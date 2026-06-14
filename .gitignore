@@ -1,0 +1,29 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Runtime artifacts
+outputs/
+runs/
+logs/
+*.log
+
+# Large/generated model artifacts
+*.pkl
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Editor/system files
+.DS_Store
+.vscode/
+.idea/
