@@ -91,6 +91,7 @@ def extract_features_for_dataset(
                 response_token_ids=gen_out.response_token_ids,
                 response_token_indices=response_indices,
                 target_token_ids=target_token_ids,
+                cfg_dgst_t=cfg_dgst_t,
             )
         except Exception as e:
             import traceback
@@ -118,23 +119,25 @@ def extract_features_for_dataset(
             target_token_ids,
             model_outputs,
         ):
-            if model_out.dgst_t_raw is None:
-                raise RuntimeError("Wrapper did not return dgst_t_raw captures.")
-            dgst_t = compute_dgst_t(
-                model_out.dgst_t_raw,
-                tau=cfg_dgst_t.get("tau", 0.07),
-                transport_top_k=cfg_dgst_t.get("transport_top_k", 64),
-                cost_mode=cfg_dgst_t.get("cost_mode", "direct"),
-                lambda_d=cfg_dgst_t.get("lambda_d", 1.0),
-                lambda_s=cfg_dgst_t.get("lambda_s", 1.0),
-                lambda_t=cfg_dgst_t.get("lambda_t", 1.0),
-                lambda_int=cfg_dgst_t.get("lambda_int", 1.0),
-                baseline_layers=cfg_dgst_t.get("baseline_layers", 10),
-                risk_start_layer=cfg_dgst_t.get("risk_start_layer", 15),
-                alpha=cfg_dgst_t.get("alpha", 2.0),
-                ot_solver=cfg_dgst_t.get("ot_solver", "linprog"),
-                atarget_visual_top_k=cfg_dgst_t.get("atarget_visual_top_k", 32),
-            )
+            dgst_t = model_out.dgst_t_result
+            if dgst_t is None:
+                if model_out.dgst_t_raw is None:
+                    raise RuntimeError("Wrapper did not return DGST-T captures or result.")
+                dgst_t = compute_dgst_t(
+                    model_out.dgst_t_raw,
+                    tau=cfg_dgst_t.get("tau", 0.07),
+                    transport_top_k=cfg_dgst_t.get("transport_top_k", 64),
+                    cost_mode=cfg_dgst_t.get("cost_mode", "direct"),
+                    lambda_d=cfg_dgst_t.get("lambda_d", 1.0),
+                    lambda_s=cfg_dgst_t.get("lambda_s", 1.0),
+                    lambda_t=cfg_dgst_t.get("lambda_t", 1.0),
+                    lambda_int=cfg_dgst_t.get("lambda_int", 1.0),
+                    baseline_layers=cfg_dgst_t.get("baseline_layers", 10),
+                    risk_start_layer=cfg_dgst_t.get("risk_start_layer", 15),
+                    alpha=cfg_dgst_t.get("alpha", 2.0),
+                    ot_solver=cfg_dgst_t.get("ot_solver", "linprog"),
+                    atarget_visual_top_k=cfg_dgst_t.get("atarget_visual_top_k", 32),
+                )
             alpha_img_per_layer, alpha_text_per_layer = compute_alpha_img_alpha_text(
                 text_to_patch_attn=model_out.text_to_patch_attn,
                 text_to_text_attn=model_out.text_to_text_attn,
@@ -155,7 +158,23 @@ def extract_features_for_dataset(
                 "dgst_t_prompt_last_cosine_per_layer": dgst_t["dgst_t_prompt_last_cosine_per_layer"].tolist(),
                 "dgst_t_prompt_mean_cosine_per_layer": dgst_t["dgst_t_prompt_mean_cosine_per_layer"].tolist(),
                 "dgst_t_atarget_visual_cosine_per_layer": dgst_t["dgst_t_atarget_visual_cosine_per_layer"].tolist(),
+                "dgst_t_target_visual_hidden_cosine_per_layer": dgst_t.get(
+                    "dgst_t_target_visual_hidden_cosine_per_layer",
+                    dgst_t["dgst_t_atarget_visual_cosine_per_layer"],
+                ).tolist(),
+                "dgst_t_prompt_confidence_top3_per_layer": dgst_t.get(
+                    "dgst_t_prompt_confidence_top3_per_layer",
+                    _layer_stat_tensor(dgst_t["dgst_t_layer_stats"], "prompt_logit_lens_top3_confidence"),
+                ).tolist(),
+                "dgst_t_prompt_confidence_max_per_layer": dgst_t.get(
+                    "dgst_t_prompt_confidence_max_per_layer",
+                    _layer_stat_tensor(dgst_t["dgst_t_layer_stats"], "prompt_logit_lens_top3_confidence"),
+                ).tolist(),
                 "dgst_t_context_confidence_per_layer": dgst_t["dgst_t_context_confidence_per_layer"].tolist(),
+                "dgst_t_context_confidence_max_prompt_per_layer": dgst_t.get(
+                    "dgst_t_context_confidence_max_prompt_per_layer",
+                    dgst_t["dgst_t_context_confidence_per_layer"],
+                ).tolist(),
                 "dgst_t_feature_vector": dgst_t["dgst_t_feature_vector"],
                 "dgst_t_layer_stats":    dgst_t["dgst_t_layer_stats"],
                 "alpha_img_per_layer":   alpha_img_per_layer.tolist(),
@@ -245,3 +264,12 @@ def _compute_baseline_features(model_out) -> dict:
     result["attn_per_head_mid"] = attn_np[mid_l].mean(axis=-1).tolist()
 
     return result
+
+
+def _layer_stat_tensor(layer_stats: list[dict], key: str):
+    import torch
+
+    return torch.tensor(
+        [float(item.get(key, 0.0)) for item in layer_stats],
+        dtype=torch.float32,
+    )

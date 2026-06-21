@@ -16,6 +16,7 @@ from models.dgst_capture import (
     resolve_prompt_positions,
     run_forward_with_dgst_captures,
 )
+from features.dgst_t import compute_dgst_t_batch_from_captures
 
 IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
 IMG_START_TOKEN = "<img>"
@@ -208,6 +209,7 @@ class InternVLWrapper(BaseLVLMWrapper):
         response_token_ids: Sequence[int],
         response_token_indices: Sequence[int],
         target_token_ids: Optional[Sequence[int]] = None,
+        cfg_dgst_t: Optional[dict] = None,
     ) -> List[ModelOutput]:
         requested_indices = [int(index) for index in response_token_indices]
         if not requested_indices:
@@ -263,25 +265,52 @@ class InternVLWrapper(BaseLVLMWrapper):
             visual_token_count=int(img_end - img_start),
             prompt_positions=prompt_positions,
         )
-        dgst_raws = build_dgst_t_raw_batch(
-            model=self.model,
-            full_input_ids=input_ids[0].tolist(),
-            prompt_tokenized_length=prompt_tokenized_length,
-            captures=captures,
-            visual_start=img_start,
-            visual_end=img_end,
-            image_token_id=int(self._img_ctx_id),
-            target_token_ids=targets,
-            prediction_positions=prediction_positions,
-            support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
-        )
+        dgst_results = None
+        dgst_raws = None
+        if cfg_dgst_t is not None:
+            dgst_results = compute_dgst_t_batch_from_captures(
+                model=self.model,
+                full_input_ids=input_ids[0].tolist(),
+                prompt_tokenized_length=prompt_tokenized_length,
+                captures=captures,
+                visual_start=img_start,
+                visual_end=img_end,
+                image_token_id=int(self._img_ctx_id),
+                target_token_ids=targets,
+                prediction_positions=prediction_positions,
+                support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+                tau=cfg_dgst_t.get("tau", 0.07),
+                transport_top_k=cfg_dgst_t.get("transport_top_k", 64),
+                cost_mode=cfg_dgst_t.get("cost_mode", "direct"),
+                lambda_d=cfg_dgst_t.get("lambda_d", 1.0),
+                lambda_s=cfg_dgst_t.get("lambda_s", 1.0),
+                lambda_t=cfg_dgst_t.get("lambda_t", 1.0),
+                lambda_int=cfg_dgst_t.get("lambda_int", 1.0),
+                baseline_layers=cfg_dgst_t.get("baseline_layers", 10),
+                risk_start_layer=cfg_dgst_t.get("risk_start_layer", 15),
+                alpha=cfg_dgst_t.get("alpha", 2.0),
+                ot_solver=cfg_dgst_t.get("ot_solver", "linprog"),
+                atarget_visual_top_k=cfg_dgst_t.get("atarget_visual_top_k", 32),
+            )
+        else:
+            dgst_raws = build_dgst_t_raw_batch(
+                model=self.model,
+                full_input_ids=input_ids[0].tolist(),
+                prompt_tokenized_length=prompt_tokenized_length,
+                captures=captures,
+                visual_start=img_start,
+                visual_end=img_end,
+                image_token_id=int(self._img_ctx_id),
+                target_token_ids=targets,
+                prediction_positions=prediction_positions,
+                support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+            )
 
         outputs: List[ModelOutput] = []
-        for response_index, prediction_position, dgst_raw in zip(
+        for offset, (response_index, prediction_position) in enumerate(zip(
             requested_indices,
             prediction_positions,
-            dgst_raws,
-        ):
+        )):
             text_to_patch_attn, text_to_text_attn = _extract_attention_features_at_position(
                 out.attentions,
                 img_start,
@@ -308,7 +337,8 @@ class InternVLWrapper(BaseLVLMWrapper):
                     patch_hidden_states=patch_hidden_states.cpu(),
                     response_token_idx=int(response_index),
                     token_logits=logits,
-                    dgst_t_raw=dgst_raw,
+                    dgst_t_raw=dgst_raws[offset] if dgst_raws is not None else None,
+                    dgst_t_result=dgst_results[offset] if dgst_results is not None else None,
                 )
             )
         return outputs

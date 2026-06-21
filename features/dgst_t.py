@@ -34,46 +34,278 @@ def compute_dgst_t(
     atarget_visual_top_k: int = 32,
 ) -> dict[str, Any]:
     """Compute DGST-T layer features from raw wrapper captures."""
-    source_ffn = dgst_t_raw["source_ffn_states"].float()
-    prediction_hidden = dgst_t_raw["prediction_hidden_states"].float()
-    support_states = dgst_t_raw["support_h_mid_states"].float()
-    support_attentions = dgst_t_raw["support_attentions"].float()
-    semantic_probs = dgst_t_raw["semantic_probs"].float()
-    prompt_last = dgst_t_raw["prompt_last_hidden_states"].float()
-    prompt_mean = dgst_t_raw["prompt_mean_hidden_states"].float()
-    prompt_confidence = dgst_t_raw["prompt_logit_lens_top3_confidence"].float()
-    target_embedding = dgst_t_raw["target_embedding"].float()
-    support_positions = [int(pos) for pos in dgst_t_raw["support_positions"]]
-    visual_start = int(dgst_t_raw["visual_start"])
-    visual_end = int(dgst_t_raw["visual_end"])
+    support_states = dgst_t_raw["support_h_mid_states"]
+    support_output_states = dgst_t_raw.get("support_output_states", support_states)
+    prompt_confidence_max = dgst_t_raw.get(
+        "prompt_logit_lens_max_confidence",
+        dgst_t_raw["prompt_logit_lens_top3_confidence"],
+    )
 
-    if source_ffn.ndim != 2 or support_states.ndim != 3:
-        raise ValueError("DGST-T raw tensors have invalid shapes.")
-    if source_ffn.shape[0] != support_states.shape[0]:
-        raise ValueError("DGST-T layer count mismatch between source and support states.")
+    return _compute_dgst_t_from_parts(
+        source_ffn_states=_layer_tensors(dgst_t_raw["source_ffn_states"]),
+        prediction_hidden_states=_layer_tensors(dgst_t_raw["prediction_hidden_states"]),
+        support_h_mid_states=_layer_tensors(support_states),
+        support_output_states=_layer_tensors(support_output_states),
+        support_attentions=_layer_tensors(dgst_t_raw["support_attentions"]),
+        semantic_probs=_layer_tensors(dgst_t_raw["semantic_probs"]),
+        prompt_last_hidden_states=_layer_tensors(dgst_t_raw["prompt_last_hidden_states"]),
+        prompt_mean_hidden_states=_layer_tensors(dgst_t_raw["prompt_mean_hidden_states"]),
+        prompt_confidence_top3=_layer_tensors(dgst_t_raw["prompt_logit_lens_top3_confidence"]),
+        prompt_confidence_max=_layer_tensors(prompt_confidence_max),
+        support_positions=[int(pos) for pos in dgst_t_raw["support_positions"]],
+        visual_start=int(dgst_t_raw["visual_start"]),
+        visual_end=int(dgst_t_raw["visual_end"]),
+        tau=tau,
+        transport_top_k=transport_top_k,
+        cost_mode=cost_mode,
+        lambda_d=lambda_d,
+        lambda_s=lambda_s,
+        lambda_t=lambda_t,
+        lambda_int=lambda_int,
+        baseline_layers=baseline_layers,
+        risk_start_layer=risk_start_layer,
+        alpha=alpha,
+        ot_solver=ot_solver,
+        atarget_visual_top_k=atarget_visual_top_k,
+    )
+
+
+def compute_dgst_t_batch_from_captures(
+    *,
+    model: Any,
+    full_input_ids: Sequence[int],
+    prompt_tokenized_length: int,
+    captures: Sequence[dict[str, Any]],
+    visual_start: int,
+    visual_end: int,
+    image_token_id: int,
+    target_token_ids: Sequence[int],
+    prediction_positions: Sequence[int],
+    support_scope: str = "visual_prompt",
+    semantic_chunk_size: int = 64,
+    tau: float = 0.07,
+    transport_top_k: int = 64,
+    cost_mode: str = "direct",
+    lambda_d: float = 1.0,
+    lambda_s: float = 1.0,
+    lambda_t: float = 1.0,
+    lambda_int: float = 1.0,
+    baseline_layers: int = 10,
+    risk_start_layer: int = 15,
+    alpha: float = 2.0,
+    ot_solver: str = "linprog",
+    atarget_visual_top_k: int = 32,
+) -> list[dict[str, Any]]:
+    """Compute DGST-T for several target tokens directly from shared captures."""
+    from models.dgst_capture import (
+        resolve_output_embedding_layer,
+        resolve_prompt_positions,
+        resolve_support_positions,
+        target_probabilities_multi,
+    )
+
+    target_ids = [int(token_id) for token_id in target_token_ids]
+    pred_positions = [int(position) for position in prediction_positions]
+    if len(target_ids) != len(pred_positions):
+        raise ValueError("target_token_ids and prediction_positions must have the same length.")
+    if not target_ids:
+        return []
+
+    prompt_positions = resolve_prompt_positions(
+        full_input_ids=full_input_ids,
+        prompt_tokenized_length=prompt_tokenized_length,
+        image_token_id=int(image_token_id),
+        visual_start=int(visual_start),
+        visual_end=int(visual_end),
+    )
+    support_positions = resolve_support_positions(
+        visual_start=int(visual_start),
+        visual_end=int(visual_end),
+        prompt_positions=prompt_positions,
+        support_scope=support_scope,
+    )
+    if not support_positions:
+        raise ValueError("DGST-T support is empty.")
+    if not prompt_positions:
+        raise ValueError("DGST-T prompt positions are empty.")
+
+    output_layer = resolve_output_embedding_layer(model)
+    parts = [
+        {
+            "source_ffn_states": [],
+            "prediction_hidden_states": [],
+            "support_h_mid_states": [],
+            "support_output_states": [],
+            "support_attentions": [],
+            "semantic_probs": [],
+            "prompt_last_hidden_states": [],
+            "prompt_mean_hidden_states": [],
+            "prompt_logit_lens_top3_confidence": [],
+            "prompt_logit_lens_max_confidence": [],
+        }
+        for _ in target_ids
+    ]
+
+    for capture in captures:
+        h_mid = capture["h_mid"][0]
+        o_ffn = capture["o_ffn"][0]
+        layer_hidden = h_mid + o_ffn
+        device = h_mid.device
+        support_index = torch.tensor(support_positions, dtype=torch.long, device=device)
+        prompt_index = torch.tensor(prompt_positions, dtype=torch.long, device=device)
+
+        support_states = h_mid.index_select(0, support_index)
+        support_output_states = layer_hidden.index_select(0, support_index)
+        prompt_states = layer_hidden.index_select(0, prompt_index)
+
+        support_semantic_all = target_probabilities_multi(
+            output_layer=output_layer,
+            states=support_states,
+            target_token_ids=target_ids,
+            chunk_size=semantic_chunk_size,
+        )
+        prompt_probs_all = target_probabilities_multi(
+            output_layer=output_layer,
+            states=prompt_states,
+            target_token_ids=target_ids,
+            chunk_size=semantic_chunk_size,
+        )
+        top_k = min(3, int(prompt_probs_all.shape[0]))
+        prompt_conf_top3_all = torch.topk(prompt_probs_all.float(), k=top_k, dim=0).values.mean(dim=0)
+        prompt_conf_max_all = prompt_probs_all.float().max(dim=0).values
+        prompt_last_state = prompt_states[-1]
+        prompt_mean_state = prompt_states.mean(dim=0)
+
+        for target_offset, prediction_position in enumerate(pred_positions):
+            attention_row = capture["attn_weights"][0, :, int(prediction_position), :]
+            support_attention = attention_row.index_select(
+                1,
+                support_index.to(attention_row.device),
+            ).mean(dim=0)
+            support_attention = support_attention.to(device=device, dtype=torch.float32)
+
+            part = parts[target_offset]
+            part["source_ffn_states"].append(o_ffn[int(prediction_position), :])
+            part["prediction_hidden_states"].append(layer_hidden[int(prediction_position), :])
+            part["support_h_mid_states"].append(support_states)
+            part["support_output_states"].append(support_output_states)
+            part["support_attentions"].append(support_attention)
+            part["semantic_probs"].append(support_semantic_all[:, target_offset])
+            part["prompt_last_hidden_states"].append(prompt_last_state)
+            part["prompt_mean_hidden_states"].append(prompt_mean_state)
+            part["prompt_logit_lens_top3_confidence"].append(prompt_conf_top3_all[target_offset])
+            part["prompt_logit_lens_max_confidence"].append(prompt_conf_max_all[target_offset])
+
+    results: list[dict[str, Any]] = []
+    for part in parts:
+        results.append(
+            _compute_dgst_t_from_parts(
+                source_ffn_states=part["source_ffn_states"],
+                prediction_hidden_states=part["prediction_hidden_states"],
+                support_h_mid_states=part["support_h_mid_states"],
+                support_output_states=part["support_output_states"],
+                support_attentions=part["support_attentions"],
+                semantic_probs=part["semantic_probs"],
+                prompt_last_hidden_states=part["prompt_last_hidden_states"],
+                prompt_mean_hidden_states=part["prompt_mean_hidden_states"],
+                prompt_confidence_top3=part["prompt_logit_lens_top3_confidence"],
+                prompt_confidence_max=part["prompt_logit_lens_max_confidence"],
+                support_positions=[int(position) for position in support_positions],
+                visual_start=int(visual_start),
+                visual_end=int(visual_end),
+                tau=tau,
+                transport_top_k=transport_top_k,
+                cost_mode=cost_mode,
+                lambda_d=lambda_d,
+                lambda_s=lambda_s,
+                lambda_t=lambda_t,
+                lambda_int=lambda_int,
+                baseline_layers=baseline_layers,
+                risk_start_layer=risk_start_layer,
+                alpha=alpha,
+                ot_solver=ot_solver,
+                atarget_visual_top_k=atarget_visual_top_k,
+            )
+        )
+    return results
+
+
+def _compute_dgst_t_from_parts(
+    *,
+    source_ffn_states: Sequence[torch.Tensor],
+    prediction_hidden_states: Sequence[torch.Tensor],
+    support_h_mid_states: Sequence[torch.Tensor],
+    support_output_states: Sequence[torch.Tensor],
+    support_attentions: Sequence[torch.Tensor],
+    semantic_probs: Sequence[torch.Tensor],
+    prompt_last_hidden_states: Sequence[torch.Tensor],
+    prompt_mean_hidden_states: Sequence[torch.Tensor],
+    prompt_confidence_top3: Sequence[torch.Tensor],
+    prompt_confidence_max: Sequence[torch.Tensor],
+    support_positions: Sequence[int],
+    visual_start: int,
+    visual_end: int,
+    tau: float,
+    transport_top_k: int,
+    cost_mode: str,
+    lambda_d: float,
+    lambda_s: float,
+    lambda_t: float,
+    lambda_int: float,
+    baseline_layers: int,
+    risk_start_layer: int,
+    alpha: float,
+    ot_solver: str,
+    atarget_visual_top_k: int,
+) -> dict[str, Any]:
+    layer_count = len(source_ffn_states)
+    if layer_count == 0:
+        raise ValueError("DGST-T requires at least one captured layer.")
+    for name, values in {
+        "prediction_hidden_states": prediction_hidden_states,
+        "support_h_mid_states": support_h_mid_states,
+        "support_output_states": support_output_states,
+        "support_attentions": support_attentions,
+        "semantic_probs": semantic_probs,
+        "prompt_last_hidden_states": prompt_last_hidden_states,
+        "prompt_mean_hidden_states": prompt_mean_hidden_states,
+        "prompt_confidence_top3": prompt_confidence_top3,
+        "prompt_confidence_max": prompt_confidence_max,
+    }.items():
+        if len(values) != layer_count:
+            raise ValueError(f"DGST-T layer count mismatch for {name}.")
 
     layer_stats = []
     risk_per_layer = []
     prompt_last_cosine_per_layer = []
     prompt_mean_cosine_per_layer = []
+    target_visual_hidden_cosine_per_layer = []
+    prompt_confidence_top3_per_layer = []
+    prompt_confidence_max_per_layer = []
     context_confidence_per_layer = []
-    atarget_visual_cosine_per_layer = []
+    context_confidence_max_prompt_per_layer = []
 
-    for layer_idx in range(int(source_ffn.shape[0])):
-        layer_support_states = support_states[layer_idx]
+    for layer_idx in range(layer_count):
+        layer_support_states = support_h_mid_states[layer_idx].float()
+        layer_support_output_states = support_output_states[layer_idx].float()
+        layer_source_ffn = source_ffn_states[layer_idx].float()
+        layer_prediction_hidden = prediction_hidden_states[layer_idx].float()
+        layer_semantic_probs = semantic_probs[layer_idx].to(layer_support_states.device).float()
+        layer_support_attentions = support_attentions[layer_idx].to(layer_support_states.device).float()
+
         source_dist = _source_distribution(
-            source_update=source_ffn[layer_idx],
+            source_update=layer_source_ffn,
             support_states=layer_support_states,
             tau=tau,
         )
-        attention_dist = _renormalize(support_attentions[layer_idx])
-        target_dist = _renormalize(attention_dist * semantic_probs[layer_idx])
+        attention_dist = _renormalize(layer_support_attentions)
+        target_dist = _renormalize(attention_dist * layer_semantic_probs)
 
         support = _topk_union_indices(source_dist, target_dist, transport_top_k)
         local_source = _renormalize(source_dist.index_select(0, support))
         local_target = _renormalize(target_dist.index_select(0, support))
         local_states = layer_support_states.index_select(0, support)
-        local_semantic = semantic_probs[layer_idx].index_select(0, support)
+        local_semantic = layer_semantic_probs.index_select(0, support)
 
         distance = _cosine_distance_matrix(local_states)
         source_penalty = torch.relu(1.0 - local_semantic)
@@ -95,45 +327,56 @@ def compute_dgst_t(
             solver=ot_solver,
         )
 
+        prompt_last = prompt_last_hidden_states[layer_idx].to(layer_prediction_hidden.device).float()
+        prompt_mean = prompt_mean_hidden_states[layer_idx].to(layer_prediction_hidden.device).float()
         prompt_last_cosine = float(
             F.cosine_similarity(
-                prediction_hidden[layer_idx].unsqueeze(0),
-                prompt_last[layer_idx].unsqueeze(0),
+                layer_prediction_hidden.unsqueeze(0),
+                prompt_last.unsqueeze(0),
                 dim=-1,
             ).item()
         )
         prompt_mean_cosine = float(
             F.cosine_similarity(
-                prediction_hidden[layer_idx].unsqueeze(0),
-                prompt_mean[layer_idx].unsqueeze(0),
+                layer_prediction_hidden.unsqueeze(0),
+                prompt_mean.unsqueeze(0),
                 dim=-1,
             ).item()
         )
-        atarget_visual_cosine = _atarget_topk_visual_cosine(
-            target_embedding=target_embedding,
-            support_states=layer_support_states,
+        target_visual_hidden_cosine = _target_hidden_topk_visual_cosine(
+            target_hidden=layer_prediction_hidden,
+            support_output_states=layer_support_output_states,
             target_dist=target_dist,
             support_positions=support_positions,
             visual_start=visual_start,
             visual_end=visual_end,
             top_k=atarget_visual_top_k,
         )
-        context_confidence = float(prompt_confidence[layer_idx].item() * atarget_visual_cosine)
+        prompt_conf_top3 = _scalar(prompt_confidence_top3[layer_idx])
+        prompt_conf_max = _scalar(prompt_confidence_max[layer_idx])
+        context_confidence = float(prompt_conf_top3 * target_visual_hidden_cosine)
+        context_confidence_max_prompt = float(prompt_conf_max * target_visual_hidden_cosine)
 
         risk_per_layer.append(float(transport_risk))
         prompt_last_cosine_per_layer.append(prompt_last_cosine)
         prompt_mean_cosine_per_layer.append(prompt_mean_cosine)
-        atarget_visual_cosine_per_layer.append(float(atarget_visual_cosine))
+        target_visual_hidden_cosine_per_layer.append(float(target_visual_hidden_cosine))
+        prompt_confidence_top3_per_layer.append(float(prompt_conf_top3))
+        prompt_confidence_max_per_layer.append(float(prompt_conf_max))
         context_confidence_per_layer.append(context_confidence)
+        context_confidence_max_prompt_per_layer.append(context_confidence_max_prompt)
         layer_stats.append(
             {
                 "layer": int(layer_idx + 1),
                 "transport_risk": float(transport_risk),
                 "prompt_last_cosine": prompt_last_cosine,
                 "prompt_mean_cosine": prompt_mean_cosine,
-                "prompt_logit_lens_top3_confidence": float(prompt_confidence[layer_idx].item()),
-                "atarget_top32_visual_cosine": float(atarget_visual_cosine),
+                "prompt_logit_lens_top3_confidence": float(prompt_conf_top3),
+                "prompt_logit_lens_max_confidence": float(prompt_conf_max),
+                "atarget_top32_visual_cosine": float(target_visual_hidden_cosine),
+                "target_hidden_top32_visual_cosine": float(target_visual_hidden_cosine),
                 "context_confidence": context_confidence,
+                "context_confidence_max_prompt": context_confidence_max_prompt,
                 "support_size": int(len(support_positions)),
                 "selected_support_size": int(support.numel()),
             }
@@ -146,6 +389,7 @@ def compute_dgst_t(
         risk_start_layer=risk_start_layer,
         alpha=alpha,
     )
+    target_visual_tensor = torch.tensor(target_visual_hidden_cosine_per_layer, dtype=torch.float32)
 
     return {
         "dgst_t_score": float(final_score),
@@ -153,8 +397,15 @@ def compute_dgst_t(
         "dgst_t_transport_risk_per_layer": risk_tensor,
         "dgst_t_prompt_last_cosine_per_layer": torch.tensor(prompt_last_cosine_per_layer, dtype=torch.float32),
         "dgst_t_prompt_mean_cosine_per_layer": torch.tensor(prompt_mean_cosine_per_layer, dtype=torch.float32),
-        "dgst_t_atarget_visual_cosine_per_layer": torch.tensor(atarget_visual_cosine_per_layer, dtype=torch.float32),
+        "dgst_t_atarget_visual_cosine_per_layer": target_visual_tensor,
+        "dgst_t_target_visual_hidden_cosine_per_layer": target_visual_tensor,
+        "dgst_t_prompt_confidence_top3_per_layer": torch.tensor(prompt_confidence_top3_per_layer, dtype=torch.float32),
+        "dgst_t_prompt_confidence_max_per_layer": torch.tensor(prompt_confidence_max_per_layer, dtype=torch.float32),
         "dgst_t_context_confidence_per_layer": torch.tensor(context_confidence_per_layer, dtype=torch.float32),
+        "dgst_t_context_confidence_max_prompt_per_layer": torch.tensor(
+            context_confidence_max_prompt_per_layer,
+            dtype=torch.float32,
+        ),
         "dgst_t_layer_stats": layer_stats,
         "dgst_t_feature_vector": _feature_vector(
             risk_per_layer,
@@ -163,6 +414,18 @@ def compute_dgst_t(
             context_confidence_per_layer,
         ),
     }
+
+
+def _layer_tensors(value: Any) -> list[torch.Tensor]:
+    if torch.is_tensor(value):
+        return [value[index] for index in range(int(value.shape[0]))]
+    return list(value)
+
+
+def _scalar(value: torch.Tensor | float | int) -> float:
+    if torch.is_tensor(value):
+        return float(value.detach().float().reshape(-1)[0].item())
+    return float(value)
 
 
 def _feature_vector(
@@ -239,10 +502,10 @@ def _build_cost_matrix(
     raise ValueError("DGST-T only keeps direct/decomposed transport costs.")
 
 
-def _atarget_topk_visual_cosine(
+def _target_hidden_topk_visual_cosine(
     *,
-    target_embedding: torch.Tensor,
-    support_states: torch.Tensor,
+    target_hidden: torch.Tensor,
+    support_output_states: torch.Tensor,
     target_dist: torch.Tensor,
     support_positions: Sequence[int],
     visual_start: int,
@@ -256,12 +519,12 @@ def _atarget_topk_visual_cosine(
     ]
     if not visual_indices:
         return 0.0
-    visual_index = torch.tensor(visual_indices, dtype=torch.long)
+    visual_index = torch.tensor(visual_indices, dtype=torch.long, device=target_dist.device)
     visual_scores = target_dist.index_select(0, visual_index)
     k = min(max(int(top_k), 1), int(visual_scores.numel()))
     selected = visual_index.index_select(0, torch.topk(visual_scores, k=k).indices)
-    selected_states = support_states.index_select(0, selected).float()
-    similarities = F.cosine_similarity(target_embedding.float().unsqueeze(0), selected_states, dim=-1)
+    selected_states = support_output_states.index_select(0, selected.to(support_output_states.device)).float()
+    similarities = F.cosine_similarity(target_hidden.float().unsqueeze(0), selected_states, dim=-1)
     return float(similarities.mean().item())
 
 

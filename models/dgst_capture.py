@@ -223,11 +223,13 @@ def build_dgst_t_raw_batch(
             "source_ffn_states": [],
             "prediction_hidden_states": [],
             "support_h_mid_states": [],
+            "support_output_states": [],
             "support_attentions": [],
             "semantic_probs": [],
             "prompt_last_hidden_states": [],
             "prompt_mean_hidden_states": [],
             "prompt_logit_lens_top3_confidence": [],
+            "prompt_logit_lens_max_confidence": [],
         }
         for _ in target_ids
     ]
@@ -241,6 +243,7 @@ def build_dgst_t_raw_batch(
         prompt_index = torch.tensor(prompt_positions, dtype=torch.long, device=device)
 
         support_states = h_mid.index_select(0, support_index)
+        support_output_states = layer_hidden.index_select(0, support_index)
         prompt_states = layer_hidden.index_select(0, prompt_index)
 
         support_semantic_all = target_probabilities_multi(
@@ -257,9 +260,11 @@ def build_dgst_t_raw_batch(
         )
         top_k = min(3, int(prompt_probs_all.shape[0]))
         prompt_conf_all = torch.topk(prompt_probs_all.float(), k=top_k, dim=0).values.mean(dim=0)
+        prompt_max_conf_all = prompt_probs_all.float().max(dim=0).values
         prompt_last_state = prompt_states[-1].detach().cpu()
         prompt_mean_state = prompt_states.mean(dim=0).detach().cpu()
         support_states_cpu = support_states.detach().cpu()
+        support_output_states_cpu = support_output_states.detach().cpu()
 
         for target_offset, prediction_position in enumerate(pred_positions):
             attention_row = capture["attn_weights"][0, :, int(prediction_position), :]
@@ -271,12 +276,16 @@ def build_dgst_t_raw_batch(
             part["source_ffn_states"].append(o_ffn[int(prediction_position), :].detach().cpu())
             part["prediction_hidden_states"].append(layer_hidden[int(prediction_position), :].detach().cpu())
             part["support_h_mid_states"].append(support_states_cpu)
+            part["support_output_states"].append(support_output_states_cpu)
             part["support_attentions"].append(support_attention.detach().cpu())
             part["semantic_probs"].append(support_semantic_all[:, target_offset].detach().cpu())
             part["prompt_last_hidden_states"].append(prompt_last_state)
             part["prompt_mean_hidden_states"].append(prompt_mean_state)
             part["prompt_logit_lens_top3_confidence"].append(
                 prompt_conf_all[target_offset].detach().cpu()
+            )
+            part["prompt_logit_lens_max_confidence"].append(
+                prompt_max_conf_all[target_offset].detach().cpu()
             )
 
     raws: list[dict[str, Any]] = []
@@ -293,12 +302,16 @@ def build_dgst_t_raw_batch(
                 "source_ffn_states": torch.stack(part["source_ffn_states"], dim=0),
                 "prediction_hidden_states": torch.stack(part["prediction_hidden_states"], dim=0),
                 "support_h_mid_states": torch.stack(part["support_h_mid_states"], dim=0),
+                "support_output_states": torch.stack(part["support_output_states"], dim=0),
                 "support_attentions": torch.stack(part["support_attentions"], dim=0),
                 "semantic_probs": torch.stack(part["semantic_probs"], dim=0),
                 "prompt_last_hidden_states": torch.stack(part["prompt_last_hidden_states"], dim=0),
                 "prompt_mean_hidden_states": torch.stack(part["prompt_mean_hidden_states"], dim=0),
                 "prompt_logit_lens_top3_confidence": torch.stack(
                     part["prompt_logit_lens_top3_confidence"], dim=0
+                ),
+                "prompt_logit_lens_max_confidence": torch.stack(
+                    part["prompt_logit_lens_max_confidence"], dim=0
                 ),
                 "target_embedding": target_embeddings[target_offset].detach().cpu(),
             }

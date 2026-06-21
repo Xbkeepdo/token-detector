@@ -18,6 +18,10 @@ SYSTEM_PROMPT = (
     "Follow the instructions exactly and output ONLY a JSON list."
 )
 
+DEFAULT_OPENAI_MODEL = "gpt-4o"
+GITHUB_MODELS_BASE_URL = "https://models.github.ai/inference"
+GITHUB_MODELS_MODEL = "openai/gpt-4o"
+
 USER_TEMPLATE = """\
 You are given:
 - A list of ground truth object classes (from COCO).
@@ -58,6 +62,7 @@ def _call_gpt4o(
     objects: List[str],
     description: str,
     captions: List[str],
+    model: str = DEFAULT_OPENAI_MODEL,
     max_retries: int = 3,
     retry_delay: float = 2.0,
 ) -> Optional[List[str]]:
@@ -77,7 +82,7 @@ def _call_gpt4o(
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model=model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
@@ -104,6 +109,34 @@ def _call_gpt4o(
                 return None
 
 
+def _is_github_models_base_url(base_url: Optional[str]) -> bool:
+    return bool(base_url and "models.github.ai" in base_url)
+
+
+def _resolve_api_settings(
+    openai_api_key: Optional[str],
+    openai_base_url: Optional[str],
+    openai_model: Optional[str],
+) -> tuple[str, Optional[str], str]:
+    env_openai_key = os.environ.get("OPENAI_API_KEY")
+    github_models_token = os.environ.get("GITHUB_MODELS_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    base_url = openai_base_url or os.environ.get("OPENAI_BASE_URL")
+
+    if not base_url and not (openai_api_key or env_openai_key) and github_models_token:
+        base_url = GITHUB_MODELS_BASE_URL
+
+    if _is_github_models_base_url(base_url):
+        api_key = openai_api_key or github_models_token or env_openai_key or ""
+    else:
+        api_key = openai_api_key or env_openai_key or github_models_token or ""
+
+    model = openai_model or os.environ.get("OPENAI_MODEL")
+    if not model:
+        model = GITHUB_MODELS_MODEL if _is_github_models_base_url(base_url) else DEFAULT_OPENAI_MODEL
+
+    return api_key, base_url, model
+
+
 def _get_coco_objects(sample: dict) -> List[str]:
     """Return unique COCO object names from either new or legacy sample format."""
     if "coco_objects" in sample:
@@ -123,6 +156,8 @@ def label_dataset(
     tokenizer,                            # the model's tokenizer (for token finding)
     output_path: str,
     openai_api_key: Optional[str] = None,
+    openai_base_url: Optional[str] = None,
+    openai_model: Optional[str] = None,
     openai_proxy: Optional[str] = None,
     resume: bool = True,
     sleep_between_calls: float = 0.5,
@@ -136,7 +171,10 @@ def label_dataset(
         generation_token_ids:  Dict mapping image_id → list of response token ids.
         tokenizer:             The LVLM tokenizer (used for token-position finding).
         output_path:           Path to save/resume the JSON results file.
-        openai_api_key:        API key (falls back to OPENAI_API_KEY env var).
+        openai_api_key:        API key (falls back to OPENAI_API_KEY, then
+                               GITHUB_MODELS_TOKEN/GITHUB_TOKEN env vars).
+        openai_base_url:       Optional OpenAI-compatible API base URL.
+        openai_model:          Chat model name, e.g. gpt-4o or openai/gpt-4o.
         openai_proxy:          Optional HTTP(S) proxy URL for OpenAI requests.
         resume:                Skip already-labeled images if output_path exists.
         sleep_between_calls:   Seconds to sleep between API calls.
@@ -144,10 +182,25 @@ def label_dataset(
     Returns:
         Dict mapping image_id → labeling result dict.
     """
-    api_key = openai_api_key or os.environ.get("OPENAI_API_KEY", "")
+    api_key, base_url, model = _resolve_api_settings(
+        openai_api_key=openai_api_key,
+        openai_base_url=openai_base_url,
+        openai_model=openai_model,
+    )
     proxy = openai_proxy or os.environ.get("OPENAI_PROXY")
     http_client = httpx.Client(proxy=proxy, timeout=60.0) if proxy else None
-    client = OpenAI(api_key=api_key, http_client=http_client)
+
+    client_kwargs = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    if http_client:
+        client_kwargs["http_client"] = http_client
+    if _is_github_models_base_url(base_url):
+        client_kwargs["default_headers"] = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+    client = OpenAI(**client_kwargs)
 
     results: Dict[int, dict] = {}
     if resume and os.path.exists(output_path):
@@ -171,6 +224,7 @@ def label_dataset(
             objects=coco_objects,
             description=generated_text,
             captions=captions,
+            model=model,
         )
         if hallucinated_words is None:
             print(f"[GPT4Labeler] Skipping image {image_id}; will retry on resume.")

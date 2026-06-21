@@ -30,6 +30,8 @@ class ModelOutput:
 
     dgst_t_raw: Optional[dict[str, Any]] = None
 
+    dgst_t_result: Optional[dict[str, Any]] = None
+
 
 @dataclass
 class GenerationOutput:
@@ -83,6 +85,7 @@ class BaseLVLMWrapper(ABC):
         response_token_ids: Sequence[int],
         response_token_indices: Sequence[int],
         target_token_ids: Optional[Sequence[int]] = None,
+        cfg_dgst_t: Optional[dict[str, Any]] = None,
     ) -> List[ModelOutput]:
         """Fallback batch API; wrappers can override to reuse one image forward."""
         targets = (
