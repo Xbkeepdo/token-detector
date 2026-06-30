@@ -15,6 +15,9 @@ import torch
 import torch.nn.functional as F
 
 EPS = 1e-12
+TOPMASS_ALPHA_085 = 0.85
+CAPPED_TOPMASS_MIN_K = 32
+CAPPED_TOPMASS_MAX_K = 64
 
 
 def compute_dgst_t(
@@ -32,6 +35,12 @@ def compute_dgst_t(
     alpha: float = 2.0,
     ot_solver: str = "linprog",
     atarget_visual_top_k: int = 32,
+    topmass_alpha: float = TOPMASS_ALPHA_085,
+    capped_topmass_alpha: float = TOPMASS_ALPHA_085,
+    capped_topmass_min_k: int = CAPPED_TOPMASS_MIN_K,
+    capped_topmass_max_k: int = CAPPED_TOPMASS_MAX_K,
+    compute_topmass_085: bool = True,
+    compute_capped_topmass_085: bool = True,
 ) -> dict[str, Any]:
     """Compute DGST-T layer features from raw wrapper captures."""
     support_states = dgst_t_raw["support_h_mid_states"]
@@ -67,6 +76,12 @@ def compute_dgst_t(
         alpha=alpha,
         ot_solver=ot_solver,
         atarget_visual_top_k=atarget_visual_top_k,
+        topmass_alpha=topmass_alpha,
+        capped_topmass_alpha=capped_topmass_alpha,
+        capped_topmass_min_k=capped_topmass_min_k,
+        capped_topmass_max_k=capped_topmass_max_k,
+        compute_topmass_085=compute_topmass_085,
+        compute_capped_topmass_085=compute_capped_topmass_085,
     )
 
 
@@ -95,6 +110,12 @@ def compute_dgst_t_batch_from_captures(
     alpha: float = 2.0,
     ot_solver: str = "linprog",
     atarget_visual_top_k: int = 32,
+    topmass_alpha: float = TOPMASS_ALPHA_085,
+    capped_topmass_alpha: float = TOPMASS_ALPHA_085,
+    capped_topmass_min_k: int = CAPPED_TOPMASS_MIN_K,
+    capped_topmass_max_k: int = CAPPED_TOPMASS_MAX_K,
+    compute_topmass_085: bool = True,
+    compute_capped_topmass_085: bool = True,
 ) -> list[dict[str, Any]]:
     """Compute DGST-T for several target tokens directly from shared captures."""
     from models.dgst_capture import (
@@ -225,6 +246,12 @@ def compute_dgst_t_batch_from_captures(
                 alpha=alpha,
                 ot_solver=ot_solver,
                 atarget_visual_top_k=atarget_visual_top_k,
+                topmass_alpha=topmass_alpha,
+                capped_topmass_alpha=capped_topmass_alpha,
+                capped_topmass_min_k=capped_topmass_min_k,
+                capped_topmass_max_k=capped_topmass_max_k,
+                compute_topmass_085=compute_topmass_085,
+                compute_capped_topmass_085=compute_capped_topmass_085,
             )
         )
     return results
@@ -257,6 +284,12 @@ def _compute_dgst_t_from_parts(
     alpha: float,
     ot_solver: str,
     atarget_visual_top_k: int,
+    topmass_alpha: float,
+    capped_topmass_alpha: float,
+    capped_topmass_min_k: int,
+    capped_topmass_max_k: int,
+    compute_topmass_085: bool,
+    compute_capped_topmass_085: bool,
 ) -> dict[str, Any]:
     layer_count = len(source_ffn_states)
     if layer_count == 0:
@@ -277,9 +310,14 @@ def _compute_dgst_t_from_parts(
 
     layer_stats = []
     risk_per_layer = []
+    risk_topmass_085_per_layer = []
+    risk_capped_topmass_085_per_layer = []
     prompt_last_cosine_per_layer = []
     prompt_mean_cosine_per_layer = []
     target_visual_hidden_cosine_per_layer = []
+    target_visual_prompt_hidden_cosine_per_layer = []
+    target_visual_hidden_cosine_capped_topmass_085_per_layer = []
+    target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer = []
     prompt_confidence_top3_per_layer = []
     prompt_confidence_max_per_layer = []
     context_confidence_per_layer = []
@@ -302,30 +340,60 @@ def _compute_dgst_t_from_parts(
         target_dist = _renormalize(attention_dist * layer_semantic_probs)
 
         support = _topk_union_indices(source_dist, target_dist, transport_top_k)
-        local_source = _renormalize(source_dist.index_select(0, support))
-        local_target = _renormalize(target_dist.index_select(0, support))
-        local_states = layer_support_states.index_select(0, support)
-        local_semantic = layer_semantic_probs.index_select(0, support)
-
-        distance = _cosine_distance_matrix(local_states)
-        source_penalty = torch.relu(1.0 - local_semantic)
-        target_penalty = torch.relu(1.0 - local_semantic)
-        cost = _build_cost_matrix(
-            distance,
-            source_penalty,
-            target_penalty,
+        transport_risk = _transport_risk_on_support(
+            source_dist=source_dist,
+            target_dist=target_dist,
+            support_states=layer_support_states,
+            semantic_probs=layer_semantic_probs,
+            support=support,
             cost_mode=cost_mode,
             lambda_d=lambda_d,
             lambda_s=lambda_s,
             lambda_t=lambda_t,
             lambda_int=lambda_int,
+            ot_solver=ot_solver,
         )
-        transport_risk, _transport_plan = _wasserstein_1_exact(
-            local_source,
-            local_target,
-            cost,
-            solver=ot_solver,
-        )
+        topmass_support = None
+        transport_risk_topmass_085 = None
+        if compute_topmass_085:
+            topmass_support = _topmass_union_indices(source_dist, target_dist, topmass_alpha)
+            transport_risk_topmass_085 = _transport_risk_on_support(
+                source_dist=source_dist,
+                target_dist=target_dist,
+                support_states=layer_support_states,
+                semantic_probs=layer_semantic_probs,
+                support=topmass_support,
+                cost_mode=cost_mode,
+                lambda_d=lambda_d,
+                lambda_s=lambda_s,
+                lambda_t=lambda_t,
+                lambda_int=lambda_int,
+                ot_solver=ot_solver,
+            )
+
+        capped_topmass_support = None
+        transport_risk_capped_topmass_085 = None
+        if compute_capped_topmass_085:
+            capped_topmass_support = _capped_topmass_union_indices(
+                source_dist,
+                target_dist,
+                capped_topmass_alpha,
+                min_k=capped_topmass_min_k,
+                max_k=capped_topmass_max_k,
+            )
+            transport_risk_capped_topmass_085 = _transport_risk_on_support(
+                source_dist=source_dist,
+                target_dist=target_dist,
+                support_states=layer_support_states,
+                semantic_probs=layer_semantic_probs,
+                support=capped_topmass_support,
+                cost_mode=cost_mode,
+                lambda_d=lambda_d,
+                lambda_s=lambda_s,
+                lambda_t=lambda_t,
+                lambda_int=lambda_int,
+                ot_solver=ot_solver,
+            )
 
         prompt_last = prompt_last_hidden_states[layer_idx].to(layer_prediction_hidden.device).float()
         prompt_mean = prompt_mean_hidden_states[layer_idx].to(layer_prediction_hidden.device).float()
@@ -352,35 +420,83 @@ def _compute_dgst_t_from_parts(
             visual_end=visual_end,
             top_k=atarget_visual_top_k,
         )
+        target_visual_prompt_hidden_cosine = _target_hidden_topk_support_cosine(
+            target_hidden=layer_prediction_hidden,
+            support_output_states=layer_support_output_states,
+            target_dist=target_dist,
+            top_k=atarget_visual_top_k,
+        )
+        target_visual_hidden_cosine_capped_topmass_085 = _target_hidden_capped_topmass_visual_cosine(
+            target_hidden=layer_prediction_hidden,
+            support_output_states=layer_support_output_states,
+            target_dist=target_dist,
+            support_positions=support_positions,
+            visual_start=visual_start,
+            visual_end=visual_end,
+            alpha=capped_topmass_alpha,
+            min_k=capped_topmass_min_k,
+            max_k=capped_topmass_max_k,
+        )
+        target_visual_prompt_hidden_cosine_capped_topmass_085 = _target_hidden_capped_topmass_support_cosine(
+            target_hidden=layer_prediction_hidden,
+            support_output_states=layer_support_output_states,
+            target_dist=target_dist,
+            alpha=capped_topmass_alpha,
+            min_k=capped_topmass_min_k,
+            max_k=capped_topmass_max_k,
+        )
         prompt_conf_top3 = _scalar(prompt_confidence_top3[layer_idx])
         prompt_conf_max = _scalar(prompt_confidence_max[layer_idx])
         context_confidence = float(prompt_conf_top3 * target_visual_hidden_cosine)
         context_confidence_max_prompt = float(prompt_conf_max * target_visual_hidden_cosine)
 
         risk_per_layer.append(float(transport_risk))
+        if transport_risk_topmass_085 is not None:
+            risk_topmass_085_per_layer.append(float(transport_risk_topmass_085))
+        if transport_risk_capped_topmass_085 is not None:
+            risk_capped_topmass_085_per_layer.append(float(transport_risk_capped_topmass_085))
         prompt_last_cosine_per_layer.append(prompt_last_cosine)
         prompt_mean_cosine_per_layer.append(prompt_mean_cosine)
         target_visual_hidden_cosine_per_layer.append(float(target_visual_hidden_cosine))
+        target_visual_prompt_hidden_cosine_per_layer.append(float(target_visual_prompt_hidden_cosine))
+        target_visual_hidden_cosine_capped_topmass_085_per_layer.append(
+            float(target_visual_hidden_cosine_capped_topmass_085)
+        )
+        target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer.append(
+            float(target_visual_prompt_hidden_cosine_capped_topmass_085)
+        )
         prompt_confidence_top3_per_layer.append(float(prompt_conf_top3))
         prompt_confidence_max_per_layer.append(float(prompt_conf_max))
         context_confidence_per_layer.append(context_confidence)
         context_confidence_max_prompt_per_layer.append(context_confidence_max_prompt)
-        layer_stats.append(
-            {
-                "layer": int(layer_idx + 1),
-                "transport_risk": float(transport_risk),
-                "prompt_last_cosine": prompt_last_cosine,
-                "prompt_mean_cosine": prompt_mean_cosine,
-                "prompt_logit_lens_top3_confidence": float(prompt_conf_top3),
-                "prompt_logit_lens_max_confidence": float(prompt_conf_max),
-                "atarget_top32_visual_cosine": float(target_visual_hidden_cosine),
-                "target_hidden_top32_visual_cosine": float(target_visual_hidden_cosine),
-                "context_confidence": context_confidence,
-                "context_confidence_max_prompt": context_confidence_max_prompt,
-                "support_size": int(len(support_positions)),
-                "selected_support_size": int(support.numel()),
-            }
-        )
+        stats = {
+            "layer": int(layer_idx + 1),
+            "transport_risk": float(transport_risk),
+            "prompt_last_cosine": prompt_last_cosine,
+            "prompt_mean_cosine": prompt_mean_cosine,
+            "prompt_logit_lens_top3_confidence": float(prompt_conf_top3),
+            "prompt_logit_lens_max_confidence": float(prompt_conf_max),
+            "atarget_top32_visual_cosine": float(target_visual_hidden_cosine),
+            "target_hidden_top32_visual_cosine": float(target_visual_hidden_cosine),
+            "target_hidden_top32_visual_prompt_cosine": float(target_visual_prompt_hidden_cosine),
+            "target_hidden_capped_topmass_085_visual_cosine": float(
+                target_visual_hidden_cosine_capped_topmass_085
+            ),
+            "target_hidden_capped_topmass_085_visual_prompt_cosine": float(
+                target_visual_prompt_hidden_cosine_capped_topmass_085
+            ),
+            "context_confidence": context_confidence,
+            "context_confidence_max_prompt": context_confidence_max_prompt,
+            "support_size": int(len(support_positions)),
+            "selected_support_size": int(support.numel()),
+        }
+        if transport_risk_topmass_085 is not None and topmass_support is not None:
+            stats["transport_risk_topmass_085"] = float(transport_risk_topmass_085)
+            stats["selected_support_size_topmass_085"] = int(topmass_support.numel())
+        if transport_risk_capped_topmass_085 is not None and capped_topmass_support is not None:
+            stats["transport_risk_capped_topmass_085"] = float(transport_risk_capped_topmass_085)
+            stats["selected_support_size_capped_topmass_085"] = int(capped_topmass_support.numel())
+        layer_stats.append(stats)
 
     risk_tensor = torch.tensor(risk_per_layer, dtype=torch.float32)
     final_score = _baseline_excess_score(
@@ -390,8 +506,20 @@ def _compute_dgst_t_from_parts(
         alpha=alpha,
     )
     target_visual_tensor = torch.tensor(target_visual_hidden_cosine_per_layer, dtype=torch.float32)
+    target_visual_prompt_tensor = torch.tensor(
+        target_visual_prompt_hidden_cosine_per_layer,
+        dtype=torch.float32,
+    )
+    target_visual_capped_tensor = torch.tensor(
+        target_visual_hidden_cosine_capped_topmass_085_per_layer,
+        dtype=torch.float32,
+    )
+    target_visual_prompt_capped_tensor = torch.tensor(
+        target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer,
+        dtype=torch.float32,
+    )
 
-    return {
+    result = {
         "dgst_t_score": float(final_score),
         "dgst_t_per_layer": risk_tensor,
         "dgst_t_transport_risk_per_layer": risk_tensor,
@@ -399,6 +527,9 @@ def _compute_dgst_t_from_parts(
         "dgst_t_prompt_mean_cosine_per_layer": torch.tensor(prompt_mean_cosine_per_layer, dtype=torch.float32),
         "dgst_t_atarget_visual_cosine_per_layer": target_visual_tensor,
         "dgst_t_target_visual_hidden_cosine_per_layer": target_visual_tensor,
+        "dgst_t_target_visual_prompt_hidden_cosine_per_layer": target_visual_prompt_tensor,
+        "dgst_t_target_visual_hidden_cosine_capped_topmass_085_per_layer": target_visual_capped_tensor,
+        "dgst_t_target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer": target_visual_prompt_capped_tensor,
         "dgst_t_prompt_confidence_top3_per_layer": torch.tensor(prompt_confidence_top3_per_layer, dtype=torch.float32),
         "dgst_t_prompt_confidence_max_per_layer": torch.tensor(prompt_confidence_max_per_layer, dtype=torch.float32),
         "dgst_t_context_confidence_per_layer": torch.tensor(context_confidence_per_layer, dtype=torch.float32),
@@ -414,6 +545,17 @@ def _compute_dgst_t_from_parts(
             context_confidence_per_layer,
         ),
     }
+    if compute_topmass_085:
+        result["dgst_t_transport_risk_topmass_085_per_layer"] = torch.tensor(
+            risk_topmass_085_per_layer,
+            dtype=torch.float32,
+        )
+    if compute_capped_topmass_085:
+        result["dgst_t_transport_risk_capped_topmass_085_per_layer"] = torch.tensor(
+            risk_capped_topmass_085_per_layer,
+            dtype=torch.float32,
+        )
+    return result
 
 
 def _layer_tensors(value: Any) -> list[torch.Tensor]:
@@ -467,6 +609,110 @@ def _topk_union_indices(source: torch.Tensor, target: torch.Tensor, top_k: int) 
     src_idx = torch.topk(source, k=k_half).indices
     tgt_idx = torch.topk(target, k=k_half).indices
     return torch.unique(torch.cat([src_idx, tgt_idx], dim=0), sorted=True)
+
+
+def _topmass_k(values: torch.Tensor, alpha: float) -> int:
+    probs = _renormalize(values)
+    n = int(probs.numel())
+    if n <= 0:
+        return 0
+    threshold = min(max(float(alpha), 0.0), 1.0)
+    if threshold <= 0.0:
+        return 1
+    sorted_probs = torch.sort(probs, descending=True).values
+    cumulative = torch.cumsum(sorted_probs, dim=0)
+    hits = torch.nonzero(cumulative >= threshold, as_tuple=False)
+    if hits.numel() == 0:
+        return n
+    return min(int(hits[0].item()) + 1, n)
+
+
+def _topmass_indices(values: torch.Tensor, alpha: float) -> torch.Tensor:
+    probs = _renormalize(values)
+    k = _topmass_k(probs, alpha)
+    if k <= 0:
+        return torch.empty((0,), dtype=torch.long, device=values.device)
+    return torch.topk(probs, k=k).indices
+
+
+def _topmass_union_indices(source: torch.Tensor, target: torch.Tensor, alpha: float) -> torch.Tensor:
+    src_idx = _topmass_indices(source, alpha)
+    tgt_idx = _topmass_indices(target, alpha)
+    return torch.unique(torch.cat([src_idx, tgt_idx], dim=0), sorted=True)
+
+
+def _capped_topmass_indices(
+    values: torch.Tensor,
+    alpha: float,
+    *,
+    min_k: int,
+    max_k: int,
+) -> torch.Tensor:
+    probs = _renormalize(values)
+    n = int(probs.numel())
+    if n <= 0:
+        return torch.empty((0,), dtype=torch.long, device=values.device)
+    lower = max(int(min_k), 1)
+    upper = max(int(max_k), lower)
+    k = min(upper, max(lower, _topmass_k(probs, alpha)))
+    k = min(k, n)
+    return torch.topk(probs, k=k).indices
+
+
+def _capped_topmass_union_indices(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float,
+    *,
+    min_k: int,
+    max_k: int,
+) -> torch.Tensor:
+    src_idx = _capped_topmass_indices(source, alpha, min_k=min_k, max_k=max_k)
+    tgt_idx = _capped_topmass_indices(target, alpha, min_k=min_k, max_k=max_k)
+    return torch.unique(torch.cat([src_idx, tgt_idx], dim=0), sorted=True)
+
+
+def _transport_risk_on_support(
+    *,
+    source_dist: torch.Tensor,
+    target_dist: torch.Tensor,
+    support_states: torch.Tensor,
+    semantic_probs: torch.Tensor,
+    support: torch.Tensor,
+    cost_mode: str,
+    lambda_d: float,
+    lambda_s: float,
+    lambda_t: float,
+    lambda_int: float,
+    ot_solver: str,
+) -> float:
+    if support.numel() == 0:
+        return 0.0
+    local_source = _renormalize(source_dist.index_select(0, support))
+    local_target = _renormalize(target_dist.index_select(0, support))
+    local_states = support_states.index_select(0, support)
+    local_semantic = semantic_probs.index_select(0, support)
+
+    distance = _cosine_distance_matrix(local_states)
+    source_penalty = torch.relu(1.0 - local_semantic)
+    target_penalty = torch.relu(1.0 - local_semantic)
+    cost = _build_cost_matrix(
+        distance,
+        source_penalty,
+        target_penalty,
+        cost_mode=cost_mode,
+        lambda_d=lambda_d,
+        lambda_s=lambda_s,
+        lambda_t=lambda_t,
+        lambda_int=lambda_int,
+    )
+    transport_risk, _transport_plan = _wasserstein_1_exact(
+        local_source,
+        local_target,
+        cost,
+        solver=ot_solver,
+    )
+    return float(transport_risk)
 
 
 def _cosine_distance_matrix(states: torch.Tensor) -> torch.Tensor:
@@ -523,6 +769,67 @@ def _target_hidden_topk_visual_cosine(
     visual_scores = target_dist.index_select(0, visual_index)
     k = min(max(int(top_k), 1), int(visual_scores.numel()))
     selected = visual_index.index_select(0, torch.topk(visual_scores, k=k).indices)
+    selected_states = support_output_states.index_select(0, selected.to(support_output_states.device)).float()
+    similarities = F.cosine_similarity(target_hidden.float().unsqueeze(0), selected_states, dim=-1)
+    return float(similarities.mean().item())
+
+
+def _target_hidden_topk_support_cosine(
+    *,
+    target_hidden: torch.Tensor,
+    support_output_states: torch.Tensor,
+    target_dist: torch.Tensor,
+    top_k: int,
+) -> float:
+    if target_dist.numel() == 0:
+        return 0.0
+    k = min(max(int(top_k), 1), int(target_dist.numel()))
+    selected = torch.topk(target_dist, k=k).indices
+    selected_states = support_output_states.index_select(0, selected.to(support_output_states.device)).float()
+    similarities = F.cosine_similarity(target_hidden.float().unsqueeze(0), selected_states, dim=-1)
+    return float(similarities.mean().item())
+
+
+def _target_hidden_capped_topmass_visual_cosine(
+    *,
+    target_hidden: torch.Tensor,
+    support_output_states: torch.Tensor,
+    target_dist: torch.Tensor,
+    support_positions: Sequence[int],
+    visual_start: int,
+    visual_end: int,
+    alpha: float,
+    min_k: int,
+    max_k: int,
+) -> float:
+    visual_indices = [
+        offset
+        for offset, position in enumerate(support_positions)
+        if int(visual_start) <= int(position) < int(visual_end)
+    ]
+    if not visual_indices:
+        return 0.0
+    visual_index = torch.tensor(visual_indices, dtype=torch.long, device=target_dist.device)
+    visual_scores = target_dist.index_select(0, visual_index)
+    local_selected = _capped_topmass_indices(visual_scores, alpha, min_k=min_k, max_k=max_k)
+    selected = visual_index.index_select(0, local_selected)
+    selected_states = support_output_states.index_select(0, selected.to(support_output_states.device)).float()
+    similarities = F.cosine_similarity(target_hidden.float().unsqueeze(0), selected_states, dim=-1)
+    return float(similarities.mean().item())
+
+
+def _target_hidden_capped_topmass_support_cosine(
+    *,
+    target_hidden: torch.Tensor,
+    support_output_states: torch.Tensor,
+    target_dist: torch.Tensor,
+    alpha: float,
+    min_k: int,
+    max_k: int,
+) -> float:
+    if target_dist.numel() == 0:
+        return 0.0
+    selected = _capped_topmass_indices(target_dist, alpha, min_k=min_k, max_k=max_k)
     selected_states = support_output_states.index_select(0, selected.to(support_output_states.device)).float()
     similarities = F.cosine_similarity(target_hidden.float().unsqueeze(0), selected_states, dim=-1)
     return float(similarities.mean().item())

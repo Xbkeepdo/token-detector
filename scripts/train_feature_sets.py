@@ -13,13 +13,20 @@ from typing import Sequence
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils.io_utils import load_json, load_pkl, save_json
+
+from summarize_feature_set_results import write_summary_tables
 
 
 FEATURE_ALIASES = {
     "risk": "risk",
     "transport_risk": "risk",
+    "risk_topmass_085": "risk_topmass_085",
+    "topmass_085": "risk_topmass_085",
+    "risk_capped_topmass_085": "risk_capped_topmass_085",
+    "capped_topmass_085": "risk_capped_topmass_085",
     "prompt_confidence": "prompt_confidence_top3",
     "prompt_confidence_top3": "prompt_confidence_top3",
     "prompt_confidence_max": "prompt_confidence_max",
@@ -28,17 +35,32 @@ FEATURE_ALIASES = {
     "context_confidence_max_prompt": "context_confidence_max_prompt",
     "visual_cosine": "target_visual_hidden_cosine",
     "target_visual_hidden_cosine": "target_visual_hidden_cosine",
+    "visual_prompt_cosine": "target_visual_prompt_hidden_cosine",
+    "target_visual_prompt_hidden_cosine": "target_visual_prompt_hidden_cosine",
+    "visual_cosine_capped_topmass_085": "target_visual_hidden_cosine_capped_topmass_085",
+    "target_visual_hidden_cosine_capped_topmass_085": "target_visual_hidden_cosine_capped_topmass_085",
+    "visual_prompt_cosine_capped_topmass_085": "target_visual_prompt_hidden_cosine_capped_topmass_085",
+    "target_visual_prompt_hidden_cosine_capped_topmass_085": "target_visual_prompt_hidden_cosine_capped_topmass_085",
     "prompt_last_cosine": "prompt_last_cosine",
     "prompt_mean_cosine": "prompt_mean_cosine",
+    "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine": "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine",
+    "risk_capped_topmass_085_times_inverse_target_visual_hidden_cosine": "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine",
+    "risk_capped_topmass_085*(1-target_visual_hidden_cosine)": "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine",
+    "risk_capped_topmass_085*(1_target_visual_hidden_cosine)": "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine",
 }
 
 FEATURE_KEYS = {
     "risk": "dgst_t_transport_risk_per_layer",
+    "risk_topmass_085": "dgst_t_transport_risk_topmass_085_per_layer",
+    "risk_capped_topmass_085": "dgst_t_transport_risk_capped_topmass_085_per_layer",
     "prompt_confidence_top3": "dgst_t_prompt_confidence_top3_per_layer",
     "prompt_confidence_max": "dgst_t_prompt_confidence_max_per_layer",
     "context_confidence": "dgst_t_context_confidence_per_layer",
     "context_confidence_max_prompt": "dgst_t_context_confidence_max_prompt_per_layer",
     "target_visual_hidden_cosine": "dgst_t_target_visual_hidden_cosine_per_layer",
+    "target_visual_prompt_hidden_cosine": "dgst_t_target_visual_prompt_hidden_cosine_per_layer",
+    "target_visual_hidden_cosine_capped_topmass_085": "dgst_t_target_visual_hidden_cosine_capped_topmass_085_per_layer",
+    "target_visual_prompt_hidden_cosine_capped_topmass_085": "dgst_t_target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer",
     "prompt_last_cosine": "dgst_t_prompt_last_cosine_per_layer",
     "prompt_mean_cosine": "dgst_t_prompt_mean_cosine_per_layer",
 }
@@ -47,6 +69,9 @@ LAYER_STAT_KEYS = {
     "prompt_confidence_top3": "prompt_logit_lens_top3_confidence",
     "prompt_confidence_max": "prompt_logit_lens_max_confidence",
     "target_visual_hidden_cosine": "target_hidden_top32_visual_cosine",
+    "target_visual_prompt_hidden_cosine": "target_hidden_top32_visual_prompt_cosine",
+    "target_visual_hidden_cosine_capped_topmass_085": "target_hidden_capped_topmass_085_visual_cosine",
+    "target_visual_prompt_hidden_cosine_capped_topmass_085": "target_hidden_capped_topmass_085_visual_prompt_cosine",
     "context_confidence": "context_confidence",
     "context_confidence_max_prompt": "context_confidence_max_prompt",
 }
@@ -62,6 +87,8 @@ def parse_args():
         nargs="+",
         default=[
             "risk",
+            "risk_topmass_085",
+            "risk_capped_topmass_085",
             "context_confidence",
             "context_confidence_max_prompt",
             "target_visual_hidden_cosine",
@@ -77,7 +104,7 @@ def parse_args():
         default=["xgb", "rf"],
         choices=["xgb", "rf", "mlp"],
     )
-    parser.add_argument("--scoring", default="f1", choices=["f1", "accuracy"])
+    parser.add_argument("--scoring", default="f1", choices=["f1", "accuracy", "auc"])
     return parser.parse_args()
 
 
@@ -157,12 +184,15 @@ def main() -> None:
         save_json(results, out_path)
 
     print(f"\n[FeatureSets] Saved results to {out_path}")
+    _write_summary_table(out_path)
 
 
 def parse_feature_set(value: str) -> list[str]:
     blocks = []
     for raw in value.split("+"):
-        key = raw.strip().lower().replace("-", "_")
+        key = raw.strip().lower().replace("（", "(").replace("）", ")").replace(" ", "")
+        if key not in FEATURE_ALIASES:
+            key = key.replace("-", "_")
         if not key:
             continue
         if key not in FEATURE_ALIASES:
@@ -190,6 +220,16 @@ def build_selected_matrix(features: Sequence[dict], blocks: Sequence[str]) -> tu
 
 
 def feature_block(feat: dict, block: str) -> np.ndarray:
+    if block == "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine":
+        risk = feature_block(feat, "risk_capped_topmass_085")
+        visual = feature_block(feat, "target_visual_hidden_cosine")
+        if risk.shape != visual.shape:
+            raise ValueError(
+                "risk_capped_topmass_085 and target_visual_hidden_cosine must have "
+                f"the same shape, got {risk.shape} and {visual.shape}."
+            )
+        return (risk * (1.0 - visual)).astype(np.float32)
+
     key = FEATURE_KEYS[block]
     values = feat.get(key)
     if values is None and block == "risk":
@@ -219,6 +259,13 @@ def _json_ready(value):
     if isinstance(value, float) and math.isnan(value):
         return None
     return value
+
+
+def _write_summary_table(results_path: str) -> None:
+    try:
+        write_summary_tables(results_path, formats=("md",), print_table=True)
+    except Exception as exc:
+        print(f"[FeatureSets] WARNING: failed to write summary table: {exc}")
 
 
 if __name__ == "__main__":

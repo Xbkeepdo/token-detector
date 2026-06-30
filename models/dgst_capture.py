@@ -147,6 +147,7 @@ def build_dgst_t_raw(
     prediction_position: int,
     support_scope: str = "visual_prompt",
     semantic_chunk_size: int = 64,
+    keep_on_device: bool = False,
 ) -> dict[str, Any]:
     """Build the raw tensors consumed by features.dgst_t.compute_dgst_t."""
     return build_dgst_t_raw_batch(
@@ -161,6 +162,7 @@ def build_dgst_t_raw(
         prediction_positions=[int(prediction_position)],
         support_scope=support_scope,
         semantic_chunk_size=semantic_chunk_size,
+        keep_on_device=keep_on_device,
     )[0]
 
 
@@ -177,6 +179,7 @@ def build_dgst_t_raw_batch(
     prediction_positions: Sequence[int],
     support_scope: str = "visual_prompt",
     semantic_chunk_size: int = 64,
+    keep_on_device: bool = False,
 ) -> list[dict[str, Any]]:
     """Build per-token DGST-T raw tensors from one shared decoder forward."""
     target_ids = [int(token_id) for token_id in target_token_ids]
@@ -261,10 +264,13 @@ def build_dgst_t_raw_batch(
         top_k = min(3, int(prompt_probs_all.shape[0]))
         prompt_conf_all = torch.topk(prompt_probs_all.float(), k=top_k, dim=0).values.mean(dim=0)
         prompt_max_conf_all = prompt_probs_all.float().max(dim=0).values
-        prompt_last_state = prompt_states[-1].detach().cpu()
-        prompt_mean_state = prompt_states.mean(dim=0).detach().cpu()
-        support_states_cpu = support_states.detach().cpu()
-        support_output_states_cpu = support_output_states.detach().cpu()
+        prompt_last_state = _raw_tensor(prompt_states[-1], keep_on_device=keep_on_device)
+        prompt_mean_state = _raw_tensor(prompt_states.mean(dim=0), keep_on_device=keep_on_device)
+        support_states_raw = _raw_tensor(support_states, keep_on_device=keep_on_device)
+        support_output_states_raw = _raw_tensor(
+            support_output_states,
+            keep_on_device=keep_on_device,
+        )
 
         for target_offset, prediction_position in enumerate(pred_positions):
             attention_row = capture["attn_weights"][0, :, int(prediction_position), :]
@@ -273,19 +279,27 @@ def build_dgst_t_raw_batch(
             ).mean(dim=0)
 
             part = raw_parts[target_offset]
-            part["source_ffn_states"].append(o_ffn[int(prediction_position), :].detach().cpu())
-            part["prediction_hidden_states"].append(layer_hidden[int(prediction_position), :].detach().cpu())
-            part["support_h_mid_states"].append(support_states_cpu)
-            part["support_output_states"].append(support_output_states_cpu)
-            part["support_attentions"].append(support_attention.detach().cpu())
-            part["semantic_probs"].append(support_semantic_all[:, target_offset].detach().cpu())
+            part["source_ffn_states"].append(
+                _raw_tensor(o_ffn[int(prediction_position), :], keep_on_device=keep_on_device)
+            )
+            part["prediction_hidden_states"].append(
+                _raw_tensor(layer_hidden[int(prediction_position), :], keep_on_device=keep_on_device)
+            )
+            part["support_h_mid_states"].append(support_states_raw)
+            part["support_output_states"].append(support_output_states_raw)
+            part["support_attentions"].append(
+                _raw_tensor(support_attention, keep_on_device=keep_on_device)
+            )
+            part["semantic_probs"].append(
+                _raw_tensor(support_semantic_all[:, target_offset], keep_on_device=keep_on_device)
+            )
             part["prompt_last_hidden_states"].append(prompt_last_state)
             part["prompt_mean_hidden_states"].append(prompt_mean_state)
             part["prompt_logit_lens_top3_confidence"].append(
-                prompt_conf_all[target_offset].detach().cpu()
+                _raw_tensor(prompt_conf_all[target_offset], keep_on_device=keep_on_device)
             )
             part["prompt_logit_lens_max_confidence"].append(
-                prompt_max_conf_all[target_offset].detach().cpu()
+                _raw_tensor(prompt_max_conf_all[target_offset], keep_on_device=keep_on_device)
             )
 
     raws: list[dict[str, Any]] = []
@@ -313,10 +327,18 @@ def build_dgst_t_raw_batch(
                 "prompt_logit_lens_max_confidence": torch.stack(
                     part["prompt_logit_lens_max_confidence"], dim=0
                 ),
-                "target_embedding": target_embeddings[target_offset].detach().cpu(),
+                "target_embedding": _raw_tensor(
+                    target_embeddings[target_offset],
+                    keep_on_device=keep_on_device,
+                ),
             }
         )
     return raws
+
+
+def _raw_tensor(tensor: torch.Tensor, *, keep_on_device: bool) -> torch.Tensor:
+    value = tensor.detach()
+    return value if keep_on_device else value.cpu()
 
 
 def resolve_prompt_positions(

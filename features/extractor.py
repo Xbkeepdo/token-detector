@@ -137,6 +137,12 @@ def extract_features_for_dataset(
                     alpha=cfg_dgst_t.get("alpha", 2.0),
                     ot_solver=cfg_dgst_t.get("ot_solver", "linprog"),
                     atarget_visual_top_k=cfg_dgst_t.get("atarget_visual_top_k", 32),
+                    topmass_alpha=cfg_dgst_t.get("topmass_085_alpha", 0.85),
+                    capped_topmass_alpha=cfg_dgst_t.get("capped_topmass_085_alpha", 0.85),
+                    capped_topmass_min_k=cfg_dgst_t.get("capped_topmass_085_min_k", 32),
+                    capped_topmass_max_k=cfg_dgst_t.get("capped_topmass_085_max_k", 64),
+                    compute_topmass_085=cfg_dgst_t.get("compute_topmass_085", True),
+                    compute_capped_topmass_085=cfg_dgst_t.get("compute_capped_topmass_085", True),
                 )
             alpha_img_per_layer, alpha_text_per_layer = compute_alpha_img_alpha_text(
                 text_to_patch_attn=model_out.text_to_patch_attn,
@@ -162,6 +168,30 @@ def extract_features_for_dataset(
                     "dgst_t_target_visual_hidden_cosine_per_layer",
                     dgst_t["dgst_t_atarget_visual_cosine_per_layer"],
                 ).tolist(),
+                "dgst_t_target_visual_prompt_hidden_cosine_per_layer": dgst_t.get(
+                    "dgst_t_target_visual_prompt_hidden_cosine_per_layer",
+                    dgst_t.get(
+                        "dgst_t_target_visual_hidden_cosine_per_layer",
+                        dgst_t["dgst_t_atarget_visual_cosine_per_layer"],
+                    ),
+                ).tolist(),
+                "dgst_t_target_visual_hidden_cosine_capped_topmass_085_per_layer": dgst_t.get(
+                    "dgst_t_target_visual_hidden_cosine_capped_topmass_085_per_layer",
+                    dgst_t.get(
+                        "dgst_t_target_visual_hidden_cosine_per_layer",
+                        dgst_t["dgst_t_atarget_visual_cosine_per_layer"],
+                    ),
+                ).tolist(),
+                "dgst_t_target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer": dgst_t.get(
+                    "dgst_t_target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer",
+                    dgst_t.get(
+                        "dgst_t_target_visual_prompt_hidden_cosine_per_layer",
+                        dgst_t.get(
+                            "dgst_t_target_visual_hidden_cosine_per_layer",
+                            dgst_t["dgst_t_atarget_visual_cosine_per_layer"],
+                        ),
+                    ),
+                ).tolist(),
                 "dgst_t_prompt_confidence_top3_per_layer": dgst_t.get(
                     "dgst_t_prompt_confidence_top3_per_layer",
                     _layer_stat_tensor(dgst_t["dgst_t_layer_stats"], "prompt_logit_lens_top3_confidence"),
@@ -181,6 +211,14 @@ def extract_features_for_dataset(
                 "alpha_text_per_layer":  alpha_text_per_layer.tolist(),
                 **baseline,
             }
+            if "dgst_t_transport_risk_topmass_085_per_layer" in dgst_t:
+                feat["dgst_t_transport_risk_topmass_085_per_layer"] = dgst_t[
+                    "dgst_t_transport_risk_topmass_085_per_layer"
+                ].tolist()
+            if "dgst_t_transport_risk_capped_topmass_085_per_layer" in dgst_t:
+                feat["dgst_t_transport_risk_capped_topmass_085_per_layer"] = dgst_t[
+                    "dgst_t_transport_risk_capped_topmass_085_per_layer"
+                ].tolist()
             image_features.append(feat)
 
         all_features.extend(image_features)

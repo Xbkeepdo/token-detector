@@ -170,6 +170,12 @@ def grid_search(
             score = f1_score(y_val, y_pred, zero_division=0)
         elif scoring == "accuracy":
             score = accuracy_score(y_val, y_pred)
+        elif scoring == "auc":
+            try:
+                y_prob = clf.predict_proba(X_val)[:, 1]
+                score = roc_auc_score(y_val, y_prob)
+            except Exception:
+                score = -1.0
         else:
             raise ValueError(f"Unknown scoring: {scoring}")
 

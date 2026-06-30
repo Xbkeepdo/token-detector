@@ -47,3 +47,18 @@ python scripts/train_and_eval.py \
 
 The POPE-specific legacy extractor was copied with the TGD tree but is not the
 primary migrated path.
+
+
+
+python scripts/train_feature_sets.py \
+  --model internvl_2_5_8b \
+  --config configs/model_configs.yaml \
+  --output-dir outputs/internvl_2_5_8b/COCO500 \
+  --feature-sets \
+    risk \
+    risk_capped_topmass_085 \
+    risk_capped_topmass_085+context_confidence \
+    risk_capped_topmass_085+context_confidence_max_prompt \
+    risk_capped_topmass_085+target_visual_hidden_cosine \
+  --classifiers xgb rf mlp \
+  --scoring auc

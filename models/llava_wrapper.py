@@ -277,6 +277,12 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 alpha=cfg_dgst_t.get("alpha", 2.0),
                 ot_solver=cfg_dgst_t.get("ot_solver", "linprog"),
                 atarget_visual_top_k=cfg_dgst_t.get("atarget_visual_top_k", 32),
+                topmass_alpha=cfg_dgst_t.get("topmass_085_alpha", 0.85),
+                capped_topmass_alpha=cfg_dgst_t.get("capped_topmass_085_alpha", 0.85),
+                capped_topmass_min_k=cfg_dgst_t.get("capped_topmass_085_min_k", 32),
+                capped_topmass_max_k=cfg_dgst_t.get("capped_topmass_085_max_k", 64),
+                compute_topmass_085=cfg_dgst_t.get("compute_topmass_085", True),
+                compute_capped_topmass_085=cfg_dgst_t.get("compute_capped_topmass_085", True),
             )
         else:
             dgst_raws = build_dgst_t_raw_batch(

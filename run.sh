@@ -2,10 +2,10 @@
 # Full pipeline for one model. Replace MODEL and paths as needed.
 set -euo pipefail
 
-MODEL="${MODEL:-llava_1_5_7b}"          # or: internvl_2_5_8b, qwen2_5_vl_7b, llava_1_5_7b
+MODEL="${MODEL:-internvl_2_5_8b}"          # or: internvl_2_5_8b, qwen2_5_vl_7b, llava_1_5_7b
 CONFIG="${CONFIG:-configs/model_configs.yaml}"
 LABELER="${LABELER:-gpt4o}"
-OUTPUT="${OUTPUT:-outputs/${MODEL}/4000COCO}"       # gpt4o, chair, or coco-output
+OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO500-visualonly}"       # gpt4o, chair, or coco-output
 # if [ "$LABELER" = "coco-output" ]; then
 #     LABELER="chair"
 # fi
@@ -20,7 +20,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 DEVICE="${DEVICE:-cuda:0}"
 GENERATION_DEVICES="${GENERATION_DEVICES:-cuda:0 cuda:1}"
 FEATURE_DEVICES="${FEATURE_DEVICES:-cuda:0 cuda:1}"
-OPENAI_PROXY="${OPENAI_PROXY:-}"
+OPENAI_PROXY="${OPENAI_PROXY:-http://127.0.0.1:12598}"
 export CUDA_VISIBLE_DEVICES
 
 if [ "$LABELER" = "gpt4o" ] \
