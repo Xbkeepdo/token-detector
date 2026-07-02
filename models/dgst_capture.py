@@ -229,6 +229,7 @@ def build_dgst_t_raw_batch(
             "support_output_states": [],
             "support_attentions": [],
             "semantic_probs": [],
+            "relative_vll_logits": [],
             "prompt_last_hidden_states": [],
             "prompt_mean_hidden_states": [],
             "prompt_logit_lens_top3_confidence": [],
@@ -250,6 +251,12 @@ def build_dgst_t_raw_batch(
         prompt_states = layer_hidden.index_select(0, prompt_index)
 
         support_semantic_all = target_probabilities_multi(
+            output_layer=output_layer,
+            states=support_states,
+            target_token_ids=target_ids,
+            chunk_size=semantic_chunk_size,
+        )
+        support_relative_logits_all = target_logits_multi(
             output_layer=output_layer,
             states=support_states,
             target_token_ids=target_ids,
@@ -293,6 +300,12 @@ def build_dgst_t_raw_batch(
             part["semantic_probs"].append(
                 _raw_tensor(support_semantic_all[:, target_offset], keep_on_device=keep_on_device)
             )
+            part["relative_vll_logits"].append(
+                _raw_tensor(
+                    support_relative_logits_all[:, target_offset],
+                    keep_on_device=keep_on_device,
+                )
+            )
             part["prompt_last_hidden_states"].append(prompt_last_state)
             part["prompt_mean_hidden_states"].append(prompt_mean_state)
             part["prompt_logit_lens_top3_confidence"].append(
@@ -319,6 +332,7 @@ def build_dgst_t_raw_batch(
                 "support_output_states": torch.stack(part["support_output_states"], dim=0),
                 "support_attentions": torch.stack(part["support_attentions"], dim=0),
                 "semantic_probs": torch.stack(part["semantic_probs"], dim=0),
+                "relative_vll_logits": torch.stack(part["relative_vll_logits"], dim=0),
                 "prompt_last_hidden_states": torch.stack(part["prompt_last_hidden_states"], dim=0),
                 "prompt_mean_hidden_states": torch.stack(part["prompt_mean_hidden_states"], dim=0),
                 "prompt_logit_lens_top3_confidence": torch.stack(
@@ -449,6 +463,50 @@ def target_probabilities_multi(
             chunk_probs[:, column] = valid_probs[:, valid_offset]
         probs.append(chunk_probs)
     return torch.cat(probs, dim=0).reshape(*states.shape[:-1], len(token_ids)).float()
+
+
+def target_logits_multi(
+    *,
+    output_layer: Any,
+    states: torch.Tensor,
+    target_token_ids: Sequence[int],
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Compute raw W_U target logits without LM-head bias."""
+    weight = output_layer.weight
+    token_ids = [int(token_id) for token_id in target_token_ids]
+    if not token_ids:
+        return torch.empty(*states.shape[:-1], 0, dtype=torch.float32, device=states.device)
+
+    valid_columns = [
+        (column, token_id)
+        for column, token_id in enumerate(token_ids)
+        if 0 <= token_id < int(weight.shape[0])
+    ]
+    if not valid_columns:
+        return torch.zeros(*states.shape[:-1], len(token_ids), dtype=torch.float32, device=states.device)
+
+    logits = []
+    flat_states = states.reshape(-1, states.shape[-1])
+    valid_token_index = torch.tensor(
+        [token_id for _column, token_id in valid_columns],
+        dtype=torch.long,
+        device=weight.device,
+    )
+    target_weight = weight.index_select(dim=0, index=valid_token_index)
+    for start in range(0, int(flat_states.shape[0]), max(1, int(chunk_size))):
+        chunk = flat_states[start : start + int(chunk_size)].to(device=weight.device, dtype=weight.dtype)
+        valid_logits = F.linear(chunk, target_weight, bias=None).float().to(states.device)
+        chunk_logits = torch.zeros(
+            int(chunk.shape[0]),
+            len(token_ids),
+            dtype=torch.float32,
+            device=states.device,
+        )
+        for valid_offset, (column, _token_id) in enumerate(valid_columns):
+            chunk_logits[:, column] = valid_logits[:, valid_offset]
+        logits.append(chunk_logits)
+    return torch.cat(logits, dim=0).reshape(*states.shape[:-1], len(token_ids)).float()
 
 
 def merged_position_for_tokenized_position(

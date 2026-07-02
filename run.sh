@@ -2,10 +2,10 @@
 # Full pipeline for one model. Replace MODEL and paths as needed.
 set -euo pipefail
 
-MODEL="${MODEL:-internvl_2_5_8b}"          # or: internvl_2_5_8b, qwen2_5_vl_7b, llava_1_5_7b
-CONFIG="${CONFIG:-configs/model_configs.yaml}"
+MODEL="${MODEL:-qwen2_5_vl_7b}"          # or: internvl_2_5_8b, qwen2_5_vl_7b, llava_1_5_7b
+CONFIG="${CONFIG:-configs/model_configs_visualonly.yaml}"
 LABELER="${LABELER:-gpt4o}"
-OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO500-visualonly}"       # gpt4o, chair, or coco-output
+OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO500-visualonly-relativevll}"       # gpt4o, chair, or coco-output
 # if [ "$LABELER" = "coco-output" ]; then
 #     LABELER="chair"
 # fi

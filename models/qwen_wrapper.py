@@ -195,6 +195,8 @@ class QwenVLWrapper(BaseLVLMWrapper):
                 capped_topmass_max_k=cfg_dgst_t.get("capped_topmass_085_max_k", 64),
                 compute_topmass_085=cfg_dgst_t.get("compute_topmass_085", True),
                 compute_capped_topmass_085=cfg_dgst_t.get("compute_capped_topmass_085", True),
+                target_gate_mode=cfg_dgst_t.get("target_gate_mode", "legacy_prob"),
+                relative_vll_mad_epsilon=cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6),
             )
             dgst_t_raw = None
 

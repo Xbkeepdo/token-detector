@@ -22,9 +22,25 @@ from utils.io_utils import load_pkl
 FEATURE_KEYS = {
     "risk": "dgst_t_transport_risk_per_layer",
     "risk_capped_topmass_085": "dgst_t_transport_risk_capped_topmass_085_per_layer",
+    "risk_relative_vll": "dgst_t_transport_risk_relative_vll_per_layer",
+    "risk_relative_vll_capped_topmass_085": "dgst_t_transport_risk_relative_vll_capped_topmass_085_per_layer",
+    "risk_visual_prompt_relative_vll": "dgst_t_transport_risk_visual_prompt_relative_vll_per_layer",
+    "risk_visual_prompt_relative_vll_capped_topmass_085": (
+        "dgst_t_transport_risk_visual_prompt_relative_vll_capped_topmass_085_per_layer"
+    ),
     "target_visual_hidden_cosine": "dgst_t_target_visual_hidden_cosine_per_layer",
     "target_visual_prompt_hidden_cosine": "dgst_t_target_visual_prompt_hidden_cosine_per_layer",
     "target_visual_hidden_cosine_capped_topmass_085": "dgst_t_target_visual_hidden_cosine_capped_topmass_085_per_layer",
+    "target_visual_hidden_cosine_relative_vll": "dgst_t_target_visual_hidden_cosine_relative_vll_per_layer",
+    "target_visual_hidden_cosine_relative_vll_capped_topmass_085": (
+        "dgst_t_target_visual_hidden_cosine_relative_vll_capped_topmass_085_per_layer"
+    ),
+    "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll": (
+        "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer"
+    ),
+    "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085": (
+        "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer"
+    ),
     "target_visual_prompt_hidden_cosine_capped_topmass_085": "dgst_t_target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer",
     "context_confidence": "dgst_t_context_confidence_per_layer",
     "context_confidence_max_prompt": "dgst_t_context_confidence_max_prompt_per_layer",

@@ -4,6 +4,15 @@
 比较 Qwen2.5-VL-7B 与 InternVL2.5-8B 在 DGST-T `support_scope=visual` 时，幻觉/非幻觉 object token 的逐层 transport risk 曲线。
 
 ## Last status
+- 已实现 relative VLL target 构造，按用户最新公式使用无 bias raw target logit：`l_m^l = W_U^T v_m^l[w*]`，其中 `v_m^l` 为视觉 token 的 `h_mid`。
+- 新增配置项：`target_gate_mode: "legacy_prob" | "relative_vll" | "dual"` 与 `relative_vll_mad_epsilon`。当前 `configs/model_configs.yaml` 默认 `legacy_prob`，`configs/model_configs_visualonly.yaml` 设置为 `dual`。
+- relative VLL 新增字段包括：
+  - `dgst_t_transport_risk_relative_vll_per_layer`
+  - `dgst_t_transport_risk_relative_vll_capped_topmass_085_per_layer`
+  - `dgst_t_target_visual_hidden_cosine_relative_vll_per_layer`
+  - `dgst_t_target_visual_hidden_cosine_relative_vll_capped_topmass_085_per_layer`
+- 旧 DGST-T 字段保持不变；`dual` 模式会同时输出旧字段和 relative VLL 新字段。`visual_prompt` support 下 median/MAD 仍只在视觉 token 上统计，prompt token 的 relative gate 为 0。
+- 用户澄清还要看 visual 和 prompt 同时参与 VLL 的效果；已新增 `visual_prompt_relative_vll` 并保持旧 `relative_vll` 不变。`visual_prompt_relative_vll` 在 visual+prompt support 全体 token 上同时计算 median/MAD、`q_i=sigmoid(z_i)` 和 `T_i=A_i q_i/sum(Aq)`，不是 prompt-only。
 - 已新增 `configs/model_configs_visualonly.yaml`，只在 Qwen/InternVL 模型配置中设置 `dgst_t_support_scope: "visual"`，并修正 COCO 数据路径为 `/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco`。
 - 用户要求将 visual-only 的 DGST-T `cost_mode` 改为 `decomposed` 后重跑；已确认并将 `configs/model_configs_visualonly.yaml` 设置为 `cost_mode: "decomposed"`。
 - 已完成 InternVL COCO500 visual-only 特征抽取：`outputs/internvl_2_5_8b/COCO500-visualonly/features.pkl`，3715 行，hall=3064，true=651，support_size=256。
@@ -14,6 +23,46 @@
   - `outputs/visualonly_support_risk_comparison/qwen_internvl_visualonly_decomposed_risk_layerwise_by_label.{png,pdf}`
 - decomposed 初步结果：Qwen visual-only 下 hallucination 与 non-hallucination 的平均 risk 曲线仍高度重合，diff_avg 约 0.0011，最大绝对差在第 12 层约 -0.0889；InternVL visual-only 下早期层差异更明显，diff_avg 约 0.0151，最大绝对差在第 3 层约 0.169。
 - 与 direct 版本相比，decomposed 主要使 risk 绝对值整体下移，曲线形状和类别差异趋势基本一致。
+- 已生成 capped topmass 0.85 risk 曲线：
+  - `outputs/qwen2_5_vl_7b/COCO500-visualonly/results/qwen2_5_vl_7b_visualonly_risk_vs_capped_topmass_085_by_label.{png,pdf,csv}`
+  - `outputs/internvl_2_5_8b/COCO500-visualonly/results/internvl_2_5_8b_visualonly_risk_vs_capped_topmass_085_by_label.{png,pdf,csv}`
+  - `outputs/visualonly_support_risk_comparison/qwen_internvl_visualonly_capped_topmass_085_risk_layerwise_by_label.{png,pdf,csv}`
+- capped risk 结果：Qwen hallucination/non-hallucination 仍高度重合，diff_avg 约 0.0018，最大绝对差在第 7 层约 0.0906；InternVL capped 后整体差异缩小，diff_avg 约 0.0054，最大绝对差在第 25 层约 -0.1106。
+- 已在 visual-only + decomposed 特征上补跑 feature-set 分类实验：
+  - Qwen `risk` 最佳 xgb：F1=0.901，Acc=0.845，AUC=0.789。
+  - Qwen `risk+target_visual_hidden_cosine_capped_topmass_085` 最佳 xgb：F1=0.914，Acc=0.870，AUC=0.861。
+  - Qwen `risk_capped_topmass_085+target_visual_hidden_cosine_capped_topmass_085` 最佳 xgb：F1=0.913，Acc=0.870，AUC=0.868。
+  - InternVL `risk` 最佳 xgb：F1=0.938，Acc=0.892，AUC=0.862。
+  - InternVL `risk+target_visual_hidden_cosine_capped_topmass_085` 最佳 xgb：F1=0.954，Acc=0.922，AUC=0.932。
+  - InternVL `risk_capped_topmass_085+target_visual_hidden_cosine_capped_topmass_085` 最佳 AUC 为 rf：F1=0.936，Acc=0.889，AUC=0.924；最佳 F1 为 xgb：F1=0.954，Acc=0.922，AUC=0.921。
+- 已补齐并对比原 `COCO500` visual+prompt/direct 与 `COCO500-visualonly` visual-only/decomposed 的同名 feature-set 分类结果：
+  - 对比表：`outputs/visualonly_support_risk_comparison/direct_vs_visualonly_decomposed_feature_sets.{md,csv}`。
+  - 单独 `risk`：Qwen visual-only/decomposed 对 xgb AUC 从 0.811 降到 0.789，rf/MLP 基本持平；InternVL 三个分类器 AUC 均下降（xgb 0.888->0.862，rf 0.886->0.833，mlp 0.854->0.822）。
+  - `risk+target_visual_hidden_cosine_capped_topmass_085`：Qwen xgb AUC 持平 0.861，rf 下降 0.862->0.831，mlp 小升 0.843->0.849；InternVL 明显提升（xgb 0.885->0.932，rf 0.881->0.912，mlp 0.843->0.929）。
+  - `risk_capped_topmass_085+target_visual_hidden_cosine_capped_topmass_085`：Qwen xgb/MLP 提升（0.838->0.868，0.833->0.860），rf 下降；InternVL 三个分类器 AUC 均提升（xgb 0.860->0.921，rf 0.892->0.924，mlp 0.829->0.897）。
+- 已实现 Word All-Token Risk Mean：
+  - 新增 `target_token_aggregation: "first" | "risk_mean"`，默认 `first`，旧配置显式保持 `first`。
+  - `risk_mean` 严格按用户定义实现：word span 内每个合法 sub-token 使用自己的 `prediction_position` 和 `target_token_id` 独立计算完整 DGST-T/relative VLL/cosine 曲线，再对同名 `*_per_layer` 曲线逐层算 arithmetic mean；没有先平均 target logit/prob。
+  - 输出仍保持“一行 = 一个 object word”。兼容字段如 `target_token_id`、`response_token_idx` 保留第一个 sub-token，并新增 `target_token_ids`、`response_token_indices`、`target_token_count`、`target_token_aggregation`。
+  - `dgst_t_layer_stats` 中同层数值字段取均值，`dgst_t_score*` 从平均后的 risk 曲线重新按 baseline-excess 逻辑计算，`dgst_t_feature_vector` 也基于平均后曲线重建。
+  - 新增配置：`configs/model_configs_visualprompt_relativevll_riskmean.yaml`，输出目录为 `COCO500-visualprompt-relativevll-riskmean`。
+- Qwen `COCO500-visualprompt-relativevll-riskmean` 已完成：features 共 2190 行，hall=1636，true=554；`target_token_count` 分布为 `{1: 911, 2: 848, 3: 347, 4: 65, 5: 12, 6: 4, 7: 1, 8: 1, 10: 1}`。
+  - 逐层图在 `outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-riskmean/results/`，包括 risk、capped risk、target cosine、capped target cosine 对 visual-relative-vll 的对比。
+  - 曲线摘要：visual-relative-vll risk hall/non diff_avg 约 0.049；visual+prompt risk_mean diff_avg 约 0.040。capped 后 visual-relative-vll diff_avg 约 0.034，visual+prompt risk_mean diff_avg 约 0.036。
+  - 消融表：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-riskmean/results/qwen2_5_vl_7b_selected_feature_sets_table.md`
+  - `risk_visual_prompt_relative_vll`：XGB F1=0.905，AUC=0.851；RF F1=0.898，AUC=0.820；MLP F1=0.892，AUC=0.864。
+  - 单独 capped target cosine 表现最好：`target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085` 的 XGB F1=0.932，AUC=0.911。
+  - 组合 `risk_visual_prompt_relative_vll+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` 的 XGB 为 F1=0.932、AUC=0.922，是本组 risk_mean 中最高 AUC。
+- InternVL `COCO500-visualprompt-relativevll-riskmean` 已完成：features 共 3715 行，hall=3064，true=651；`target_token_count` 分布为 `{1: 1327, 2: 1520, 3: 687, 4: 137, 5: 37, 6: 6, 8: 1}`。
+  - 逐层图在 `outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-riskmean/results/`，包括 risk、capped risk、target cosine、capped target cosine 对 visual-relative-vll 的对比。
+  - 曲线摘要：visual-relative-vll risk diff_avg 约 -0.016；visual+prompt risk_mean diff_avg 约 0.051。capped 后 visual-relative-vll diff_avg 约 -0.014，visual+prompt risk_mean diff_avg 约 0.049。
+  - 消融表：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-riskmean/results/internvl_2_5_8b_selected_feature_sets_table.md`
+  - `risk_visual_prompt_relative_vll`：XGB F1=0.950，AUC=0.861；RF F1=0.949，AUC=0.870；MLP F1=0.939，AUC=0.888。
+  - 最强组合为 `risk_visual_prompt_relative_vll+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` 的 XGB：F1=0.954，AUC=0.935。
+- first-token vs risk_mean 对比表已生成：`outputs/visualprompt_relativevll_riskmean_comparison/first_vs_riskmean_selected_feature_sets.md`。
+  - 总体看，risk_mean 的逐层 hall/non 曲线差异仍存在，InternVL visual+prompt risk_mean 更清晰；但分类 AUC 多数比 first-token 略降。
+  - Qwen 例外点：单独 capped target cosine 在 risk_mean 下 XGB 从 first-token 的 F1=0.917、AUC=0.896 提升到 F1=0.932、AUC=0.911。
+  - InternVL 组合特征略降但接近：`risk_visual_prompt_relative_vll+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` 的 XGB AUC 从 0.939 降到 0.935。
 
 ## Files changed recently
 - 新增：`configs/model_configs_visualonly.yaml`
@@ -21,18 +70,93 @@
 - 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualonly/`
 - 新增输出目录：`outputs/visualonly_support_risk_comparison/`
 - 备份错误中间结果：`outputs/qwen2_5_vl_7b/COCO500-visualonly/bad_internvl_labels_20260630_194840/`
+- 新增：`configs/model_configs_visualprompt_relativevll.yaml`
+- 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll/`
+- 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll/`
+- 新增：`configs/model_configs_visualprompt_relativevll_riskmean.yaml`
+- 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-riskmean/`
+- 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-riskmean/`
+- 新增输出目录：`outputs/visualprompt_relativevll_riskmean_comparison/`
 
 ## Commands run
 - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model internvl_2_5_8b --config configs/model_configs_visualonly.yaml --output-dir outputs/internvl_2_5_8b/COCO500-visualonly --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
 - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model qwen2_5_vl_7b --config configs/model_configs_visualonly.yaml --output-dir outputs/qwen2_5_vl_7b/COCO500-visualonly --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
 - 使用 `/opt/conda/private/envs/vicr/bin/python` 读取 `features.pkl` 并生成逐层 risk 的 png/pdf/csv。
 - 2026-06-30 再次运行上述两条 `extract_features.py` 命令，用 `cost_mode: "decomposed"` 重算 visual-only 特征和图。
+- 2026-06-30 使用 `scripts/plot_layerwise_feature_comparison.py --features risk risk_capped_topmass_085` 生成 Qwen/InternVL 单模型 risk-vs-capped 图，并额外生成双模型 capped risk 合并图。
+- 2026-06-30 使用 `scripts/train_feature_sets.py` 在两个 visual-only 输出目录上补跑 `risk`、`risk+target_visual_hidden_cosine_capped_topmass_085`、`risk_capped_topmass_085+target_visual_hidden_cosine_capped_topmass_085`，分类器为 xgb/rf/mlp。
+- 2026-06-30 使用 `scripts/train_feature_sets.py` 在原 `COCO500` visual+prompt/direct 输出上补跑缺失的 `risk+target_visual_hidden_cosine_capped_topmass_085` 和 InternVL 的 capped 组合，并生成 direct vs visual-only/decomposed 对比表。
+- 2026-07-01 实现 relative VLL 代码后运行：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py models/dgst_capture.py features/extractor.py models/qwen_wrapper.py models/internvl_wrapper.py models/llava_wrapper.py scripts/train_feature_sets.py scripts/train_torch_probe_feature_sets.py scripts/plot_layerwise_feature_comparison.py`
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 小张量验证 median/MAD、prompt gate=0、MAD=0 稳定、`target_logits_multi` 不使用 bias、`legacy_prob` 与 `dual` 旧 risk 一致。
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 验证新增 train/plot aliases 可解析。
+- 2026-07-01 InternVL `COCO500-visualonly-relativevll` 已完成后生成图：
+  - `outputs/internvl_2_5_8b/COCO500-visualonly-relativevll/results/internvl_2_5_8b_visualonly_relativevll_risk_vs_legacy_by_label.{png,pdf,csv}`
+  - `outputs/internvl_2_5_8b/COCO500-visualonly-relativevll/results/internvl_2_5_8b_visualonly_relativevll_capped_risk_vs_legacy_by_label.{png,pdf,csv}`
+  - `outputs/internvl_2_5_8b/COCO500-visualonly-relativevll/results/internvl_2_5_8b_visualonly_relativevll_target_visual_cosine_vs_legacy_by_label.{png,pdf,csv}`
+  - `outputs/internvl_2_5_8b/COCO500-visualonly-relativevll/results/internvl_2_5_8b_visualonly_relativevll_capped_target_visual_cosine_vs_legacy_by_label.{png,pdf,csv}`
+  - 结果摘要：relative VLL risk 平均值明显低于 legacy risk（hall/non 均值约 0.436/0.420 vs 0.928/0.912），hall-non 平均差仍约 0.016；relative VLL capped risk 的 hall-non 平均差约 0.011，高于 legacy capped risk 的约 0.005；relative target visual cosine 仍表现为 non-hallucination 高于 hallucination。
+- 2026-07-01 已在 InternVL `COCO500-visualonly-relativevll` 上补跑 feature-set 消融，结果表：
+  - `outputs/internvl_2_5_8b/COCO500-visualonly-relativevll/results/internvl_2_5_8b_selected_feature_sets_table.md`
+  - 单独 `risk_relative_vll` 最佳为 MLP：F1=0.940，Acc=0.895，AUC=0.860；单独 `risk_relative_vll_capped_topmass_085` 最佳 AUC 为 MLP：AUC=0.866。
+  - 单独 `target_visual_hidden_cosine_relative_vll_capped_topmass_085` 已很强，最佳 AUC 为 RF：AUC=0.932；最佳 F1 为 XGB：F1=0.950，AUC=0.928。
+  - 最强组合为 `risk_relative_vll_capped_topmass_085+target_visual_hidden_cosine_relative_vll_capped_topmass_085` 的 XGB：Precision=0.930，Recall=0.977，F1=0.953，Acc=0.919，AUC=0.951。
+  - `risk_relative_vll+target_visual_hidden_cosine_relative_vll_capped_topmass_085` 的 XGB 也较强：F1=0.948，Acc=0.911，AUC=0.943。
+- 2026-07-01 Qwen `COCO500-visualonly-relativevll` 已完成后生成图：
+  - `outputs/qwen2_5_vl_7b/COCO500-visualonly-relativevll/results/qwen2_5_vl_7b_visualonly_relativevll_risk_vs_legacy_by_label.{png,pdf,csv}`
+  - `outputs/qwen2_5_vl_7b/COCO500-visualonly-relativevll/results/qwen2_5_vl_7b_visualonly_relativevll_capped_risk_vs_legacy_by_label.{png,pdf,csv}`
+  - `outputs/qwen2_5_vl_7b/COCO500-visualonly-relativevll/results/qwen2_5_vl_7b_visualonly_relativevll_target_visual_cosine_vs_legacy_by_label.{png,pdf,csv}`
+  - `outputs/qwen2_5_vl_7b/COCO500-visualonly-relativevll/results/qwen2_5_vl_7b_visualonly_relativevll_capped_target_visual_cosine_vs_legacy_by_label.{png,pdf,csv}`
+  - 结果摘要：legacy risk 的 hall/non 平均值几乎重合（约 0.778/0.777，diff_avg 约 0.001），relative VLL risk 的 hall/non 平均差提升到约 0.036；legacy capped risk diff_avg 约 0.002，relative VLL capped risk diff_avg 约 0.030。relative target visual cosine 中 non-hallucination 高于 hallucination 的差异也更明显（diff_avg 约 -0.047；capped 后约 -0.040）。
+- 2026-07-01 已在 Qwen `COCO500-visualonly-relativevll` 上补跑 feature-set 消融，结果表：
+  - `outputs/qwen2_5_vl_7b/COCO500-visualonly-relativevll/results/qwen2_5_vl_7b_selected_feature_sets_table.md`
+  - legacy `risk` 最佳为 XGB：F1=0.901，Acc=0.845，AUC=0.789。
+  - 单独 `risk_relative_vll` 最佳 AUC 为 MLP：AUC=0.904，F1=0.902；最佳 F1 为 XGB：F1=0.918，AUC=0.893。
+  - 单独 `risk_relative_vll_capped_topmass_085` 最佳 AUC 为 MLP：AUC=0.903，F1=0.907；最佳 F1 为 XGB：F1=0.920，AUC=0.878。
+  - 单独 `target_visual_hidden_cosine_relative_vll` 最佳 F1 为 XGB：F1=0.921，Acc=0.879，AUC=0.881。
+  - 组合 `risk_relative_vll+target_visual_hidden_cosine_relative_vll` 最佳 AUC 为 MLP：Precision=0.907，Recall=0.954，F1=0.930，Acc=0.894，AUC=0.942。
+  - 最高 F1/Acc 为 `risk_relative_vll_capped_topmass_085+target_visual_hidden_cosine_relative_vll_capped_topmass_085` 的 MLP：Precision=0.935，Recall=0.935，F1=0.935，Acc=0.903，AUC=0.923。
+- 2026-07-01 新增并验证 visual+prompt simultaneous VLL：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py features/extractor.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py`
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 小张量验证 `visual_prompt_relative_vll` 在全 support 上归一化、`relative_vll` 仍只给视觉 token target mass、输出字段存在且无 prompt-only 字段。
+  - 新增字段：`dgst_t_transport_risk_visual_prompt_relative_vll_per_layer`、`dgst_t_transport_risk_visual_prompt_relative_vll_capped_topmass_085_per_layer`、`dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer`、`dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer`。
+- 2026-07-01 Qwen `COCO500-visualprompt-relativevll` 已完成：
+  - 特征抽取命令：`CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model qwen2_5_vl_7b --config configs/model_configs_visualprompt_relativevll.yaml --output-dir outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
+  - features 共 2190 行，结果目录：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll/results/`
+  - 图：`qwen2_5_vl_7b_visualprompt_relativevll_risk_vs_visual_relativevll_by_label.{png,pdf,csv}`、`qwen2_5_vl_7b_visualprompt_relativevll_capped_risk_vs_visual_relativevll_by_label.{png,pdf,csv}`、`qwen2_5_vl_7b_visualprompt_relativevll_target_cosine_vs_visual_relativevll_by_label.{png,pdf,csv}`、`qwen2_5_vl_7b_visualprompt_relativevll_capped_target_cosine_vs_visual_relativevll_by_label.{png,pdf,csv}`。
+  - 曲线摘要：visual+prompt simultaneous risk 的 hall/non diff_avg 约 0.038，visual relative risk 约 0.040；capped 后 visual+prompt diff_avg 约 0.037，高于 visual relative capped 的约 0.027；target cosine 中 non-hall 高于 hall，visual+prompt capped diff_avg 约 -0.045，略强于 visual relative capped 的约 -0.040。
+  - 消融表：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll/results/qwen2_5_vl_7b_selected_feature_sets_table.md`
+  - 单独 `risk_visual_prompt_relative_vll`：XGB F1=0.908，Acc=0.860，AUC=0.902；单独 capped risk：XGB F1=0.915，AUC=0.878。
+  - 单独 `target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085`：XGB F1=0.917，AUC=0.896；RF AUC=0.900。
+  - 最强 AUC 为 `risk_visual_prompt_relative_vll+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` 的 MLP：F1=0.935，Acc=0.903，AUC=0.941。
+  - 最高 F1 为 visual+prompt 组合的 XGB：`risk_visual_prompt_relative_vll+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` F1=0.939，AUC=0.935；capped+capped 组合 XGB F1=0.939，AUC=0.936。
+- 2026-07-01 InternVL `COCO500-visualprompt-relativevll` 已完成：
+  - 特征抽取命令：`CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model internvl_2_5_8b --config configs/model_configs_visualprompt_relativevll.yaml --output-dir outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
+  - features 共 3715 行，结果目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll/results/`
+  - 图：`internvl_2_5_8b_visualprompt_relativevll_risk_vs_visual_relativevll_by_label.{png,pdf,csv}`、`internvl_2_5_8b_visualprompt_relativevll_capped_risk_vs_visual_relativevll_by_label.{png,pdf,csv}`、`internvl_2_5_8b_visualprompt_relativevll_target_cosine_vs_visual_relativevll_by_label.{png,pdf,csv}`、`internvl_2_5_8b_visualprompt_relativevll_capped_target_cosine_vs_visual_relativevll_by_label.{png,pdf,csv}`。
+  - 曲线摘要：visual+prompt simultaneous risk 的 hall/non diff_avg 约 0.049，明显强于 visual relative risk 在 visual+prompt support 下的约 -0.019；capped 后 visual+prompt diff_avg 约 0.048。target cosine 中 non-hall 高于 hall，visual+prompt capped diff_avg 约 -0.038，高于 visual relative capped 的约 -0.029。
+  - 消融表：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll/results/internvl_2_5_8b_selected_feature_sets_table.md`
+  - 单独 `risk_visual_prompt_relative_vll`：XGB F1=0.956，Acc=0.924，AUC=0.901；单独 capped risk：XGB F1=0.955，AUC=0.912。
+  - 单独 `target_visual_prompt_hidden_cosine_visual_prompt_relative_vll`：XGB F1=0.948，AUC=0.920；capped 版本 RF AUC=0.918。
+  - visual+prompt simultaneous 最强 F1 为 `risk_visual_prompt_relative_vll+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085` 的 XGB：Precision=0.950，Recall=0.974，F1=0.962，Acc=0.935，AUC=0.937。
+  - visual+prompt simultaneous 最强 AUC 为 capped+capped 组合 XGB：F1=0.959，Acc=0.930，AUC=0.944。当前总最高 AUC 仍是 visual branch 组合 `risk_relative_vll+target_visual_hidden_cosine_relative_vll` 的 MLP：F1=0.958，Acc=0.930，AUC=0.950。
+- 2026-07-01 Word All-Token Risk Mean 实现和验证：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/extractor.py features/dgst_t.py models/qwen_wrapper.py models/internvl_wrapper.py models/llava_wrapper.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py`
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 小样本验证两个 sub-token 的 risk/cosine 曲线逐层平均、`dgst_t_score` 从平均 risk 重算、`target_token_count` 和新增元数据正确。
+  - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model qwen2_5_vl_7b --config configs/model_configs_visualprompt_relativevll_riskmean.yaml --output-dir outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-riskmean --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
+  - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model internvl_2_5_8b --config configs/model_configs_visualprompt_relativevll_riskmean.yaml --output-dir outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-riskmean --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
+  - 使用 `scripts/plot_layerwise_feature_comparison.py` 在 Qwen/InternVL risk_mean 输出上生成 risk、capped risk、target cosine、capped target cosine 对比图。
+  - 使用 `scripts/train_feature_sets.py` 在 Qwen/InternVL risk_mean 输出上跑同一组 `risk_relative_vll`、`risk_visual_prompt_relative_vll`、target cosine 与组合特征，分类器为 xgb/rf/mlp。
+  - 生成 first-token vs risk_mean 汇总表：`outputs/visualprompt_relativevll_riskmean_comparison/first_vs_riskmean_selected_feature_sets.md`。
 
 ## Known issues
 - 第一次 Qwen visual-only 抽取误用了 InternVL 的 `labeling.json/generations.json`，产物已移动到 `outputs/qwen2_5_vl_7b/COCO500-visualonly/bad_internvl_labels_20260630_194840/`，不要用于分析。
 - 默认 `/opt/conda/bin/python` 缺少 torch/transformers/scipy/sklearn/openai/pyyaml；本次运行使用的是 `/opt/conda/private/envs/vicr/bin/python`。
-- `run.sh` 中仍有疑似 API key 示例字符串，建议后续清理并确认是否需要轮换。
+- `run.sh` 中的疑似 API key 示例字符串已改回占位符；如该字符串曾经是真实密钥，仍建议在 OpenAI 控制台轮换。
 
 ## Next steps
-- 如需进一步量化 visual-only 是否改善检测，可在两个 visual-only 输出目录上运行 `scripts/train_feature_sets.py` 或 torch probe。
-- 如需和 visual+prompt 直接对比，可把原 `COCO500/results/*risk_layerwise_by_label.csv` 与本次 visual-only CSV 做同图差值分析。
+- relative VLL visual-only/decomposed、visual+prompt simultaneous VLL、visual+prompt risk_mean 的 Qwen 和 InternVL 逐层图与 xgb/rf/mlp feature-set 消融已完成。
+- 当前最值得进一步看的是 first-token 与 risk_mean 的差异来源：多 sub-token word 是否主要集中在某些 object 类，以及后续 sub-token 的 risk 是否系统性更噪。
+- 下一步可把 Qwen 与 InternVL 的 visual-only relative VLL、visual+prompt simultaneous VLL、risk_mean 最强 feature set 汇总到一张跨模型对比表。
+- 如需进一步确认泛化，可补跑 torch probe 或换 split seed 做稳定性检查。
+- 如需和原 visual+prompt/direct 直接对比，可把原 `COCO500/results/*risk_layerwise_by_label.csv` 与本次 `COCO500-visualprompt-relativevll` CSV 做同图差值分析。

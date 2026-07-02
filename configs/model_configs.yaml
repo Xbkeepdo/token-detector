@@ -64,6 +64,9 @@ feature_extraction:
     capped_topmass_085_alpha: 0.85
     capped_topmass_085_min_k: 32
     capped_topmass_085_max_k: 64
+    target_gate_mode: "legacy_prob"
+    relative_vll_mad_epsilon: 1.0e-6
+    target_token_aggregation: "first"
 
 dataset:
   coco_root: "/home/apulis-dev/code/token-grounding-detector/data/coco"

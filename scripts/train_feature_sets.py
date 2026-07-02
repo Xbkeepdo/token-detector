@@ -27,6 +27,14 @@ FEATURE_ALIASES = {
     "topmass_085": "risk_topmass_085",
     "risk_capped_topmass_085": "risk_capped_topmass_085",
     "capped_topmass_085": "risk_capped_topmass_085",
+    "risk_relative_vll": "risk_relative_vll",
+    "relative_vll_risk": "risk_relative_vll",
+    "risk_relative_vll_capped_topmass_085": "risk_relative_vll_capped_topmass_085",
+    "relative_vll_capped_topmass_085": "risk_relative_vll_capped_topmass_085",
+    "risk_visual_prompt_relative_vll": "risk_visual_prompt_relative_vll",
+    "visual_prompt_relative_vll_risk": "risk_visual_prompt_relative_vll",
+    "risk_visual_prompt_relative_vll_capped_topmass_085": "risk_visual_prompt_relative_vll_capped_topmass_085",
+    "visual_prompt_relative_vll_capped_topmass_085": "risk_visual_prompt_relative_vll_capped_topmass_085",
     "prompt_confidence": "prompt_confidence_top3",
     "prompt_confidence_top3": "prompt_confidence_top3",
     "prompt_confidence_max": "prompt_confidence_max",
@@ -39,6 +47,22 @@ FEATURE_ALIASES = {
     "target_visual_prompt_hidden_cosine": "target_visual_prompt_hidden_cosine",
     "visual_cosine_capped_topmass_085": "target_visual_hidden_cosine_capped_topmass_085",
     "target_visual_hidden_cosine_capped_topmass_085": "target_visual_hidden_cosine_capped_topmass_085",
+    "visual_cosine_relative_vll": "target_visual_hidden_cosine_relative_vll",
+    "target_visual_hidden_cosine_relative_vll": "target_visual_hidden_cosine_relative_vll",
+    "visual_cosine_relative_vll_capped_topmass_085": "target_visual_hidden_cosine_relative_vll_capped_topmass_085",
+    "target_visual_hidden_cosine_relative_vll_capped_topmass_085": (
+        "target_visual_hidden_cosine_relative_vll_capped_topmass_085"
+    ),
+    "visual_prompt_cosine_visual_prompt_relative_vll": "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll",
+    "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll": (
+        "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll"
+    ),
+    "visual_prompt_cosine_visual_prompt_relative_vll_capped_topmass_085": (
+        "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085"
+    ),
+    "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085": (
+        "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085"
+    ),
     "visual_prompt_cosine_capped_topmass_085": "target_visual_prompt_hidden_cosine_capped_topmass_085",
     "target_visual_prompt_hidden_cosine_capped_topmass_085": "target_visual_prompt_hidden_cosine_capped_topmass_085",
     "prompt_last_cosine": "prompt_last_cosine",
@@ -53,6 +77,12 @@ FEATURE_KEYS = {
     "risk": "dgst_t_transport_risk_per_layer",
     "risk_topmass_085": "dgst_t_transport_risk_topmass_085_per_layer",
     "risk_capped_topmass_085": "dgst_t_transport_risk_capped_topmass_085_per_layer",
+    "risk_relative_vll": "dgst_t_transport_risk_relative_vll_per_layer",
+    "risk_relative_vll_capped_topmass_085": "dgst_t_transport_risk_relative_vll_capped_topmass_085_per_layer",
+    "risk_visual_prompt_relative_vll": "dgst_t_transport_risk_visual_prompt_relative_vll_per_layer",
+    "risk_visual_prompt_relative_vll_capped_topmass_085": (
+        "dgst_t_transport_risk_visual_prompt_relative_vll_capped_topmass_085_per_layer"
+    ),
     "prompt_confidence_top3": "dgst_t_prompt_confidence_top3_per_layer",
     "prompt_confidence_max": "dgst_t_prompt_confidence_max_per_layer",
     "context_confidence": "dgst_t_context_confidence_per_layer",
@@ -60,6 +90,16 @@ FEATURE_KEYS = {
     "target_visual_hidden_cosine": "dgst_t_target_visual_hidden_cosine_per_layer",
     "target_visual_prompt_hidden_cosine": "dgst_t_target_visual_prompt_hidden_cosine_per_layer",
     "target_visual_hidden_cosine_capped_topmass_085": "dgst_t_target_visual_hidden_cosine_capped_topmass_085_per_layer",
+    "target_visual_hidden_cosine_relative_vll": "dgst_t_target_visual_hidden_cosine_relative_vll_per_layer",
+    "target_visual_hidden_cosine_relative_vll_capped_topmass_085": (
+        "dgst_t_target_visual_hidden_cosine_relative_vll_capped_topmass_085_per_layer"
+    ),
+    "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll": (
+        "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer"
+    ),
+    "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085": (
+        "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer"
+    ),
     "target_visual_prompt_hidden_cosine_capped_topmass_085": "dgst_t_target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer",
     "prompt_last_cosine": "dgst_t_prompt_last_cosine_per_layer",
     "prompt_mean_cosine": "dgst_t_prompt_mean_cosine_per_layer",
@@ -71,6 +111,16 @@ LAYER_STAT_KEYS = {
     "target_visual_hidden_cosine": "target_hidden_top32_visual_cosine",
     "target_visual_prompt_hidden_cosine": "target_hidden_top32_visual_prompt_cosine",
     "target_visual_hidden_cosine_capped_topmass_085": "target_hidden_capped_topmass_085_visual_cosine",
+    "target_visual_hidden_cosine_relative_vll": "target_hidden_top32_visual_cosine_relative_vll",
+    "target_visual_hidden_cosine_relative_vll_capped_topmass_085": (
+        "target_hidden_capped_topmass_085_visual_cosine_relative_vll"
+    ),
+    "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll": (
+        "target_hidden_top32_visual_prompt_cosine_visual_prompt_relative_vll"
+    ),
+    "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085": (
+        "target_hidden_capped_topmass_085_visual_prompt_cosine_visual_prompt_relative_vll"
+    ),
     "target_visual_prompt_hidden_cosine_capped_topmass_085": "target_hidden_capped_topmass_085_visual_prompt_cosine",
     "context_confidence": "context_confidence",
     "context_confidence_max_prompt": "context_confidence_max_prompt",

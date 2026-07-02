@@ -18,6 +18,7 @@ EPS = 1e-12
 TOPMASS_ALPHA_085 = 0.85
 CAPPED_TOPMASS_MIN_K = 32
 CAPPED_TOPMASS_MAX_K = 64
+RELATIVE_VLL_MAD_EPSILON = 1e-6
 
 
 def compute_dgst_t(
@@ -41,6 +42,8 @@ def compute_dgst_t(
     capped_topmass_max_k: int = CAPPED_TOPMASS_MAX_K,
     compute_topmass_085: bool = True,
     compute_capped_topmass_085: bool = True,
+    target_gate_mode: str = "legacy_prob",
+    relative_vll_mad_epsilon: float = RELATIVE_VLL_MAD_EPSILON,
 ) -> dict[str, Any]:
     """Compute DGST-T layer features from raw wrapper captures."""
     support_states = dgst_t_raw["support_h_mid_states"]
@@ -57,6 +60,7 @@ def compute_dgst_t(
         support_output_states=_layer_tensors(support_output_states),
         support_attentions=_layer_tensors(dgst_t_raw["support_attentions"]),
         semantic_probs=_layer_tensors(dgst_t_raw["semantic_probs"]),
+        relative_vll_logits=_optional_layer_tensors(dgst_t_raw.get("relative_vll_logits")),
         prompt_last_hidden_states=_layer_tensors(dgst_t_raw["prompt_last_hidden_states"]),
         prompt_mean_hidden_states=_layer_tensors(dgst_t_raw["prompt_mean_hidden_states"]),
         prompt_confidence_top3=_layer_tensors(dgst_t_raw["prompt_logit_lens_top3_confidence"]),
@@ -82,6 +86,8 @@ def compute_dgst_t(
         capped_topmass_max_k=capped_topmass_max_k,
         compute_topmass_085=compute_topmass_085,
         compute_capped_topmass_085=compute_capped_topmass_085,
+        target_gate_mode=target_gate_mode,
+        relative_vll_mad_epsilon=relative_vll_mad_epsilon,
     )
 
 
@@ -116,12 +122,15 @@ def compute_dgst_t_batch_from_captures(
     capped_topmass_max_k: int = CAPPED_TOPMASS_MAX_K,
     compute_topmass_085: bool = True,
     compute_capped_topmass_085: bool = True,
+    target_gate_mode: str = "legacy_prob",
+    relative_vll_mad_epsilon: float = RELATIVE_VLL_MAD_EPSILON,
 ) -> list[dict[str, Any]]:
     """Compute DGST-T for several target tokens directly from shared captures."""
     from models.dgst_capture import (
         resolve_output_embedding_layer,
         resolve_prompt_positions,
         resolve_support_positions,
+        target_logits_multi,
         target_probabilities_multi,
     )
 
@@ -159,6 +168,7 @@ def compute_dgst_t_batch_from_captures(
             "support_output_states": [],
             "support_attentions": [],
             "semantic_probs": [],
+            "relative_vll_logits": [],
             "prompt_last_hidden_states": [],
             "prompt_mean_hidden_states": [],
             "prompt_logit_lens_top3_confidence": [],
@@ -180,6 +190,12 @@ def compute_dgst_t_batch_from_captures(
         prompt_states = layer_hidden.index_select(0, prompt_index)
 
         support_semantic_all = target_probabilities_multi(
+            output_layer=output_layer,
+            states=support_states,
+            target_token_ids=target_ids,
+            chunk_size=semantic_chunk_size,
+        )
+        support_relative_logits_all = target_logits_multi(
             output_layer=output_layer,
             states=support_states,
             target_token_ids=target_ids,
@@ -212,6 +228,7 @@ def compute_dgst_t_batch_from_captures(
             part["support_output_states"].append(support_output_states)
             part["support_attentions"].append(support_attention)
             part["semantic_probs"].append(support_semantic_all[:, target_offset])
+            part["relative_vll_logits"].append(support_relative_logits_all[:, target_offset])
             part["prompt_last_hidden_states"].append(prompt_last_state)
             part["prompt_mean_hidden_states"].append(prompt_mean_state)
             part["prompt_logit_lens_top3_confidence"].append(prompt_conf_top3_all[target_offset])
@@ -227,6 +244,7 @@ def compute_dgst_t_batch_from_captures(
                 support_output_states=part["support_output_states"],
                 support_attentions=part["support_attentions"],
                 semantic_probs=part["semantic_probs"],
+                relative_vll_logits=part["relative_vll_logits"],
                 prompt_last_hidden_states=part["prompt_last_hidden_states"],
                 prompt_mean_hidden_states=part["prompt_mean_hidden_states"],
                 prompt_confidence_top3=part["prompt_logit_lens_top3_confidence"],
@@ -252,6 +270,8 @@ def compute_dgst_t_batch_from_captures(
                 capped_topmass_max_k=capped_topmass_max_k,
                 compute_topmass_085=compute_topmass_085,
                 compute_capped_topmass_085=compute_capped_topmass_085,
+                target_gate_mode=target_gate_mode,
+                relative_vll_mad_epsilon=relative_vll_mad_epsilon,
             )
         )
     return results
@@ -265,6 +285,7 @@ def _compute_dgst_t_from_parts(
     support_output_states: Sequence[torch.Tensor],
     support_attentions: Sequence[torch.Tensor],
     semantic_probs: Sequence[torch.Tensor],
+    relative_vll_logits: Sequence[torch.Tensor] | None,
     prompt_last_hidden_states: Sequence[torch.Tensor],
     prompt_mean_hidden_states: Sequence[torch.Tensor],
     prompt_confidence_top3: Sequence[torch.Tensor],
@@ -290,10 +311,16 @@ def _compute_dgst_t_from_parts(
     capped_topmass_max_k: int,
     compute_topmass_085: bool,
     compute_capped_topmass_085: bool,
+    target_gate_mode: str,
+    relative_vll_mad_epsilon: float,
 ) -> dict[str, Any]:
     layer_count = len(source_ffn_states)
     if layer_count == 0:
         raise ValueError("DGST-T requires at least one captured layer.")
+    gate_mode = _normalize_target_gate_mode(target_gate_mode)
+    compute_relative_vll = gate_mode in {"relative_vll", "dual"}
+    if compute_relative_vll and relative_vll_logits is None:
+        raise ValueError("target_gate_mode requires relative_vll_logits, but they are missing.")
     for name, values in {
         "prediction_hidden_states": prediction_hidden_states,
         "support_h_mid_states": support_h_mid_states,
@@ -307,21 +334,36 @@ def _compute_dgst_t_from_parts(
     }.items():
         if len(values) != layer_count:
             raise ValueError(f"DGST-T layer count mismatch for {name}.")
+    if relative_vll_logits is not None and len(relative_vll_logits) != layer_count:
+        raise ValueError("DGST-T layer count mismatch for relative_vll_logits.")
 
     layer_stats = []
     risk_per_layer = []
     risk_topmass_085_per_layer = []
     risk_capped_topmass_085_per_layer = []
+    risk_relative_vll_per_layer = []
+    risk_relative_vll_capped_topmass_085_per_layer = []
+    risk_visual_prompt_relative_vll_per_layer = []
+    risk_visual_prompt_relative_vll_capped_topmass_085_per_layer = []
     prompt_last_cosine_per_layer = []
     prompt_mean_cosine_per_layer = []
     target_visual_hidden_cosine_per_layer = []
     target_visual_prompt_hidden_cosine_per_layer = []
     target_visual_hidden_cosine_capped_topmass_085_per_layer = []
     target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer = []
+    target_visual_hidden_cosine_relative_vll_per_layer = []
+    target_visual_hidden_cosine_relative_vll_capped_topmass_085_per_layer = []
+    target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer = []
+    target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer = []
     prompt_confidence_top3_per_layer = []
     prompt_confidence_max_per_layer = []
     context_confidence_per_layer = []
     context_confidence_max_prompt_per_layer = []
+    has_prompt_support = _has_prompt_support_tokens(
+        support_positions=support_positions,
+        visual_start=visual_start,
+        visual_end=visual_end,
+    )
 
     for layer_idx in range(layer_count):
         layer_support_states = support_h_mid_states[layer_idx].float()
@@ -338,6 +380,43 @@ def _compute_dgst_t_from_parts(
         )
         attention_dist = _renormalize(layer_support_attentions)
         target_dist = _renormalize(attention_dist * layer_semantic_probs)
+        target_dist_relative_vll = None
+        semantic_gate_relative_vll = None
+        relative_vll_stats = None
+        target_dist_visual_prompt_relative_vll = None
+        semantic_gate_visual_prompt_relative_vll = None
+        visual_prompt_relative_vll_stats = None
+        if compute_relative_vll:
+            layer_relative_logits = relative_vll_logits[layer_idx].to(layer_support_states.device).float()
+            (
+                target_dist_relative_vll,
+                semantic_gate_relative_vll,
+                relative_vll_stats,
+            ) = _relative_vll_target_distribution(
+                attention_dist=attention_dist,
+                target_logits=layer_relative_logits,
+                support_positions=support_positions,
+                visual_start=visual_start,
+                visual_end=visual_end,
+                candidate_scope="visual",
+                stat_prefix="relative_vll",
+                epsilon=relative_vll_mad_epsilon,
+            )
+            if has_prompt_support:
+                (
+                    target_dist_visual_prompt_relative_vll,
+                    semantic_gate_visual_prompt_relative_vll,
+                    visual_prompt_relative_vll_stats,
+                ) = _relative_vll_target_distribution(
+                    attention_dist=attention_dist,
+                    target_logits=layer_relative_logits,
+                    support_positions=support_positions,
+                    visual_start=visual_start,
+                    visual_end=visual_end,
+                    candidate_scope="visual_prompt",
+                    stat_prefix="visual_prompt_relative_vll",
+                    epsilon=relative_vll_mad_epsilon,
+                )
 
         support = _topk_union_indices(source_dist, target_dist, transport_top_k)
         transport_risk = _transport_risk_on_support(
@@ -395,6 +474,97 @@ def _compute_dgst_t_from_parts(
                 ot_solver=ot_solver,
             )
 
+        relative_vll_support = None
+        transport_risk_relative_vll = None
+        relative_vll_capped_support = None
+        transport_risk_relative_vll_capped_topmass_085 = None
+        visual_prompt_relative_vll_support = None
+        transport_risk_visual_prompt_relative_vll = None
+        visual_prompt_relative_vll_capped_support = None
+        transport_risk_visual_prompt_relative_vll_capped_topmass_085 = None
+        if compute_relative_vll:
+            relative_vll_support = _topk_union_indices(
+                source_dist,
+                target_dist_relative_vll,
+                transport_top_k,
+            )
+            transport_risk_relative_vll = _transport_risk_on_support(
+                source_dist=source_dist,
+                target_dist=target_dist_relative_vll,
+                support_states=layer_support_states,
+                semantic_probs=semantic_gate_relative_vll,
+                support=relative_vll_support,
+                cost_mode=cost_mode,
+                lambda_d=lambda_d,
+                lambda_s=lambda_s,
+                lambda_t=lambda_t,
+                lambda_int=lambda_int,
+                ot_solver=ot_solver,
+            )
+            if compute_capped_topmass_085:
+                relative_vll_capped_support = _capped_topmass_union_indices(
+                    source_dist,
+                    target_dist_relative_vll,
+                    capped_topmass_alpha,
+                    min_k=capped_topmass_min_k,
+                    max_k=capped_topmass_max_k,
+                )
+                transport_risk_relative_vll_capped_topmass_085 = _transport_risk_on_support(
+                    source_dist=source_dist,
+                    target_dist=target_dist_relative_vll,
+                    support_states=layer_support_states,
+                    semantic_probs=semantic_gate_relative_vll,
+                    support=relative_vll_capped_support,
+                    cost_mode=cost_mode,
+                    lambda_d=lambda_d,
+                    lambda_s=lambda_s,
+                    lambda_t=lambda_t,
+                    lambda_int=lambda_int,
+                    ot_solver=ot_solver,
+                )
+            if target_dist_visual_prompt_relative_vll is not None:
+                visual_prompt_relative_vll_support = _topk_union_indices(
+                    source_dist,
+                    target_dist_visual_prompt_relative_vll,
+                    transport_top_k,
+                )
+                transport_risk_visual_prompt_relative_vll = _transport_risk_on_support(
+                    source_dist=source_dist,
+                    target_dist=target_dist_visual_prompt_relative_vll,
+                    support_states=layer_support_states,
+                    semantic_probs=semantic_gate_visual_prompt_relative_vll,
+                    support=visual_prompt_relative_vll_support,
+                    cost_mode=cost_mode,
+                    lambda_d=lambda_d,
+                    lambda_s=lambda_s,
+                    lambda_t=lambda_t,
+                    lambda_int=lambda_int,
+                    ot_solver=ot_solver,
+                )
+                if compute_capped_topmass_085:
+                    visual_prompt_relative_vll_capped_support = _capped_topmass_union_indices(
+                        source_dist,
+                        target_dist_visual_prompt_relative_vll,
+                        capped_topmass_alpha,
+                        min_k=capped_topmass_min_k,
+                        max_k=capped_topmass_max_k,
+                    )
+                    transport_risk_visual_prompt_relative_vll_capped_topmass_085 = (
+                        _transport_risk_on_support(
+                            source_dist=source_dist,
+                            target_dist=target_dist_visual_prompt_relative_vll,
+                            support_states=layer_support_states,
+                            semantic_probs=semantic_gate_visual_prompt_relative_vll,
+                            support=visual_prompt_relative_vll_capped_support,
+                            cost_mode=cost_mode,
+                            lambda_d=lambda_d,
+                            lambda_s=lambda_s,
+                            lambda_t=lambda_t,
+                            lambda_int=lambda_int,
+                            ot_solver=ot_solver,
+                        )
+                    )
+
         prompt_last = prompt_last_hidden_states[layer_idx].to(layer_prediction_hidden.device).float()
         prompt_mean = prompt_mean_hidden_states[layer_idx].to(layer_prediction_hidden.device).float()
         prompt_last_cosine = float(
@@ -445,6 +615,50 @@ def _compute_dgst_t_from_parts(
             min_k=capped_topmass_min_k,
             max_k=capped_topmass_max_k,
         )
+        target_visual_hidden_cosine_relative_vll = None
+        target_visual_hidden_cosine_relative_vll_capped_topmass_085 = None
+        target_visual_prompt_hidden_cosine_visual_prompt_relative_vll = None
+        target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085 = None
+        if compute_relative_vll:
+            target_visual_hidden_cosine_relative_vll = _target_hidden_topk_visual_cosine(
+                target_hidden=layer_prediction_hidden,
+                support_output_states=layer_support_output_states,
+                target_dist=target_dist_relative_vll,
+                support_positions=support_positions,
+                visual_start=visual_start,
+                visual_end=visual_end,
+                top_k=atarget_visual_top_k,
+            )
+            target_visual_hidden_cosine_relative_vll_capped_topmass_085 = (
+                _target_hidden_capped_topmass_visual_cosine(
+                    target_hidden=layer_prediction_hidden,
+                    support_output_states=layer_support_output_states,
+                    target_dist=target_dist_relative_vll,
+                    support_positions=support_positions,
+                    visual_start=visual_start,
+                    visual_end=visual_end,
+                    alpha=capped_topmass_alpha,
+                    min_k=capped_topmass_min_k,
+                    max_k=capped_topmass_max_k,
+                )
+            )
+            if target_dist_visual_prompt_relative_vll is not None:
+                target_visual_prompt_hidden_cosine_visual_prompt_relative_vll = _target_hidden_topk_support_cosine(
+                    target_hidden=layer_prediction_hidden,
+                    support_output_states=layer_support_output_states,
+                    target_dist=target_dist_visual_prompt_relative_vll,
+                    top_k=atarget_visual_top_k,
+                )
+                target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085 = (
+                    _target_hidden_capped_topmass_support_cosine(
+                        target_hidden=layer_prediction_hidden,
+                        support_output_states=layer_support_output_states,
+                        target_dist=target_dist_visual_prompt_relative_vll,
+                        alpha=capped_topmass_alpha,
+                        min_k=capped_topmass_min_k,
+                        max_k=capped_topmass_max_k,
+                    )
+                )
         prompt_conf_top3 = _scalar(prompt_confidence_top3[layer_idx])
         prompt_conf_max = _scalar(prompt_confidence_max[layer_idx])
         context_confidence = float(prompt_conf_top3 * target_visual_hidden_cosine)
@@ -455,6 +669,18 @@ def _compute_dgst_t_from_parts(
             risk_topmass_085_per_layer.append(float(transport_risk_topmass_085))
         if transport_risk_capped_topmass_085 is not None:
             risk_capped_topmass_085_per_layer.append(float(transport_risk_capped_topmass_085))
+        if transport_risk_relative_vll is not None:
+            risk_relative_vll_per_layer.append(float(transport_risk_relative_vll))
+        if transport_risk_relative_vll_capped_topmass_085 is not None:
+            risk_relative_vll_capped_topmass_085_per_layer.append(
+                float(transport_risk_relative_vll_capped_topmass_085)
+            )
+        if transport_risk_visual_prompt_relative_vll is not None:
+            risk_visual_prompt_relative_vll_per_layer.append(float(transport_risk_visual_prompt_relative_vll))
+        if transport_risk_visual_prompt_relative_vll_capped_topmass_085 is not None:
+            risk_visual_prompt_relative_vll_capped_topmass_085_per_layer.append(
+                float(transport_risk_visual_prompt_relative_vll_capped_topmass_085)
+            )
         prompt_last_cosine_per_layer.append(prompt_last_cosine)
         prompt_mean_cosine_per_layer.append(prompt_mean_cosine)
         target_visual_hidden_cosine_per_layer.append(float(target_visual_hidden_cosine))
@@ -465,6 +691,22 @@ def _compute_dgst_t_from_parts(
         target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer.append(
             float(target_visual_prompt_hidden_cosine_capped_topmass_085)
         )
+        if target_visual_hidden_cosine_relative_vll is not None:
+            target_visual_hidden_cosine_relative_vll_per_layer.append(
+                float(target_visual_hidden_cosine_relative_vll)
+            )
+        if target_visual_hidden_cosine_relative_vll_capped_topmass_085 is not None:
+            target_visual_hidden_cosine_relative_vll_capped_topmass_085_per_layer.append(
+                float(target_visual_hidden_cosine_relative_vll_capped_topmass_085)
+            )
+        if target_visual_prompt_hidden_cosine_visual_prompt_relative_vll is not None:
+            target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer.append(
+                float(target_visual_prompt_hidden_cosine_visual_prompt_relative_vll)
+            )
+        if target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085 is not None:
+            target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer.append(
+                float(target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085)
+            )
         prompt_confidence_top3_per_layer.append(float(prompt_conf_top3))
         prompt_confidence_max_per_layer.append(float(prompt_conf_max))
         context_confidence_per_layer.append(context_confidence)
@@ -496,6 +738,53 @@ def _compute_dgst_t_from_parts(
         if transport_risk_capped_topmass_085 is not None and capped_topmass_support is not None:
             stats["transport_risk_capped_topmass_085"] = float(transport_risk_capped_topmass_085)
             stats["selected_support_size_capped_topmass_085"] = int(capped_topmass_support.numel())
+        if transport_risk_relative_vll is not None and relative_vll_support is not None:
+            stats["transport_risk_relative_vll"] = float(transport_risk_relative_vll)
+            stats["selected_support_size_relative_vll"] = int(relative_vll_support.numel())
+            stats["target_hidden_top32_visual_cosine_relative_vll"] = float(
+                target_visual_hidden_cosine_relative_vll
+            )
+        if (
+            transport_risk_relative_vll_capped_topmass_085 is not None
+            and relative_vll_capped_support is not None
+        ):
+            stats["transport_risk_relative_vll_capped_topmass_085"] = float(
+                transport_risk_relative_vll_capped_topmass_085
+            )
+            stats["selected_support_size_relative_vll_capped_topmass_085"] = int(
+                relative_vll_capped_support.numel()
+            )
+            stats["target_hidden_capped_topmass_085_visual_cosine_relative_vll"] = float(
+                target_visual_hidden_cosine_relative_vll_capped_topmass_085
+            )
+        if relative_vll_stats is not None:
+            stats.update(relative_vll_stats)
+        if (
+            transport_risk_visual_prompt_relative_vll is not None
+            and visual_prompt_relative_vll_support is not None
+        ):
+            stats["transport_risk_visual_prompt_relative_vll"] = float(transport_risk_visual_prompt_relative_vll)
+            stats["selected_support_size_visual_prompt_relative_vll"] = int(
+                visual_prompt_relative_vll_support.numel()
+            )
+            stats["target_hidden_top32_visual_prompt_cosine_visual_prompt_relative_vll"] = float(
+                target_visual_prompt_hidden_cosine_visual_prompt_relative_vll
+            )
+        if (
+            transport_risk_visual_prompt_relative_vll_capped_topmass_085 is not None
+            and visual_prompt_relative_vll_capped_support is not None
+        ):
+            stats["transport_risk_visual_prompt_relative_vll_capped_topmass_085"] = float(
+                transport_risk_visual_prompt_relative_vll_capped_topmass_085
+            )
+            stats["selected_support_size_visual_prompt_relative_vll_capped_topmass_085"] = int(
+                visual_prompt_relative_vll_capped_support.numel()
+            )
+            stats["target_hidden_capped_topmass_085_visual_prompt_cosine_visual_prompt_relative_vll"] = float(
+                target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085
+            )
+        if visual_prompt_relative_vll_stats is not None:
+            stats.update(visual_prompt_relative_vll_stats)
         layer_stats.append(stats)
 
     risk_tensor = torch.tensor(risk_per_layer, dtype=torch.float32)
@@ -545,6 +834,67 @@ def _compute_dgst_t_from_parts(
             context_confidence_per_layer,
         ),
     }
+    if compute_relative_vll:
+        risk_relative_tensor = torch.tensor(risk_relative_vll_per_layer, dtype=torch.float32)
+        result["dgst_t_score_relative_vll"] = float(
+            _baseline_excess_score(
+                risk_relative_tensor,
+                baseline_layers=baseline_layers,
+                risk_start_layer=risk_start_layer,
+                alpha=alpha,
+            )
+        )
+        result["dgst_t_transport_risk_relative_vll_per_layer"] = risk_relative_tensor
+        result["dgst_t_target_visual_hidden_cosine_relative_vll_per_layer"] = torch.tensor(
+            target_visual_hidden_cosine_relative_vll_per_layer,
+            dtype=torch.float32,
+        )
+        if compute_capped_topmass_085:
+            result["dgst_t_transport_risk_relative_vll_capped_topmass_085_per_layer"] = torch.tensor(
+                risk_relative_vll_capped_topmass_085_per_layer,
+                dtype=torch.float32,
+            )
+            result[
+                "dgst_t_target_visual_hidden_cosine_relative_vll_capped_topmass_085_per_layer"
+            ] = torch.tensor(
+                target_visual_hidden_cosine_relative_vll_capped_topmass_085_per_layer,
+                dtype=torch.float32,
+            )
+        if risk_visual_prompt_relative_vll_per_layer:
+            risk_visual_prompt_relative_tensor = torch.tensor(
+                risk_visual_prompt_relative_vll_per_layer,
+                dtype=torch.float32,
+            )
+            result["dgst_t_score_visual_prompt_relative_vll"] = float(
+                _baseline_excess_score(
+                    risk_visual_prompt_relative_tensor,
+                    baseline_layers=baseline_layers,
+                    risk_start_layer=risk_start_layer,
+                    alpha=alpha,
+                )
+            )
+            result["dgst_t_transport_risk_visual_prompt_relative_vll_per_layer"] = (
+                risk_visual_prompt_relative_tensor
+            )
+            result["dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer"] = (
+                torch.tensor(
+                    target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer,
+                    dtype=torch.float32,
+                )
+            )
+            if compute_capped_topmass_085:
+                result[
+                    "dgst_t_transport_risk_visual_prompt_relative_vll_capped_topmass_085_per_layer"
+                ] = torch.tensor(
+                    risk_visual_prompt_relative_vll_capped_topmass_085_per_layer,
+                    dtype=torch.float32,
+                )
+                result[
+                    "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer"
+                ] = torch.tensor(
+                    target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer,
+                    dtype=torch.float32,
+                )
     if compute_topmass_085:
         result["dgst_t_transport_risk_topmass_085_per_layer"] = torch.tensor(
             risk_topmass_085_per_layer,
@@ -562,6 +912,23 @@ def _layer_tensors(value: Any) -> list[torch.Tensor]:
     if torch.is_tensor(value):
         return [value[index] for index in range(int(value.shape[0]))]
     return list(value)
+
+
+def _optional_layer_tensors(value: Any) -> list[torch.Tensor] | None:
+    if value is None:
+        return None
+    return _layer_tensors(value)
+
+
+def _normalize_target_gate_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode in {"legacy", "legacy_prob", "prob", "softmax_prob"}:
+        return "legacy_prob"
+    if mode in {"relative_vll", "relative", "relative_logit"}:
+        return "relative_vll"
+    if mode == "dual":
+        return "dual"
+    raise ValueError("DGST-T target_gate_mode must be 'legacy_prob', 'relative_vll', or 'dual'.")
 
 
 def _scalar(value: torch.Tensor | float | int) -> float:
@@ -602,6 +969,115 @@ def _renormalize(values: torch.Tensor) -> torch.Tensor:
     if total <= EPS:
         return torch.full_like(values, 1.0 / max(int(values.numel()), 1))
     return values / total
+
+
+def _relative_vll_target_distribution(
+    *,
+    attention_dist: torch.Tensor,
+    target_logits: torch.Tensor,
+    support_positions: Sequence[int],
+    visual_start: int,
+    visual_end: int,
+    candidate_scope: str,
+    stat_prefix: str,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    logits = torch.nan_to_num(target_logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    if logits.numel() != attention_dist.numel():
+        raise ValueError(
+            "relative_vll logits must align with support positions, got "
+            f"{int(logits.numel())} logits and {int(attention_dist.numel())} attention values."
+        )
+    candidate_index = _support_indices_for_scope(
+        support_positions=support_positions,
+        visual_start=visual_start,
+        visual_end=visual_end,
+        scope=candidate_scope,
+        device=logits.device,
+    )
+    if candidate_index.numel() == 0:
+        raise ValueError(
+            "relative_vll target construction requires at least one "
+            f"{candidate_scope} support token."
+        )
+
+    candidate_logits = logits.index_select(0, candidate_index)
+    median = candidate_logits.median()
+    mad = torch.abs(candidate_logits - median).median()
+    z = (candidate_logits - median) / (mad + max(float(epsilon), EPS))
+    candidate_gate = torch.sigmoid(z)
+    semantic_gate = torch.zeros_like(logits, dtype=torch.float32)
+    semantic_gate.index_copy_(0, candidate_index, candidate_gate.float())
+
+    weighted = attention_dist.float() * semantic_gate
+    denominator = weighted.sum()
+    if denominator <= EPS:
+        target_dist = torch.zeros_like(weighted, dtype=torch.float32)
+        target_dist.index_fill_(0, candidate_index, 1.0 / max(int(candidate_index.numel()), 1))
+    else:
+        target_dist = weighted / denominator
+
+    stats = {
+        f"{stat_prefix}_logit_median": float(median.item()),
+        f"{stat_prefix}_logit_mad": float(mad.item()),
+        f"{stat_prefix}_gate_mean": float(candidate_gate.mean().item()),
+        f"{stat_prefix}_gate_max": float(candidate_gate.max().item()),
+        f"{stat_prefix}_target_denominator": float(denominator.item()),
+    }
+    return target_dist, semantic_gate, stats
+
+
+def _has_prompt_support_tokens(
+    *,
+    support_positions: Sequence[int],
+    visual_start: int,
+    visual_end: int,
+) -> bool:
+    return any(
+        not (int(visual_start) <= int(position) < int(visual_end))
+        for position in support_positions
+    )
+
+
+def _visual_support_indices(
+    *,
+    support_positions: Sequence[int],
+    visual_start: int,
+    visual_end: int,
+    device: torch.device,
+) -> torch.Tensor:
+    return _support_indices_for_scope(
+        support_positions=support_positions,
+        visual_start=visual_start,
+        visual_end=visual_end,
+        scope="visual",
+        device=device,
+    )
+
+
+def _support_indices_for_scope(
+    *,
+    support_positions: Sequence[int],
+    visual_start: int,
+    visual_end: int,
+    scope: str,
+    device: torch.device,
+) -> torch.Tensor:
+    scope_name = str(scope).strip().lower()
+    if scope_name in {"visual_prompt", "support", "all"}:
+        return torch.arange(len(support_positions), dtype=torch.long, device=device)
+    if scope_name not in {"visual", "prompt"}:
+        raise ValueError("DGST-T support scope must be 'visual', 'prompt', or 'visual_prompt'.")
+    indices = [
+        offset
+        for offset, position in enumerate(support_positions)
+        if (
+            int(visual_start) <= int(position) < int(visual_end)
+            if scope_name == "visual"
+            else not (int(visual_start) <= int(position) < int(visual_end))
+        )
+    ]
+    return torch.tensor(indices, dtype=torch.long, device=device)
 
 
 def _topk_union_indices(source: torch.Tensor, target: torch.Tensor, top_k: int) -> torch.Tensor:
