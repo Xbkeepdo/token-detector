@@ -61,6 +61,59 @@ def resolve_input_embedding_layer(model: Any):
     raise ValueError("Model does not expose input embeddings.")
 
 
+def resolve_decoder_final_norm(model: Any):
+    """Return the decoder final norm before LM head for Qwen, InternVL, or LLaVA."""
+    language_model = getattr(model, "language_model", None)
+    model_body = getattr(model, "model", None)
+    candidates = []
+    for module in (
+        language_model,
+        getattr(language_model, "model", None),
+        model_body,
+        getattr(model_body, "language_model", None),
+        getattr(getattr(model_body, "language_model", None), "model", None),
+        model,
+    ):
+        if module is not None:
+            candidates.append(getattr(module, "norm", None))
+
+    get_decoder = getattr(model, "get_decoder", None)
+    if callable(get_decoder):
+        decoder = get_decoder()
+        candidates.extend(
+            [
+                getattr(decoder, "norm", None),
+                getattr(getattr(decoder, "model", None), "norm", None),
+            ]
+        )
+
+    for norm in candidates:
+        if norm is not None:
+            return norm
+    raise ValueError(f"Cannot resolve decoder final norm for {type(model).__name__}.")
+
+
+def normalize_relative_vll_logit_source(value: str | None) -> str:
+    source = str(value or "h_mid").strip().lower()
+    if source in {"h_mid", "mid", "raw_h_mid"}:
+        return "h_mid"
+    if source in {"final_norm_h_mid", "final_norm", "norm_h_mid", "finalnorm"}:
+        return "final_norm_h_mid"
+    raise ValueError("relative_vll_logit_source must be 'h_mid' or 'final_norm_h_mid'.")
+
+
+def apply_decoder_final_norm(norm_layer: Any, states: torch.Tensor) -> torch.Tensor:
+    """Apply decoder final norm to arbitrary layer states for VLL ablation."""
+    weight = getattr(norm_layer, "weight", None)
+    device = weight.device if weight is not None else states.device
+    dtype = weight.dtype if weight is not None else states.dtype
+    original_shape = states.shape
+    flat_states = states.reshape(-1, original_shape[-1]).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        normed = norm_layer(flat_states)
+    return normed.reshape(original_shape).to(device=states.device)
+
+
 def run_forward_with_dgst_captures(
     model: Any,
     *,
@@ -147,6 +200,7 @@ def build_dgst_t_raw(
     prediction_position: int,
     support_scope: str = "visual_prompt",
     semantic_chunk_size: int = 64,
+    relative_vll_logit_source: str = "h_mid",
     keep_on_device: bool = False,
 ) -> dict[str, Any]:
     """Build the raw tensors consumed by features.dgst_t.compute_dgst_t."""
@@ -162,6 +216,7 @@ def build_dgst_t_raw(
         prediction_positions=[int(prediction_position)],
         support_scope=support_scope,
         semantic_chunk_size=semantic_chunk_size,
+        relative_vll_logit_source=relative_vll_logit_source,
         keep_on_device=keep_on_device,
     )[0]
 
@@ -179,6 +234,7 @@ def build_dgst_t_raw_batch(
     prediction_positions: Sequence[int],
     support_scope: str = "visual_prompt",
     semantic_chunk_size: int = 64,
+    relative_vll_logit_source: str = "h_mid",
     keep_on_device: bool = False,
 ) -> list[dict[str, Any]]:
     """Build per-token DGST-T raw tensors from one shared decoder forward."""
@@ -209,6 +265,12 @@ def build_dgst_t_raw_batch(
 
     output_layer = resolve_output_embedding_layer(model)
     input_layer = resolve_input_embedding_layer(model)
+    relative_source = normalize_relative_vll_logit_source(relative_vll_logit_source)
+    final_norm_layer = (
+        resolve_decoder_final_norm(model)
+        if relative_source == "final_norm_h_mid"
+        else None
+    )
     hidden_size = int(captures[0]["h_mid"].shape[-1])
     target_embeddings = [
         embedding_for_token(
@@ -247,6 +309,11 @@ def build_dgst_t_raw_batch(
         prompt_index = torch.tensor(prompt_positions, dtype=torch.long, device=device)
 
         support_states = h_mid.index_select(0, support_index)
+        support_relative_states = (
+            apply_decoder_final_norm(final_norm_layer, support_states)
+            if final_norm_layer is not None
+            else support_states
+        )
         support_output_states = layer_hidden.index_select(0, support_index)
         prompt_states = layer_hidden.index_select(0, prompt_index)
 
@@ -258,7 +325,7 @@ def build_dgst_t_raw_batch(
         )
         support_relative_logits_all = target_logits_multi(
             output_layer=output_layer,
-            states=support_states,
+            states=support_relative_states,
             target_token_ids=target_ids,
             chunk_size=semantic_chunk_size,
         )
@@ -324,6 +391,7 @@ def build_dgst_t_raw_batch(
                 "visual_start": int(visual_start),
                 "visual_end": int(visual_end),
                 "support_scope": str(support_scope),
+                "relative_vll_logit_source": relative_source,
                 "support_positions": [int(position) for position in support_positions],
                 "prompt_positions": [int(position) for position in prompt_positions],
                 "source_ffn_states": torch.stack(part["source_ffn_states"], dim=0),

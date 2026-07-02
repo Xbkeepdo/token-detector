@@ -47,21 +47,44 @@ FEATURE_KEYS = {
 }
 
 
+def _register_delta_source_aliases() -> None:
+    for target_slug in ("rvll", "vp_rvll"):
+        for gamma_slug in ("g0", "g05", "g1"):
+            block = f"{target_slug}_delta_{gamma_slug}"
+            key_stem = f"{target_slug}_delta_src_{gamma_slug}"
+            FEATURE_KEYS.update(
+                {
+                    block: f"dgst_t_risk_{key_stem}_per_layer",
+                    f"risk_{block}": f"dgst_t_risk_{key_stem}_per_layer",
+                    f"{block}_cap085": f"dgst_t_risk_{key_stem}_cap085_per_layer",
+                    f"risk_{block}_cap085": f"dgst_t_risk_{key_stem}_cap085_per_layer",
+                    f"{block}_cos": f"dgst_t_cos_{key_stem}_per_layer",
+                    f"cos_{block}": f"dgst_t_cos_{key_stem}_per_layer",
+                    f"{block}_cos_cap085": f"dgst_t_cos_{key_stem}_cap085_per_layer",
+                    f"{block}_cap085_cos": f"dgst_t_cos_{key_stem}_cap085_per_layer",
+                    f"cos_{block}_cap085": f"dgst_t_cos_{key_stem}_cap085_per_layer",
+                }
+            )
+
+
+_register_delta_source_aliases()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--features",
-        nargs=2,
+        nargs="+",
         default=["target_visual_hidden_cosine", "target_visual_prompt_hidden_cosine"],
-        help="Two feature aliases or raw feature keys to compare.",
+        help="Feature aliases or raw feature keys to compare.",
     )
     parser.add_argument(
         "--labels",
-        nargs=2,
+        nargs="+",
         default=["visual-only top-k", "visual+prompt top-k"],
-        help="Display labels for the two feature curves.",
+        help="Display labels for the feature curves.",
     )
     parser.add_argument("--name", default=None, help="Output filename stem.")
     return parser.parse_args()
@@ -69,6 +92,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if len(args.labels) != len(args.features):
+        raise ValueError("--labels must have the same length as --features.")
     feature_path = os.path.join(args.output_dir, "features.pkl")
     results_dir = os.path.join(args.output_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
@@ -80,7 +105,7 @@ def main() -> None:
     grouped = [_group_by_label(features, key) for key in keys]
     stats = [_stats_by_label(group) for group in grouped]
 
-    stem = args.name or f"{args.model}_{args.features[0]}_vs_{args.features[1]}_by_label"
+    stem = args.name or f"{args.model}_{'_vs_'.join(args.features)}_by_label"
     png_path = os.path.join(results_dir, f"{stem}.png")
     pdf_path = os.path.join(results_dir, f"{stem}.pdf")
     csv_path = os.path.join(results_dir, f"{stem}.csv")
@@ -145,7 +170,15 @@ def _stats_by_label(grouped: dict[int, np.ndarray]) -> dict[int, dict]:
 
 def _plot(stats: list[dict[int, dict]], labels: list[str], png_path: str, pdf_path: str) -> None:
     layers = np.arange(stats[0][0]["mean"].shape[0])
-    fig, axes = plt.subplots(2, 2, figsize=(13.5, 7.2), sharex=True)
+    col_count = len(stats)
+    fig, axes = plt.subplots(
+        2,
+        col_count,
+        figsize=(max(6.6 * col_count, 8.0), 7.2),
+        sharex=True,
+    )
+    if col_count == 1:
+        axes = np.asarray(axes).reshape(2, 1)
     colors = {1: "#d55e00", 0: "#0072b2"}
     class_labels = {1: "Hallucination", 0: "Non-hallucination"}
 

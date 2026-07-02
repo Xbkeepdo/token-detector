@@ -68,7 +68,7 @@ feature_extraction:
     capped_topmass_085_max_k: 64
     target_gate_mode: "dual"
     relative_vll_mad_epsilon: 1.0e-6
-    target_token_aggregation: "first"
+    relative_vll_logit_source: "h_mid"
 
 dataset:
   coco_root: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco"

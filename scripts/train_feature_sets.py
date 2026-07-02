@@ -127,6 +127,42 @@ LAYER_STAT_KEYS = {
 }
 
 
+def _register_delta_source_aliases() -> None:
+    for target_slug in ("rvll", "vp_rvll"):
+        for gamma_slug in ("g0", "g05", "g1"):
+            block = f"{target_slug}_delta_{gamma_slug}"
+            key_stem = f"{target_slug}_delta_src_{gamma_slug}"
+            risk_key = f"dgst_t_risk_{key_stem}_per_layer"
+            risk_cap_key = f"dgst_t_risk_{key_stem}_cap085_per_layer"
+            cos_key = f"dgst_t_cos_{key_stem}_per_layer"
+            cos_cap_key = f"dgst_t_cos_{key_stem}_cap085_per_layer"
+
+            FEATURE_ALIASES.update(
+                {
+                    block: block,
+                    f"risk_{block}": block,
+                    f"{block}_cap085": f"{block}_cap085",
+                    f"risk_{block}_cap085": f"{block}_cap085",
+                    f"{block}_cos": f"{block}_cos",
+                    f"cos_{block}": f"{block}_cos",
+                    f"{block}_cos_cap085": f"{block}_cos_cap085",
+                    f"{block}_cap085_cos": f"{block}_cos_cap085",
+                    f"cos_{block}_cap085": f"{block}_cos_cap085",
+                }
+            )
+            FEATURE_KEYS.update(
+                {
+                    block: risk_key,
+                    f"{block}_cap085": risk_cap_key,
+                    f"{block}_cos": cos_key,
+                    f"{block}_cos_cap085": cos_cap_key,
+                }
+            )
+
+
+_register_delta_source_aliases()
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)

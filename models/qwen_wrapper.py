@@ -171,6 +171,11 @@ class QwenVLWrapper(BaseLVLMWrapper):
             target_token_id=dgst_target_id,
             prediction_position=expanded_seq_len - 1,
             support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+            relative_vll_logit_source=(
+                cfg_dgst_t.get("relative_vll_logit_source", "h_mid")
+                if cfg_dgst_t is not None
+                else "h_mid"
+            ),
             keep_on_device=cfg_dgst_t is not None,
         )
         dgst_t_result = None
@@ -197,6 +202,9 @@ class QwenVLWrapper(BaseLVLMWrapper):
                 compute_capped_topmass_085=cfg_dgst_t.get("compute_capped_topmass_085", True),
                 target_gate_mode=cfg_dgst_t.get("target_gate_mode", "legacy_prob"),
                 relative_vll_mad_epsilon=cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6),
+                source_modes=cfg_dgst_t.get("source_modes"),
+                target_attention_gammas=cfg_dgst_t.get("target_attention_gammas"),
+                target_attention_epsilon=cfg_dgst_t.get("target_attention_epsilon", 1e-12),
             )
             dgst_t_raw = None
 

@@ -97,6 +97,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
         prefix_token_ids: List[int],
         response_token_idx: int,
         target_token_id: Optional[int] = None,
+        cfg_dgst_t: Optional[dict] = None,
     ) -> ModelOutput:
         """Runs a forward pass with prompt+partial_response and returns"""
         prompt_text = self.cfg["prompt_template"]
@@ -166,6 +167,11 @@ class LLaVAWrapper(BaseLVLMWrapper):
             target_token_id=dgst_target_id,
             prediction_position=expanded_seq_len - 1,
             support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+            relative_vll_logit_source=(
+                cfg_dgst_t.get("relative_vll_logit_source", "h_mid")
+                if cfg_dgst_t is not None
+                else "h_mid"
+            ),
         )
 
         return ModelOutput(
@@ -285,6 +291,10 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 compute_capped_topmass_085=cfg_dgst_t.get("compute_capped_topmass_085", True),
                 target_gate_mode=cfg_dgst_t.get("target_gate_mode", "legacy_prob"),
                 relative_vll_mad_epsilon=cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6),
+                relative_vll_logit_source=cfg_dgst_t.get("relative_vll_logit_source", "h_mid"),
+                source_modes=cfg_dgst_t.get("source_modes"),
+                target_attention_gammas=cfg_dgst_t.get("target_attention_gammas"),
+                target_attention_epsilon=cfg_dgst_t.get("target_attention_epsilon", 1e-12),
             )
         else:
             dgst_raws = build_dgst_t_raw_batch(
@@ -298,6 +308,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 target_token_ids=targets,
                 prediction_positions=prediction_positions,
                 support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+                relative_vll_logit_source="h_mid",
             )
 
         outputs: List[ModelOutput] = []

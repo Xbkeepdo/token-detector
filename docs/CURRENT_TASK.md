@@ -40,29 +40,28 @@
   - 单独 `risk`：Qwen visual-only/decomposed 对 xgb AUC 从 0.811 降到 0.789，rf/MLP 基本持平；InternVL 三个分类器 AUC 均下降（xgb 0.888->0.862，rf 0.886->0.833，mlp 0.854->0.822）。
   - `risk+target_visual_hidden_cosine_capped_topmass_085`：Qwen xgb AUC 持平 0.861，rf 下降 0.862->0.831，mlp 小升 0.843->0.849；InternVL 明显提升（xgb 0.885->0.932，rf 0.881->0.912，mlp 0.843->0.929）。
   - `risk_capped_topmass_085+target_visual_hidden_cosine_capped_topmass_085`：Qwen xgb/MLP 提升（0.838->0.868，0.833->0.860），rf 下降；InternVL 三个分类器 AUC 均提升（xgb 0.860->0.921，rf 0.892->0.924，mlp 0.829->0.897）。
-- 已实现 Word All-Token Risk Mean：
-  - 新增 `target_token_aggregation: "first" | "risk_mean"`，默认 `first`，旧配置显式保持 `first`。
-  - `risk_mean` 严格按用户定义实现：word span 内每个合法 sub-token 使用自己的 `prediction_position` 和 `target_token_id` 独立计算完整 DGST-T/relative VLL/cosine 曲线，再对同名 `*_per_layer` 曲线逐层算 arithmetic mean；没有先平均 target logit/prob。
-  - 输出仍保持“一行 = 一个 object word”。兼容字段如 `target_token_id`、`response_token_idx` 保留第一个 sub-token，并新增 `target_token_ids`、`response_token_indices`、`target_token_count`、`target_token_aggregation`。
-  - `dgst_t_layer_stats` 中同层数值字段取均值，`dgst_t_score*` 从平均后的 risk 曲线重新按 baseline-excess 逻辑计算，`dgst_t_feature_vector` 也基于平均后曲线重建。
-  - 新增配置：`configs/model_configs_visualprompt_relativevll_riskmean.yaml`，输出目录为 `COCO500-visualprompt-relativevll-riskmean`。
-- Qwen `COCO500-visualprompt-relativevll-riskmean` 已完成：features 共 2190 行，hall=1636，true=554；`target_token_count` 分布为 `{1: 911, 2: 848, 3: 347, 4: 65, 5: 12, 6: 4, 7: 1, 8: 1, 10: 1}`。
-  - 逐层图在 `outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-riskmean/results/`，包括 risk、capped risk、target cosine、capped target cosine 对 visual-relative-vll 的对比。
-  - 曲线摘要：visual-relative-vll risk hall/non diff_avg 约 0.049；visual+prompt risk_mean diff_avg 约 0.040。capped 后 visual-relative-vll diff_avg 约 0.034，visual+prompt risk_mean diff_avg 约 0.036。
-  - 消融表：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-riskmean/results/qwen2_5_vl_7b_selected_feature_sets_table.md`
-  - `risk_visual_prompt_relative_vll`：XGB F1=0.905，AUC=0.851；RF F1=0.898，AUC=0.820；MLP F1=0.892，AUC=0.864。
-  - 单独 capped target cosine 表现最好：`target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085` 的 XGB F1=0.932，AUC=0.911。
-  - 组合 `risk_visual_prompt_relative_vll+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` 的 XGB 为 F1=0.932、AUC=0.922，是本组 risk_mean 中最高 AUC。
-- InternVL `COCO500-visualprompt-relativevll-riskmean` 已完成：features 共 3715 行，hall=3064，true=651；`target_token_count` 分布为 `{1: 1327, 2: 1520, 3: 687, 4: 137, 5: 37, 6: 6, 8: 1}`。
-  - 逐层图在 `outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-riskmean/results/`，包括 risk、capped risk、target cosine、capped target cosine 对 visual-relative-vll 的对比。
-  - 曲线摘要：visual-relative-vll risk diff_avg 约 -0.016；visual+prompt risk_mean diff_avg 约 0.051。capped 后 visual-relative-vll diff_avg 约 -0.014，visual+prompt risk_mean diff_avg 约 0.049。
-  - 消融表：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-riskmean/results/internvl_2_5_8b_selected_feature_sets_table.md`
-  - `risk_visual_prompt_relative_vll`：XGB F1=0.950，AUC=0.861；RF F1=0.949，AUC=0.870；MLP F1=0.939，AUC=0.888。
-  - 最强组合为 `risk_visual_prompt_relative_vll+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` 的 XGB：F1=0.954，AUC=0.935。
-- first-token vs risk_mean 对比表已生成：`outputs/visualprompt_relativevll_riskmean_comparison/first_vs_riskmean_selected_feature_sets.md`。
-  - 总体看，risk_mean 的逐层 hall/non 曲线差异仍存在，InternVL visual+prompt risk_mean 更清晰；但分类 AUC 多数比 first-token 略降。
-  - Qwen 例外点：单独 capped target cosine 在 risk_mean 下 XGB 从 first-token 的 F1=0.917、AUC=0.896 提升到 F1=0.932、AUC=0.911。
-  - InternVL 组合特征略降但接近：`risk_visual_prompt_relative_vll+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` 的 XGB AUC 从 0.939 降到 0.935。
+- Word all-token risk mean 实验效果不佳，已按用户要求从当前代码路径移除：
+  - 删除 `target_token_aggregation` 配置开关和 `risk_mean` 聚合逻辑。
+  - 删除 `configs/model_configs_visualprompt_relativevll_riskmean.yaml`。
+  - 特征抽取恢复为每个 object word 只使用 `token_indices[0]`，保留 relative VLL 与 visual+prompt relative VLL 实现。
+- 已新增 final norm relative VLL ablation：
+  - 新配置项 `relative_vll_logit_source: "h_mid" | "final_norm_h_mid"`，默认/旧配置显式保持 `"h_mid"`。
+  - `"final_norm_h_mid"` 只影响 relative VLL 的 target raw logit 投影输入，即 `l_m^l = W_U^T final_norm(h_mid_m^l)[w*]`，仍不使用 LM-head bias；legacy probability/path 不变。
+  - 新增 `configs/model_configs_visualprompt_relativevll_finalnorm.yaml`，输出目录为 `COCO500-visualprompt-relativevll-finalnorm`。
+  - Qwen/InternVL full feature extraction 已完成，并确认 `dgst_t_relative_vll_logit_source == "final_norm_h_mid"`。
+  - final norm 曲线效果：visual-only relative VLL 分支基本不变；visual+prompt relative VLL risk 的 hall-non 平均差明显变大。Qwen `risk_visual_prompt_relative_vll` diff_avg 约 0.038->0.069，InternVL 约 0.049->0.078。cosine 分支变化很小。
+  - 分类效果不是单调提升：Qwen final norm 后单独 visual+prompt risk AUC 下降（`risk_visual_prompt_relative_vll` 最佳 AUC 约 0.902->0.857），但 visual+prompt cosine AUC 上升（约 0.897->0.933）；InternVL 多数 feature set 小幅提升，`risk_visual_prompt_relative_vll` 最佳 AUC 约 0.901->0.917。
+- 2026-07-02 新增并完成 Source Delta + Gamma 机制消融的主要结果记录：
+  - 新 source `delta_src` 按公式 `softmax((cos(h_out_t^l, s_i^l) - cos(h_mid_t^l, s_i^l)) / tau)` 计算，visual-only 的 support 为 visual tokens，visual-prompt 的 support 为 visual+prompt tokens；visual-prompt 下 prompt token 参与 source softmax，不再置 0。
+  - 同一次 feature extraction 同时输出旧 source baseline 与 `delta_src` 下 `gamma=0/0.5/1` 的 target 机制消融；短字段包括 `rvll_delta_g0/g05/g1`、`vp_rvll_delta_g0/g05/g1` 及对应 `_cap085`、`_cos`。
+  - 四组 features 已完成：Qwen visual-only 2190 行、Qwen visual-prompt 2190 行、InternVL visual-only 3715 行、InternVL visual-prompt 3715 行。字段检查通过：visual-only 只有 `rvll_delta_*`，visual-prompt 同时有 `rvll_delta_*` 与 `vp_rvll_delta_*`，旧字段保留。
+  - 四组逐层图已完成，包含 gamma=0/0.5/1 同图、legacy source gamma=1 vs `delta_src_g1` 同图、capped risk 与 cosine/capped cosine。
+  - 曲线结论：新设计的 Offn/delta source 整体不如 legacy source。Qwen visual-only 中 `rvll_delta` risk 的 hall-non `diff_avg` 分别约为 g0=-0.002、g05=-0.010、g1=0.001，而 legacy source g1 约为 0.036；capped 下 legacy 约 0.030，delta g1 约 -0.002。
+  - Qwen visual-prompt 中 `vp_rvll_delta` risk 的 `diff_avg` 分别约为 g0=-0.005、g05=0.000、g1=0.012，仍明显低于 legacy source g1 的约 0.038；capped 下 legacy 约 0.037，delta g1 约 0.010。
+  - InternVL visual-only 中 `rvll_delta` risk 基本接近 0（g0 约 0.000、g05 约 -0.007、g1 约 0.000），低于 legacy source g1 的约 0.016；capped 下 legacy 约 0.011，delta g1 约 -0.003。
+  - InternVL visual-prompt 中 `vp_rvll_delta` 有一定信号，g05/g1 的 `diff_avg` 约 0.036/0.026，但仍低于 legacy source g1 的约 0.049；capped 下 legacy 约 0.048，delta g1 约 0.025。
+  - Qwen 分类消融也支持该判断：visual-only 最好 legacy 组合 `risk_relative_vll+target_visual_hidden_cosine_relative_vll` AUC 约 0.942，而最好 delta 组合约 0.910；visual-prompt 最好 legacy/visual-prompt 组合 AUC 约 0.941，而最好 `vp_rvll_delta` 组合约 0.928。
+  - 当前结论：`delta_src`/新 Offn source 不适合作为默认替换，最多保留为 negative/mechanism ablation。性能主要仍来自 relative VLL target、attention-guided target 与 cosine 分支，而不是这个 source 重构。
 
 ## Files changed recently
 - 新增：`configs/model_configs_visualonly.yaml`
@@ -73,10 +72,16 @@
 - 新增：`configs/model_configs_visualprompt_relativevll.yaml`
 - 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll/`
 - 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll/`
-- 新增：`configs/model_configs_visualprompt_relativevll_riskmean.yaml`
-- 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-riskmean/`
-- 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-riskmean/`
-- 新增输出目录：`outputs/visualprompt_relativevll_riskmean_comparison/`
+- 新增：`configs/model_configs_visualprompt_relativevll_finalnorm.yaml`
+- 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-finalnorm/`
+- 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-finalnorm/`
+- 新增对比输出：`outputs/finalnorm_relativevll_comparison/`
+- 新增：`configs/model_configs_visualonly_source_delta_gamma.yaml`
+- 新增：`configs/model_configs_visualprompt_source_delta_gamma.yaml`
+- 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualonly-source-delta-gamma/`
+- 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-source-delta-gamma/`
+- 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualonly-source-delta-gamma/`
+- 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-source-delta-gamma/`
 
 ## Commands run
 - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model internvl_2_5_8b --config configs/model_configs_visualonly.yaml --output-dir outputs/internvl_2_5_8b/COCO500-visualonly --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
@@ -140,23 +145,36 @@
   - 单独 `target_visual_prompt_hidden_cosine_visual_prompt_relative_vll`：XGB F1=0.948，AUC=0.920；capped 版本 RF AUC=0.918。
   - visual+prompt simultaneous 最强 F1 为 `risk_visual_prompt_relative_vll+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085` 的 XGB：Precision=0.950，Recall=0.974，F1=0.962，Acc=0.935，AUC=0.937。
   - visual+prompt simultaneous 最强 AUC 为 capped+capped 组合 XGB：F1=0.959，Acc=0.930，AUC=0.944。当前总最高 AUC 仍是 visual branch 组合 `risk_relative_vll+target_visual_hidden_cosine_relative_vll` 的 MLP：F1=0.958，Acc=0.930，AUC=0.950。
-- 2026-07-01 Word All-Token Risk Mean 实现和验证：
-  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/extractor.py features/dgst_t.py models/qwen_wrapper.py models/internvl_wrapper.py models/llava_wrapper.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py`
-  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 小样本验证两个 sub-token 的 risk/cosine 曲线逐层平均、`dgst_t_score` 从平均 risk 重算、`target_token_count` 和新增元数据正确。
-  - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model qwen2_5_vl_7b --config configs/model_configs_visualprompt_relativevll_riskmean.yaml --output-dir outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-riskmean --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
-  - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model internvl_2_5_8b --config configs/model_configs_visualprompt_relativevll_riskmean.yaml --output-dir outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-riskmean --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
-  - 使用 `scripts/plot_layerwise_feature_comparison.py` 在 Qwen/InternVL risk_mean 输出上生成 risk、capped risk、target cosine、capped target cosine 对比图。
-  - 使用 `scripts/train_feature_sets.py` 在 Qwen/InternVL risk_mean 输出上跑同一组 `risk_relative_vll`、`risk_visual_prompt_relative_vll`、target cosine 与组合特征，分类器为 xgb/rf/mlp。
-  - 生成 first-token vs risk_mean 汇总表：`outputs/visualprompt_relativevll_riskmean_comparison/first_vs_riskmean_selected_feature_sets.md`。
+- 2026-07-02 已移除 word all-token risk mean 代码路径：
+  - 删除 `target_token_aggregation` 配置项、`risk_mean` 聚合逻辑和 riskmean 专用配置文件。
+  - 保留 relative VLL 与 visual+prompt relative VLL。
+- 2026-07-02 新增并验证 final norm relative VLL ablation：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py models/dgst_capture.py features/extractor.py models/base_wrapper.py models/qwen_wrapper.py models/internvl_wrapper.py models/llava_wrapper.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py`
+  - 小张量验证 `final_norm_h_mid` 会改变 `relative_vll_logits`，且不加入 LM-head bias。
+  - Qwen/InternVL/LLaVA `--num-images 2` smoke test 均通过，feature rows 的 `dgst_t_relative_vll_logit_source` 为 `final_norm_h_mid`。
+  - Qwen full extraction：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-finalnorm/features.pkl`，2190 行。
+  - InternVL full extraction：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-finalnorm/features.pkl`，3715 行。
+  - 生成 final-norm 单目录图：`outputs/{qwen2_5_vl_7b,internvl_2_5_8b}/COCO500-visualprompt-relativevll-finalnorm/results/*finalnorm*{png,pdf,csv}`。
+  - 生成 h_mid vs final_norm_h_mid 跨目录对比图与表：`outputs/finalnorm_relativevll_comparison/finalnorm_vs_hmid_summary.{md,csv}`、`outputs/finalnorm_relativevll_comparison/finalnorm_vs_hmid_feature_sets_best.{md,csv}`。
+  - 在 Qwen/InternVL finalnorm 输出目录上跑完 xgb/rf/mlp feature-set 消融。
+- 2026-07-02 新增并验证 Source Delta + Gamma 机制消融：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py features/extractor.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py`
+  - 小张量验证 `delta_src` softmax、visual-prompt prompt source mass 非零且总和为 1、`gamma=0/0.5/1` target 分布无 NaN/inf、默认旧配置不输出 delta 字段。
+  - Qwen/InternVL 的 visual-only、visual-prompt 四组 `--num-images 2` smoke test 通过。
+  - Qwen/InternVL 的 visual-only、visual-prompt 四组 full feature extraction 完成。
+  - 四组逐层 plot 完成，结果位于各自 `COCO500-*-source-delta-gamma/results/`。
+  - Qwen visual-only 与 Qwen visual-prompt 的 xgb/rf/mlp feature-set 消融完成；InternVL feature 与 plot 已完成，分类训练未作为本轮结论依据继续等待。
 
 ## Known issues
 - 第一次 Qwen visual-only 抽取误用了 InternVL 的 `labeling.json/generations.json`，产物已移动到 `outputs/qwen2_5_vl_7b/COCO500-visualonly/bad_internvl_labels_20260630_194840/`，不要用于分析。
 - 默认 `/opt/conda/bin/python` 缺少 torch/transformers/scipy/sklearn/openai/pyyaml；本次运行使用的是 `/opt/conda/private/envs/vicr/bin/python`。
 - `run.sh` 中的疑似 API key 示例字符串已改回占位符；如该字符串曾经是真实密钥，仍建议在 OpenAI 控制台轮换。
+- Source Delta + Gamma 中 InternVL 的 feature extraction 与逐层图已完成，但 xgb/rf/mlp 分类训练在当前结论已经清楚后停止；如果论文表格需要完整分类数值，可后续只补 InternVL 两个目录的训练。
 
 ## Next steps
-- relative VLL visual-only/decomposed、visual+prompt simultaneous VLL、visual+prompt risk_mean 的 Qwen 和 InternVL 逐层图与 xgb/rf/mlp feature-set 消融已完成。
-- 当前最值得进一步看的是 first-token 与 risk_mean 的差异来源：多 sub-token word 是否主要集中在某些 object 类，以及后续 sub-token 的 risk 是否系统性更噪。
-- 下一步可把 Qwen 与 InternVL 的 visual-only relative VLL、visual+prompt simultaneous VLL、risk_mean 最强 feature set 汇总到一张跨模型对比表。
-- 如需进一步确认泛化，可补跑 torch probe 或换 split seed 做稳定性检查。
+- relative VLL visual-only/decomposed、visual+prompt simultaneous VLL 的 Qwen 和 InternVL 逐层图与 xgb/rf/mlp feature-set 消融已完成。
+- 当前 word all-token risk mean 已从代码中移除，不再作为后续主线。
+- final norm ablation 已完成；当前结论是 final norm 能放大 visual+prompt risk 的均值曲线分离，但 Qwen 的 risk AUC 下降，InternVL 小幅提升，因此不建议直接替换默认 h_mid，需要作为 ablation 保留。
+- Source Delta + Gamma 的当前结论是新 Offn/delta source 不如 legacy source，不建议继续作为主线优化；如保留，定位为机制消融或负结果。
+- 下一步可只挑最有希望的 finalnorm 分支（Qwen cosine、InternVL visual+prompt risk）补跑 torch probe 或换 split seed 做稳定性检查；source 侧优先回到 legacy source。
 - 如需和原 visual+prompt/direct 直接对比，可把原 `COCO500/results/*risk_layerwise_by_label.csv` 与本次 `COCO500-visualprompt-relativevll` CSV 做同图差值分析。

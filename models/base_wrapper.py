@@ -75,6 +75,7 @@ class BaseLVLMWrapper(ABC):
         prefix_token_ids: List[int],
         response_token_idx: int,
         target_token_id: Optional[int] = None,
+        cfg_dgst_t: Optional[dict[str, Any]] = None,
     ) -> ModelOutput:
         """Run ONE forward pass using `prefix_token_ids` as input and"""
         ...
@@ -102,6 +103,7 @@ class BaseLVLMWrapper(ABC):
                     prefix_token_ids=[int(token_id) for token_id in response_token_ids[:index]],
                     response_token_idx=index,
                     target_token_id=int(target_token_id),
+                    cfg_dgst_t=cfg_dgst_t,
                 )
             )
         return outputs

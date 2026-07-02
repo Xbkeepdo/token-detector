@@ -139,6 +139,7 @@ class InternVLWrapper(BaseLVLMWrapper):
         prefix_token_ids: List[int],
         response_token_idx: int,
         target_token_id: Optional[int] = None,
+        cfg_dgst_t: Optional[dict] = None,
     ) -> ModelOutput:
         """Build a full input sequence that mirrors what InternVL's chat"""
         pixel_values = self._preprocess_image(image)
@@ -189,6 +190,11 @@ class InternVLWrapper(BaseLVLMWrapper):
             target_token_id=dgst_target_id,
             prediction_position=seq_len - 1,
             support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+            relative_vll_logit_source=(
+                cfg_dgst_t.get("relative_vll_logit_source", "h_mid")
+                if cfg_dgst_t is not None
+                else "h_mid"
+            ),
         )
 
         return ModelOutput(
@@ -299,6 +305,10 @@ class InternVLWrapper(BaseLVLMWrapper):
                 compute_capped_topmass_085=cfg_dgst_t.get("compute_capped_topmass_085", True),
                 target_gate_mode=cfg_dgst_t.get("target_gate_mode", "legacy_prob"),
                 relative_vll_mad_epsilon=cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6),
+                relative_vll_logit_source=cfg_dgst_t.get("relative_vll_logit_source", "h_mid"),
+                source_modes=cfg_dgst_t.get("source_modes"),
+                target_attention_gammas=cfg_dgst_t.get("target_attention_gammas"),
+                target_attention_epsilon=cfg_dgst_t.get("target_attention_epsilon", 1e-12),
             )
         else:
             dgst_raws = build_dgst_t_raw_batch(
@@ -312,6 +322,7 @@ class InternVLWrapper(BaseLVLMWrapper):
                 target_token_ids=targets,
                 prediction_positions=prediction_positions,
                 support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+                relative_vll_logit_source="h_mid",
             )
 
         outputs: List[ModelOutput] = []

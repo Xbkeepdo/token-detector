@@ -44,6 +44,9 @@ def compute_dgst_t(
     compute_capped_topmass_085: bool = True,
     target_gate_mode: str = "legacy_prob",
     relative_vll_mad_epsilon: float = RELATIVE_VLL_MAD_EPSILON,
+    source_modes: Sequence[str] | None = None,
+    target_attention_gammas: Sequence[float] | None = None,
+    target_attention_epsilon: float = EPS,
 ) -> dict[str, Any]:
     """Compute DGST-T layer features from raw wrapper captures."""
     support_states = dgst_t_raw["support_h_mid_states"]
@@ -53,7 +56,7 @@ def compute_dgst_t(
         dgst_t_raw["prompt_logit_lens_top3_confidence"],
     )
 
-    return _compute_dgst_t_from_parts(
+    result = _compute_dgst_t_from_parts(
         source_ffn_states=_layer_tensors(dgst_t_raw["source_ffn_states"]),
         prediction_hidden_states=_layer_tensors(dgst_t_raw["prediction_hidden_states"]),
         support_h_mid_states=_layer_tensors(support_states),
@@ -88,7 +91,14 @@ def compute_dgst_t(
         compute_capped_topmass_085=compute_capped_topmass_085,
         target_gate_mode=target_gate_mode,
         relative_vll_mad_epsilon=relative_vll_mad_epsilon,
+        source_modes=source_modes,
+        target_attention_gammas=target_attention_gammas,
+        target_attention_epsilon=target_attention_epsilon,
     )
+    result["dgst_t_relative_vll_logit_source"] = str(
+        dgst_t_raw.get("relative_vll_logit_source", "h_mid")
+    )
+    return result
 
 
 def compute_dgst_t_batch_from_captures(
@@ -124,12 +134,19 @@ def compute_dgst_t_batch_from_captures(
     compute_capped_topmass_085: bool = True,
     target_gate_mode: str = "legacy_prob",
     relative_vll_mad_epsilon: float = RELATIVE_VLL_MAD_EPSILON,
+    relative_vll_logit_source: str = "h_mid",
+    source_modes: Sequence[str] | None = None,
+    target_attention_gammas: Sequence[float] | None = None,
+    target_attention_epsilon: float = EPS,
 ) -> list[dict[str, Any]]:
     """Compute DGST-T for several target tokens directly from shared captures."""
     from models.dgst_capture import (
         resolve_output_embedding_layer,
+        resolve_decoder_final_norm,
         resolve_prompt_positions,
         resolve_support_positions,
+        apply_decoder_final_norm,
+        normalize_relative_vll_logit_source,
         target_logits_multi,
         target_probabilities_multi,
     )
@@ -160,6 +177,12 @@ def compute_dgst_t_batch_from_captures(
         raise ValueError("DGST-T prompt positions are empty.")
 
     output_layer = resolve_output_embedding_layer(model)
+    relative_source = normalize_relative_vll_logit_source(relative_vll_logit_source)
+    final_norm_layer = (
+        resolve_decoder_final_norm(model)
+        if relative_source == "final_norm_h_mid"
+        else None
+    )
     parts = [
         {
             "source_ffn_states": [],
@@ -186,6 +209,11 @@ def compute_dgst_t_batch_from_captures(
         prompt_index = torch.tensor(prompt_positions, dtype=torch.long, device=device)
 
         support_states = h_mid.index_select(0, support_index)
+        support_relative_states = (
+            apply_decoder_final_norm(final_norm_layer, support_states)
+            if final_norm_layer is not None
+            else support_states
+        )
         support_output_states = layer_hidden.index_select(0, support_index)
         prompt_states = layer_hidden.index_select(0, prompt_index)
 
@@ -197,7 +225,7 @@ def compute_dgst_t_batch_from_captures(
         )
         support_relative_logits_all = target_logits_multi(
             output_layer=output_layer,
-            states=support_states,
+            states=support_relative_states,
             target_token_ids=target_ids,
             chunk_size=semantic_chunk_size,
         )
@@ -236,44 +264,47 @@ def compute_dgst_t_batch_from_captures(
 
     results: list[dict[str, Any]] = []
     for part in parts:
-        results.append(
-            _compute_dgst_t_from_parts(
-                source_ffn_states=part["source_ffn_states"],
-                prediction_hidden_states=part["prediction_hidden_states"],
-                support_h_mid_states=part["support_h_mid_states"],
-                support_output_states=part["support_output_states"],
-                support_attentions=part["support_attentions"],
-                semantic_probs=part["semantic_probs"],
-                relative_vll_logits=part["relative_vll_logits"],
-                prompt_last_hidden_states=part["prompt_last_hidden_states"],
-                prompt_mean_hidden_states=part["prompt_mean_hidden_states"],
-                prompt_confidence_top3=part["prompt_logit_lens_top3_confidence"],
-                prompt_confidence_max=part["prompt_logit_lens_max_confidence"],
-                support_positions=[int(position) for position in support_positions],
-                visual_start=int(visual_start),
-                visual_end=int(visual_end),
-                tau=tau,
-                transport_top_k=transport_top_k,
-                cost_mode=cost_mode,
-                lambda_d=lambda_d,
-                lambda_s=lambda_s,
-                lambda_t=lambda_t,
-                lambda_int=lambda_int,
-                baseline_layers=baseline_layers,
-                risk_start_layer=risk_start_layer,
-                alpha=alpha,
-                ot_solver=ot_solver,
-                atarget_visual_top_k=atarget_visual_top_k,
-                topmass_alpha=topmass_alpha,
-                capped_topmass_alpha=capped_topmass_alpha,
-                capped_topmass_min_k=capped_topmass_min_k,
-                capped_topmass_max_k=capped_topmass_max_k,
-                compute_topmass_085=compute_topmass_085,
-                compute_capped_topmass_085=compute_capped_topmass_085,
-                target_gate_mode=target_gate_mode,
-                relative_vll_mad_epsilon=relative_vll_mad_epsilon,
-            )
+        result = _compute_dgst_t_from_parts(
+            source_ffn_states=part["source_ffn_states"],
+            prediction_hidden_states=part["prediction_hidden_states"],
+            support_h_mid_states=part["support_h_mid_states"],
+            support_output_states=part["support_output_states"],
+            support_attentions=part["support_attentions"],
+            semantic_probs=part["semantic_probs"],
+            relative_vll_logits=part["relative_vll_logits"],
+            prompt_last_hidden_states=part["prompt_last_hidden_states"],
+            prompt_mean_hidden_states=part["prompt_mean_hidden_states"],
+            prompt_confidence_top3=part["prompt_logit_lens_top3_confidence"],
+            prompt_confidence_max=part["prompt_logit_lens_max_confidence"],
+            support_positions=[int(position) for position in support_positions],
+            visual_start=int(visual_start),
+            visual_end=int(visual_end),
+            tau=tau,
+            transport_top_k=transport_top_k,
+            cost_mode=cost_mode,
+            lambda_d=lambda_d,
+            lambda_s=lambda_s,
+            lambda_t=lambda_t,
+            lambda_int=lambda_int,
+            baseline_layers=baseline_layers,
+            risk_start_layer=risk_start_layer,
+            alpha=alpha,
+            ot_solver=ot_solver,
+            atarget_visual_top_k=atarget_visual_top_k,
+            topmass_alpha=topmass_alpha,
+            capped_topmass_alpha=capped_topmass_alpha,
+            capped_topmass_min_k=capped_topmass_min_k,
+            capped_topmass_max_k=capped_topmass_max_k,
+            compute_topmass_085=compute_topmass_085,
+            compute_capped_topmass_085=compute_capped_topmass_085,
+            target_gate_mode=target_gate_mode,
+            relative_vll_mad_epsilon=relative_vll_mad_epsilon,
+            source_modes=source_modes,
+            target_attention_gammas=target_attention_gammas,
+            target_attention_epsilon=target_attention_epsilon,
         )
+        result["dgst_t_relative_vll_logit_source"] = relative_source
+        results.append(result)
     return results
 
 
@@ -313,11 +344,17 @@ def _compute_dgst_t_from_parts(
     compute_capped_topmass_085: bool,
     target_gate_mode: str,
     relative_vll_mad_epsilon: float,
+    source_modes: Sequence[str] | None,
+    target_attention_gammas: Sequence[float] | None,
+    target_attention_epsilon: float,
 ) -> dict[str, Any]:
     layer_count = len(source_ffn_states)
     if layer_count == 0:
         raise ValueError("DGST-T requires at least one captured layer.")
     gate_mode = _normalize_target_gate_mode(target_gate_mode)
+    enabled_source_modes = _normalize_source_modes(source_modes)
+    compute_delta_src = "delta_src" in enabled_source_modes
+    gamma_values = _normalize_target_attention_gammas(target_attention_gammas)
     compute_relative_vll = gate_mode in {"relative_vll", "dual"}
     if compute_relative_vll and relative_vll_logits is None:
         raise ValueError("target_gate_mode requires relative_vll_logits, but they are missing.")
@@ -359,11 +396,21 @@ def _compute_dgst_t_from_parts(
     prompt_confidence_max_per_layer = []
     context_confidence_per_layer = []
     context_confidence_max_prompt_per_layer = []
+    delta_series: dict[str, dict[str, list[float]]] = {}
     has_prompt_support = _has_prompt_support_tokens(
         support_positions=support_positions,
         visual_start=visual_start,
         visual_end=visual_end,
     )
+    if compute_relative_vll and compute_delta_src:
+        target_slugs = ["rvll"]
+        if has_prompt_support:
+            target_slugs.append("vp_rvll")
+        for target_slug in target_slugs:
+            for gamma in gamma_values:
+                slug = _gamma_slug(gamma)
+                key = f"{target_slug}_delta_src_{slug}"
+                delta_series[key] = {"risk": [], "risk_cap": [], "cos": [], "cos_cap": []}
 
     for layer_idx in range(layer_count):
         layer_support_states = support_h_mid_states[layer_idx].float()
@@ -378,6 +425,15 @@ def _compute_dgst_t_from_parts(
             support_states=layer_support_states,
             tau=tau,
         )
+        source_dist_delta = None
+        if compute_relative_vll and compute_delta_src:
+            layer_prediction_h_mid = layer_prediction_hidden - layer_source_ffn
+            source_dist_delta = _source_delta_distribution(
+                prediction_h_mid=layer_prediction_h_mid,
+                prediction_h_out=layer_prediction_hidden,
+                support_states=layer_support_states,
+                tau=tau,
+            )
         attention_dist = _renormalize(layer_support_attentions)
         target_dist = _renormalize(attention_dist * layer_semantic_probs)
         target_dist_relative_vll = None
@@ -417,6 +473,137 @@ def _compute_dgst_t_from_parts(
                     stat_prefix="visual_prompt_relative_vll",
                     epsilon=relative_vll_mad_epsilon,
                 )
+
+        delta_layer_stats = {}
+        if compute_relative_vll and compute_delta_src and source_dist_delta is not None:
+            delta_targets = [
+                (
+                    "rvll",
+                    "visual",
+                    _target_hidden_topk_visual_cosine,
+                    _target_hidden_capped_topmass_visual_cosine,
+                )
+            ]
+            if has_prompt_support:
+                delta_targets.append(
+                    (
+                        "vp_rvll",
+                        "visual_prompt",
+                        _target_hidden_topk_support_cosine,
+                        _target_hidden_capped_topmass_support_cosine,
+                    )
+                )
+            for target_slug, candidate_scope, cosine_fn, capped_cosine_fn in delta_targets:
+                for gamma in gamma_values:
+                    gamma_slug = _gamma_slug(gamma)
+                    series_key = f"{target_slug}_delta_src_{gamma_slug}"
+                    target_dist_delta, semantic_gate_delta, target_stats = (
+                        _relative_vll_target_distribution(
+                            attention_dist=attention_dist,
+                            target_logits=layer_relative_logits,
+                            support_positions=support_positions,
+                            visual_start=visual_start,
+                            visual_end=visual_end,
+                            candidate_scope=candidate_scope,
+                            stat_prefix=series_key,
+                            epsilon=relative_vll_mad_epsilon,
+                            attention_gamma=gamma,
+                            attention_epsilon=target_attention_epsilon,
+                        )
+                    )
+                    delta_support = _topk_union_indices(
+                        source_dist_delta,
+                        target_dist_delta,
+                        transport_top_k,
+                    )
+                    delta_risk = _transport_risk_on_support(
+                        source_dist=source_dist_delta,
+                        target_dist=target_dist_delta,
+                        support_states=layer_support_states,
+                        semantic_probs=semantic_gate_delta,
+                        support=delta_support,
+                        cost_mode=cost_mode,
+                        lambda_d=lambda_d,
+                        lambda_s=lambda_s,
+                        lambda_t=lambda_t,
+                        lambda_int=lambda_int,
+                        ot_solver=ot_solver,
+                    )
+                    if target_slug == "rvll":
+                        delta_cos = cosine_fn(
+                            target_hidden=layer_prediction_hidden,
+                            support_output_states=layer_support_output_states,
+                            target_dist=target_dist_delta,
+                            support_positions=support_positions,
+                            visual_start=visual_start,
+                            visual_end=visual_end,
+                            top_k=atarget_visual_top_k,
+                        )
+                    else:
+                        delta_cos = cosine_fn(
+                            target_hidden=layer_prediction_hidden,
+                            support_output_states=layer_support_output_states,
+                            target_dist=target_dist_delta,
+                            top_k=atarget_visual_top_k,
+                        )
+                    delta_series[series_key]["risk"].append(float(delta_risk))
+                    delta_series[series_key]["cos"].append(float(delta_cos))
+                    delta_layer_stats[f"risk_{series_key}"] = float(delta_risk)
+                    delta_layer_stats[f"cos_{series_key}"] = float(delta_cos)
+                    delta_layer_stats[f"selected_support_size_{series_key}"] = int(
+                        delta_support.numel()
+                    )
+                    delta_layer_stats.update(target_stats)
+
+                    if compute_capped_topmass_085:
+                        delta_capped_support = _capped_topmass_union_indices(
+                            source_dist_delta,
+                            target_dist_delta,
+                            capped_topmass_alpha,
+                            min_k=capped_topmass_min_k,
+                            max_k=capped_topmass_max_k,
+                        )
+                        delta_risk_cap = _transport_risk_on_support(
+                            source_dist=source_dist_delta,
+                            target_dist=target_dist_delta,
+                            support_states=layer_support_states,
+                            semantic_probs=semantic_gate_delta,
+                            support=delta_capped_support,
+                            cost_mode=cost_mode,
+                            lambda_d=lambda_d,
+                            lambda_s=lambda_s,
+                            lambda_t=lambda_t,
+                            lambda_int=lambda_int,
+                            ot_solver=ot_solver,
+                        )
+                        if target_slug == "rvll":
+                            delta_cos_cap = capped_cosine_fn(
+                                target_hidden=layer_prediction_hidden,
+                                support_output_states=layer_support_output_states,
+                                target_dist=target_dist_delta,
+                                support_positions=support_positions,
+                                visual_start=visual_start,
+                                visual_end=visual_end,
+                                alpha=capped_topmass_alpha,
+                                min_k=capped_topmass_min_k,
+                                max_k=capped_topmass_max_k,
+                            )
+                        else:
+                            delta_cos_cap = capped_cosine_fn(
+                                target_hidden=layer_prediction_hidden,
+                                support_output_states=layer_support_output_states,
+                                target_dist=target_dist_delta,
+                                alpha=capped_topmass_alpha,
+                                min_k=capped_topmass_min_k,
+                                max_k=capped_topmass_max_k,
+                            )
+                        delta_series[series_key]["risk_cap"].append(float(delta_risk_cap))
+                        delta_series[series_key]["cos_cap"].append(float(delta_cos_cap))
+                        delta_layer_stats[f"risk_{series_key}_cap085"] = float(delta_risk_cap)
+                        delta_layer_stats[f"cos_{series_key}_cap085"] = float(delta_cos_cap)
+                        delta_layer_stats[f"selected_support_size_{series_key}_cap085"] = int(
+                            delta_capped_support.numel()
+                        )
 
         support = _topk_union_indices(source_dist, target_dist, transport_top_k)
         transport_risk = _transport_risk_on_support(
@@ -785,6 +972,8 @@ def _compute_dgst_t_from_parts(
             )
         if visual_prompt_relative_vll_stats is not None:
             stats.update(visual_prompt_relative_vll_stats)
+        if delta_layer_stats:
+            stats.update(delta_layer_stats)
         layer_stats.append(stats)
 
     risk_tensor = torch.tensor(risk_per_layer, dtype=torch.float32)
@@ -905,6 +1094,30 @@ def _compute_dgst_t_from_parts(
             risk_capped_topmass_085_per_layer,
             dtype=torch.float32,
         )
+    for series_key, values in delta_series.items():
+        risk_delta_tensor = torch.tensor(values["risk"], dtype=torch.float32)
+        result[f"dgst_t_score_{series_key}"] = float(
+            _baseline_excess_score(
+                risk_delta_tensor,
+                baseline_layers=baseline_layers,
+                risk_start_layer=risk_start_layer,
+                alpha=alpha,
+            )
+        )
+        result[f"dgst_t_risk_{series_key}_per_layer"] = risk_delta_tensor
+        result[f"dgst_t_cos_{series_key}_per_layer"] = torch.tensor(
+            values["cos"],
+            dtype=torch.float32,
+        )
+        if compute_capped_topmass_085:
+            result[f"dgst_t_risk_{series_key}_cap085_per_layer"] = torch.tensor(
+                values["risk_cap"],
+                dtype=torch.float32,
+            )
+            result[f"dgst_t_cos_{series_key}_cap085_per_layer"] = torch.tensor(
+                values["cos_cap"],
+                dtype=torch.float32,
+            )
     return result
 
 
@@ -929,6 +1142,52 @@ def _normalize_target_gate_mode(value: str) -> str:
     if mode == "dual":
         return "dual"
     raise ValueError("DGST-T target_gate_mode must be 'legacy_prob', 'relative_vll', or 'dual'.")
+
+
+def _normalize_source_modes(value: Sequence[str] | str | None) -> list[str]:
+    if value is None:
+        return ["legacy_ffn"]
+    raw_modes = [value] if isinstance(value, str) else list(value)
+    modes = []
+    for raw in raw_modes:
+        mode = str(raw).strip().lower()
+        if mode in {"legacy", "legacy_ffn", "ffn", "o_ffn"}:
+            canonical = "legacy_ffn"
+        elif mode in {"delta", "delta_src", "source_delta", "source_delta_visual"}:
+            canonical = "delta_src"
+        else:
+            raise ValueError("DGST-T source_modes entries must be 'legacy_ffn' or 'delta_src'.")
+        if canonical not in modes:
+            modes.append(canonical)
+    return modes or ["legacy_ffn"]
+
+
+def _normalize_target_attention_gammas(value: Sequence[float] | float | None) -> list[float]:
+    if value is None:
+        raw_values = [1.0]
+    elif isinstance(value, (float, int)):
+        raw_values = [float(value)]
+    else:
+        raw_values = [float(item) for item in value]
+    gammas = []
+    for raw in raw_values:
+        gamma = float(raw)
+        if gamma < 0.0:
+            raise ValueError("DGST-T target_attention_gammas must be non-negative.")
+        if not any(abs(gamma - existing) < 1e-9 for existing in gammas):
+            gammas.append(gamma)
+    return gammas or [1.0]
+
+
+def _gamma_slug(gamma: float) -> str:
+    if abs(float(gamma)) < 1e-9:
+        return "g0"
+    if abs(float(gamma) - 0.5) < 1e-9:
+        return "g05"
+    if abs(float(gamma) - 1.0) < 1e-9:
+        return "g1"
+    text = f"{float(gamma):g}".replace(".", "p").replace("-", "m")
+    return f"g{text}"
 
 
 def _scalar(value: torch.Tensor | float | int) -> float:
@@ -963,6 +1222,20 @@ def _source_distribution(
     return torch.softmax(scores / max(float(tau), 1e-6), dim=-1)
 
 
+def _source_delta_distribution(
+    *,
+    prediction_h_mid: torch.Tensor,
+    prediction_h_out: torch.Tensor,
+    support_states: torch.Tensor,
+    tau: float,
+) -> torch.Tensor:
+    states = support_states.float()
+    before = F.cosine_similarity(prediction_h_mid.float().unsqueeze(0), states, dim=-1)
+    after = F.cosine_similarity(prediction_h_out.float().unsqueeze(0), states, dim=-1)
+    scores = after - before
+    return torch.softmax(scores / max(float(tau), 1e-6), dim=-1)
+
+
 def _renormalize(values: torch.Tensor) -> torch.Tensor:
     values = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
     total = values.sum()
@@ -981,6 +1254,8 @@ def _relative_vll_target_distribution(
     candidate_scope: str,
     stat_prefix: str,
     epsilon: float,
+    attention_gamma: float = 1.0,
+    attention_epsilon: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     logits = torch.nan_to_num(target_logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
     if logits.numel() != attention_dist.numel():
@@ -1009,7 +1284,12 @@ def _relative_vll_target_distribution(
     semantic_gate = torch.zeros_like(logits, dtype=torch.float32)
     semantic_gate.index_copy_(0, candidate_index, candidate_gate.float())
 
-    weighted = attention_dist.float() * semantic_gate
+    gamma = float(attention_gamma)
+    attention_weight = torch.pow(
+        attention_dist.float().clamp_min(0.0) + max(float(attention_epsilon), 0.0),
+        gamma,
+    )
+    weighted = attention_weight * semantic_gate
     denominator = weighted.sum()
     if denominator <= EPS:
         target_dist = torch.zeros_like(weighted, dtype=torch.float32)
@@ -1023,6 +1303,7 @@ def _relative_vll_target_distribution(
         f"{stat_prefix}_gate_mean": float(candidate_gate.mean().item()),
         f"{stat_prefix}_gate_max": float(candidate_gate.max().item()),
         f"{stat_prefix}_target_denominator": float(denominator.item()),
+        f"{stat_prefix}_attention_gamma": float(gamma),
     }
     return target_dist, semantic_gate, stats
 
