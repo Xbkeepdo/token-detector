@@ -242,6 +242,17 @@ def _build_feature_record(
         feat["dgst_t_relative_vll_logit_source"] = dgst_t[
             "dgst_t_relative_vll_logit_source"
         ]
+    if "dgst_t_relative_cost_mode" in dgst_t:
+        feat["dgst_t_relative_cost_mode"] = dgst_t["dgst_t_relative_cost_mode"]
+    if "dgst_t_relative_cost_modes" in dgst_t:
+        feat["dgst_t_relative_cost_modes"] = list(dgst_t["dgst_t_relative_cost_modes"])
+    for key in (
+        "dgst_t_relative_barrier_lambda",
+        "dgst_t_relative_barrier_margin",
+        "dgst_t_relative_barrier_max",
+    ):
+        if key in dgst_t:
+            feat[key] = float(dgst_t[key])
     for key in (
         "dgst_t_transport_risk_relative_vll_per_layer",
         "dgst_t_transport_risk_relative_vll_capped_topmass_085_per_layer",
@@ -257,7 +268,10 @@ def _build_feature_record(
     for key, value in dgst_t.items():
         if key in feat:
             continue
-        if key.startswith(("dgst_t_risk_", "dgst_t_cos_")) and key.endswith("_per_layer"):
+        if (
+            key.startswith(("dgst_t_risk_", "dgst_t_cos_", "dgst_t_transport_risk_"))
+            and key.endswith("_per_layer")
+        ):
             feat[key] = value.tolist() if hasattr(value, "tolist") else value
         elif key.startswith("dgst_t_score_"):
             feat[key] = float(value)
@@ -292,6 +306,11 @@ def _compute_dgst_t_result(model_out, cfg_dgst_t: dict) -> dict:
         compute_capped_topmass_085=cfg_dgst_t.get("compute_capped_topmass_085", True),
         target_gate_mode=cfg_dgst_t.get("target_gate_mode", "legacy_prob"),
         relative_vll_mad_epsilon=cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6),
+        relative_cost_mode=cfg_dgst_t.get("relative_cost_mode"),
+        relative_cost_modes=cfg_dgst_t.get("relative_cost_modes"),
+        relative_barrier_lambda=cfg_dgst_t.get("relative_barrier_lambda", 1.0),
+        relative_barrier_margin=cfg_dgst_t.get("relative_barrier_margin", 0.5),
+        relative_barrier_max=cfg_dgst_t.get("relative_barrier_max", 3.0),
         source_modes=cfg_dgst_t.get("source_modes"),
         target_attention_gammas=cfg_dgst_t.get("target_attention_gammas"),
         target_attention_epsilon=cfg_dgst_t.get("target_attention_epsilon", 1e-12),

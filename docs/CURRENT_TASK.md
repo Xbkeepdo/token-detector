@@ -62,6 +62,32 @@
   - InternVL visual-prompt 中 `vp_rvll_delta` 有一定信号，g05/g1 的 `diff_avg` 约 0.036/0.026，但仍低于 legacy source g1 的约 0.049；capped 下 legacy 约 0.048，delta g1 约 0.025。
   - Qwen 分类消融也支持该判断：visual-only 最好 legacy 组合 `risk_relative_vll+target_visual_hidden_cosine_relative_vll` AUC 约 0.942，而最好 delta 组合约 0.910；visual-prompt 最好 legacy/visual-prompt 组合 AUC 约 0.941，而最好 `vp_rvll_delta` 组合约 0.928。
   - 当前结论：`delta_src`/新 Offn source 不适合作为默认替换，最多保留为 negative/mechanism ablation。性能主要仍来自 relative VLL target、attention-guided target 与 cosine 分支，而不是这个 source 重构。
+- 2026-07-02 用户决定：后续实验暂时不再使用 deltaOffn/`delta_src`，也不再继续做 `gamma=0/0.5/1` 的 attention 机制消融。已有 Source Delta + Gamma 结果只作为记录/负结果保留，不进入后续主线实验。
+- 2026-07-02 新增并完成 relative VLL transport cost 三路重构对比：
+  - 新增 `relative_cost_mode` 与 `relative_cost_modes`。默认不设置时沿用旧 `cost_mode`，向后兼容；本轮使用一次 feature extraction 同时输出三种 cost，避免重复抽特征。
+  - 三种 cost 为 `geo`、`target_barrier_geo`/`tbar`、`symmetric_barrier_geo`/`sbar`。barrier 参数为 `relative_barrier_lambda=1.0`、`relative_barrier_margin=0.5`、`relative_barrier_max=3.0`。
+  - 新增字段包括 `dgst_t_transport_risk_relative_vll_cost_{geo,tbar,sbar}_per_layer`、对应 `_capped_topmass_085_per_layer`，以及 `dgst_t_transport_risk_visual_prompt_relative_vll_cost_{geo,tbar,sbar}_per_layer`、对应 capped 字段。
+  - Qwen/InternVL full 3-way features 已完成：
+    - `outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-cost-3way/features.pkl`：2190 行，labels `{0:554,1:1636}`，每条 risk 28 层。
+    - `outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-cost-3way/features.pkl`：3715 行，labels `{0:651,1:3064}`，每条 risk 32 层。
+  - 两个模型均已完成 24 组 XGB-only feature-set 对比；总表与曲线汇总位于 `outputs/relative_cost_3way_comparison/`。
+  - Qwen 分类结论：`geo` 是最稳默认；`tbar` 在少数 raw/visual+prompt combo 上有小幅收益，最高为 `risk_visual_prompt_relative_vll_cost_tbar_capped_topmass_085+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085`，XGB AUC 约 0.947；`sbar` 虽抬高曲线分离，但分类通常下降。
+  - InternVL 分类结论：visual+prompt risk-only 更偏向 `tbar`，`risk_visual_prompt_relative_vll_cost_tbar` AUC 约 0.943；加 cosine 后 `geo/tbar` 非常接近，最高为 `risk_visual_prompt_relative_vll_cost_tbar+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll`，AUC 约 0.960，`geo` 同组约 0.959；`sbar` 基本弱于前两者。
+  - 曲线结论：barrier cost 会抬高 risk 绝对值，`sbar` 抬升最大且常给出更大的 hall-non 均值差，但该差异不稳定转化为分类收益；建议主线仍保留 `geo`，把 `tbar` 作为轻量 ablation/候选，不建议默认使用 `sbar`。
+- 2026-07-03 补齐 LLaVA-1.5-7B 的 relative VLL cost 3-way 对比：
+  - 使用 LLaVA 原 `COCO500` 的 `labeling.json/generations.json/image_splits.json`，一次 feature extraction 同时输出 `geo/tbar/sbar`。
+  - 输出目录：`outputs/llava_1_5_7b/COCO500-visualprompt-relativevll-cost-3way/`，features 共 1448 行，labels `{0:757,1:691}`，每条 risk 32 层。
+  - 24 组 XGB-only 分类已完成，结果已合并进 `outputs/relative_cost_3way_comparison/relative_cost_3way_summary.md` 与 CSV/图。
+  - LLaVA 分类结论：单独 visual risk 中 `geo/tbar` 接近，raw 最好 `geo` AUC 约 0.818，capped 最好 `tbar` AUC 约 0.819；加 visual cosine 后 `tbar` 最强，`risk_relative_vll_cost_tbar+target_visual_hidden_cosine_relative_vll` AUC 约 0.853，是本轮 LLaVA 最高；visual+prompt combo 则 `geo` 略高，AUC 约 0.842。
+  - LLaVA 曲线结论：visual branch 的 hall-non diff 为正，`sbar` 抬高均值差最大；visual+prompt branch 的 diff 反向为负（non-hall risk 更高），这和 Qwen/InternVL 不同，也解释了 visual+prompt risk-only 分类不如 visual branch 稳。
+- 2026-07-03 补齐 cost 3-way 的 MLP 分类对比：
+  - Qwen/InternVL/LLaVA 三个 `COCO500-visualprompt-relativevll-cost-3way` 输出目录均已在同一套 24 个 feature set 上补跑 MLP-only，并和已有 XGB 结果合并。
+  - 新增汇总：`outputs/relative_cost_3way_comparison/relative_cost_3way_mlp_summary.md`、`relative_cost_3way_xgb_mlp_all.csv`、`relative_cost_3way_xgb_vs_mlp_best_by_family.csv`、`relative_cost_3way_xgb_mlp_overall_best.csv`。
+  - MLP 训练中出现 `ConvergenceWarning`，表示部分网格配置 500 iter 未完全收敛；本轮仍按验证 AUC 选最优配置，作为 classifier ablation 使用。
+  - Qwen：MLP 对单独 visual risk 有局部收益，`risk_relative_vll_cost_geo_capped_topmass_085` AUC 约 0.911，高于对应 XGB 约 0.898；但组合项最高 MLP 为 `risk_visual_prompt_relative_vll_cost_sbar+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll`，AUC 约 0.940，仍低于 XGB 总最高约 0.947。
+  - InternVL：MLP 总体未超过 XGB；最高为 `risk_relative_vll_cost_sbar+target_visual_hidden_cosine_relative_vll`，AUC 约 0.950，低于 XGB 总最高 `risk_visual_prompt_relative_vll_cost_tbar+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` 的约 0.960。
+  - LLaVA：MLP 最高为 `risk_visual_prompt_relative_vll_cost_sbar_capped_topmass_085+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085`，AUC 约 0.852，几乎追平但略低于 XGB 最高 `risk_relative_vll_cost_tbar+target_visual_hidden_cosine_relative_vll` 的约 0.853。
+  - 当前结论：MLP 可作为 sanity check/补充，未改写 cost 3-way 主结论；`sbar` 偶尔在 MLP 组合里变强，但不稳定，默认仍优先 `geo`，`tbar` 作为 ablation/候选。
 
 ## Files changed recently
 - 新增：`configs/model_configs_visualonly.yaml`
@@ -82,6 +108,13 @@
 - 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-source-delta-gamma/`
 - 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualonly-source-delta-gamma/`
 - 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-source-delta-gamma/`
+- 新增：`configs/model_configs_visualprompt_relativevll_cost_geo.yaml`
+- 新增：`configs/model_configs_visualprompt_relativevll_cost_tbar.yaml`
+- 新增：`configs/model_configs_visualprompt_relativevll_cost_sbar.yaml`
+- 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-cost-3way/`
+- 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-cost-3way/`
+- 新增输出目录：`outputs/llava_1_5_7b/COCO500-visualprompt-relativevll-cost-3way/`
+- 新增对比输出：`outputs/relative_cost_3way_comparison/`
 
 ## Commands run
 - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model internvl_2_5_8b --config configs/model_configs_visualonly.yaml --output-dir outputs/internvl_2_5_8b/COCO500-visualonly --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
@@ -164,17 +197,34 @@
   - Qwen/InternVL 的 visual-only、visual-prompt 四组 full feature extraction 完成。
   - 四组逐层 plot 完成，结果位于各自 `COCO500-*-source-delta-gamma/results/`。
   - Qwen visual-only 与 Qwen visual-prompt 的 xgb/rf/mlp feature-set 消融完成；InternVL feature 与 plot 已完成，分类训练未作为本轮结论依据继续等待。
+- 2026-07-02 新增并验证 relative VLL cost 3-way 重构：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py features/extractor.py models/qwen_wrapper.py models/internvl_wrapper.py models/llava_wrapper.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py`
+  - 小张量验证 `geo/tbar/sbar` cost matrix 有差异、`relative_cost_modes` 会同时输出三套字段、primary old visual-prompt risk 字段等于 `geo`。
+  - Qwen/InternVL 3-way smoke test 通过，字段 `geo/tbar/sbar` 均存在。
+  - 使用 `configs/model_configs_visualprompt_relativevll_cost_geo.yaml` 一次抽取 Qwen/InternVL full features，并通过 `relative_cost_modes: ["geo", "target_barrier_geo", "symmetric_barrier_geo"]` 同时生成三种 cost。
+  - 在两个 3-way 输出目录上跑完 24 组 XGB-only feature-set 分类；过慢的 Qwen xgb/rf/mlp partial 结果已另存为 `qwen2_5_vl_7b_selected_feature_sets.partial_slow.json`，正式结论使用 XGB-only 完整表。
+  - 生成汇总表与逐层图：`outputs/relative_cost_3way_comparison/relative_cost_3way_summary.md`、`relative_cost_3way_xgb_all.csv`、`relative_cost_3way_xgb_best_by_family.csv`、`relative_cost_3way_layerwise_summary.csv` 以及 Qwen/InternVL 的 visual/vp raw/cap085 三路曲线图。
+- 2026-07-03 补跑 LLaVA relative VLL cost 3-way：
+  - 复用 LLaVA `COCO500` 的 `labeling.json/generations.json/image_splits.json` 到 `outputs/llava_1_5_7b/COCO500-visualprompt-relativevll-cost-3way/`。
+  - 特征抽取命令：`CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model llava_1_5_7b --config configs/model_configs_visualprompt_relativevll_cost_geo.yaml --output-dir outputs/llava_1_5_7b/COCO500-visualprompt-relativevll-cost-3way --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
+  - 字段检查通过：`dgst_t_transport_risk_relative_vll_cost_{geo,tbar,sbar}_per_layer` 与 `dgst_t_transport_risk_visual_prompt_relative_vll_cost_{geo,tbar,sbar}_per_layer` 均为 1448 行、32 层。
+  - 在 LLaVA 3-way 输出目录上跑完 24 组 XGB-only feature-set 分类，并重新生成三模型总表/曲线。
+- 2026-07-03 补跑 MLP classifier：
+  - 在 Qwen/InternVL/LLaVA 的 `COCO500-visualprompt-relativevll-cost-3way` 输出目录上，使用同一套 24 个 feature set 跑完 `--classifiers mlp --scoring auc`。
+  - 重新生成 MLP vs XGB 汇总表：`outputs/relative_cost_3way_comparison/relative_cost_3way_mlp_summary.md`。
 
 ## Known issues
 - 第一次 Qwen visual-only 抽取误用了 InternVL 的 `labeling.json/generations.json`，产物已移动到 `outputs/qwen2_5_vl_7b/COCO500-visualonly/bad_internvl_labels_20260630_194840/`，不要用于分析。
 - 默认 `/opt/conda/bin/python` 缺少 torch/transformers/scipy/sklearn/openai/pyyaml；本次运行使用的是 `/opt/conda/private/envs/vicr/bin/python`。
 - `run.sh` 中的疑似 API key 示例字符串已改回占位符；如该字符串曾经是真实密钥，仍建议在 OpenAI 控制台轮换。
-- Source Delta + Gamma 中 InternVL 的 feature extraction 与逐层图已完成，但 xgb/rf/mlp 分类训练在当前结论已经清楚后停止；如果论文表格需要完整分类数值，可后续只补 InternVL 两个目录的训练。
+- Source Delta + Gamma 中 InternVL 的 feature extraction 与逐层图已完成，但 xgb/rf/mlp 分类训练在当前结论已经清楚后停止；按当前决策，后续先不补这组 deltaOffn/attention-gamma 分类表，除非专门需要负结果附录。
+- 本轮曾中断过一次旧思路的单独 Qwen `cost-geo` 抽取，目录 `outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-cost-geo/` 只作为废弃 scratch，不用于分析。正式 cost 对比使用 `COCO500-visualprompt-relativevll-cost-3way`。
 
 ## Next steps
 - relative VLL visual-only/decomposed、visual+prompt simultaneous VLL 的 Qwen 和 InternVL 逐层图与 xgb/rf/mlp feature-set 消融已完成。
 - 当前 word all-token risk mean 已从代码中移除，不再作为后续主线。
 - final norm ablation 已完成；当前结论是 final norm 能放大 visual+prompt risk 的均值曲线分离，但 Qwen 的 risk AUC 下降，InternVL 小幅提升，因此不建议直接替换默认 h_mid，需要作为 ablation 保留。
-- Source Delta + Gamma 的当前结论是新 Offn/delta source 不如 legacy source，不建议继续作为主线优化；如保留，定位为机制消融或负结果。
-- 下一步可只挑最有希望的 finalnorm 分支（Qwen cosine、InternVL visual+prompt risk）补跑 torch probe 或换 split seed 做稳定性检查；source 侧优先回到 legacy source。
+- 后续实验先排除 deltaOffn/`delta_src` 与 `gamma=0/0.5/1` attention 机制消融；不要默认使用 `source_delta_gamma` 配置或 `rvll_delta*` / `vp_rvll_delta*` aliases。
+- relative VLL cost 主线建议先用 `geo`；如果需要追求 InternVL visual+prompt、Qwen capped VP combo 或 LLaVA visual+cosine 的小幅 AUC，可把 `tbar` 作为 ablation 候选；`sbar` 不建议作为默认。
+- 下一步可只挑最有希望的 finalnorm 分支（Qwen cosine、InternVL visual+prompt risk）补跑 torch probe 或换 split seed 做稳定性检查；source 侧回到 legacy source 与当前默认 attention-guided target。
 - 如需和原 visual+prompt/direct 直接对比，可把原 `COCO500/results/*risk_layerwise_by_label.csv` 与本次 `COCO500-visualprompt-relativevll` CSV 做同图差值分析。

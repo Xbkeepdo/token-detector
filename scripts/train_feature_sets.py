@@ -160,7 +160,33 @@ def _register_delta_source_aliases() -> None:
             )
 
 
+def _register_relative_cost_aliases() -> None:
+    for slug in ("geo", "tbar", "sbar"):
+        for prefix in ("risk_relative_vll", "risk_visual_prompt_relative_vll"):
+            block = f"{prefix}_cost_{slug}"
+            cap_block = f"{block}_capped_topmass_085"
+            FEATURE_ALIASES.update(
+                {
+                    block: block,
+                    cap_block: cap_block,
+                    f"{block}_cap085": cap_block,
+                    f"{prefix}_{slug}": block,
+                    f"{prefix}_{slug}_capped_topmass_085": cap_block,
+                    f"{prefix}_{slug}_cap085": cap_block,
+                }
+            )
+            FEATURE_KEYS.update(
+                {
+                    block: f"dgst_t_transport_{prefix}_cost_{slug}_per_layer",
+                    cap_block: (
+                        f"dgst_t_transport_{prefix}_cost_{slug}_capped_topmass_085_per_layer"
+                    ),
+                }
+            )
+
+
 _register_delta_source_aliases()
+_register_relative_cost_aliases()
 
 
 def parse_args():

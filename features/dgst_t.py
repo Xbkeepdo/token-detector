@@ -44,6 +44,11 @@ def compute_dgst_t(
     compute_capped_topmass_085: bool = True,
     target_gate_mode: str = "legacy_prob",
     relative_vll_mad_epsilon: float = RELATIVE_VLL_MAD_EPSILON,
+    relative_cost_mode: str | None = None,
+    relative_cost_modes: Sequence[str] | str | None = None,
+    relative_barrier_lambda: float = 1.0,
+    relative_barrier_margin: float = 0.5,
+    relative_barrier_max: float = 3.0,
     source_modes: Sequence[str] | None = None,
     target_attention_gammas: Sequence[float] | None = None,
     target_attention_epsilon: float = EPS,
@@ -91,6 +96,11 @@ def compute_dgst_t(
         compute_capped_topmass_085=compute_capped_topmass_085,
         target_gate_mode=target_gate_mode,
         relative_vll_mad_epsilon=relative_vll_mad_epsilon,
+        relative_cost_mode=relative_cost_mode,
+        relative_cost_modes=relative_cost_modes,
+        relative_barrier_lambda=relative_barrier_lambda,
+        relative_barrier_margin=relative_barrier_margin,
+        relative_barrier_max=relative_barrier_max,
         source_modes=source_modes,
         target_attention_gammas=target_attention_gammas,
         target_attention_epsilon=target_attention_epsilon,
@@ -135,6 +145,11 @@ def compute_dgst_t_batch_from_captures(
     target_gate_mode: str = "legacy_prob",
     relative_vll_mad_epsilon: float = RELATIVE_VLL_MAD_EPSILON,
     relative_vll_logit_source: str = "h_mid",
+    relative_cost_mode: str | None = None,
+    relative_cost_modes: Sequence[str] | str | None = None,
+    relative_barrier_lambda: float = 1.0,
+    relative_barrier_margin: float = 0.5,
+    relative_barrier_max: float = 3.0,
     source_modes: Sequence[str] | None = None,
     target_attention_gammas: Sequence[float] | None = None,
     target_attention_epsilon: float = EPS,
@@ -299,6 +314,11 @@ def compute_dgst_t_batch_from_captures(
             compute_capped_topmass_085=compute_capped_topmass_085,
             target_gate_mode=target_gate_mode,
             relative_vll_mad_epsilon=relative_vll_mad_epsilon,
+            relative_cost_mode=relative_cost_mode,
+            relative_cost_modes=relative_cost_modes,
+            relative_barrier_lambda=relative_barrier_lambda,
+            relative_barrier_margin=relative_barrier_margin,
+            relative_barrier_max=relative_barrier_max,
             source_modes=source_modes,
             target_attention_gammas=target_attention_gammas,
             target_attention_epsilon=target_attention_epsilon,
@@ -344,6 +364,11 @@ def _compute_dgst_t_from_parts(
     compute_capped_topmass_085: bool,
     target_gate_mode: str,
     relative_vll_mad_epsilon: float,
+    relative_cost_mode: str,
+    relative_cost_modes: Sequence[str] | str | None,
+    relative_barrier_lambda: float,
+    relative_barrier_margin: float,
+    relative_barrier_max: float,
     source_modes: Sequence[str] | None,
     target_attention_gammas: Sequence[float] | None,
     target_attention_epsilon: float,
@@ -352,6 +377,16 @@ def _compute_dgst_t_from_parts(
     if layer_count == 0:
         raise ValueError("DGST-T requires at least one captured layer.")
     gate_mode = _normalize_target_gate_mode(target_gate_mode)
+    relative_cost = _normalize_relative_cost_mode(
+        relative_cost_mode,
+        legacy_cost_mode=cost_mode,
+    )
+    emit_relative_cost_modes = _normalize_relative_cost_modes(
+        relative_cost_modes,
+        primary_cost_mode=relative_cost,
+        legacy_cost_mode=cost_mode,
+    )
+    emit_relative_cost_fields = relative_cost_modes is not None
     enabled_source_modes = _normalize_source_modes(source_modes)
     compute_delta_src = "delta_src" in enabled_source_modes
     gamma_values = _normalize_target_attention_gammas(target_attention_gammas)
@@ -397,6 +432,15 @@ def _compute_dgst_t_from_parts(
     context_confidence_per_layer = []
     context_confidence_max_prompt_per_layer = []
     delta_series: dict[str, dict[str, list[float]]] = {}
+    relative_cost_series: dict[str, dict[str, list[float]]] = {}
+    if compute_relative_vll and emit_relative_cost_fields:
+        for mode in emit_relative_cost_modes:
+            relative_cost_series[mode] = {
+                "risk": [],
+                "risk_cap": [],
+                "vp_risk": [],
+                "vp_risk_cap": [],
+            }
     has_prompt_support = _has_prompt_support_tokens(
         support_positions=support_positions,
         visual_start=visual_start,
@@ -438,15 +482,18 @@ def _compute_dgst_t_from_parts(
         target_dist = _renormalize(attention_dist * layer_semantic_probs)
         target_dist_relative_vll = None
         semantic_gate_relative_vll = None
+        relative_barrier_vll = None
         relative_vll_stats = None
         target_dist_visual_prompt_relative_vll = None
         semantic_gate_visual_prompt_relative_vll = None
+        visual_prompt_relative_barrier_vll = None
         visual_prompt_relative_vll_stats = None
         if compute_relative_vll:
             layer_relative_logits = relative_vll_logits[layer_idx].to(layer_support_states.device).float()
             (
                 target_dist_relative_vll,
                 semantic_gate_relative_vll,
+                relative_barrier_vll,
                 relative_vll_stats,
             ) = _relative_vll_target_distribution(
                 attention_dist=attention_dist,
@@ -457,11 +504,14 @@ def _compute_dgst_t_from_parts(
                 candidate_scope="visual",
                 stat_prefix="relative_vll",
                 epsilon=relative_vll_mad_epsilon,
+                barrier_margin=relative_barrier_margin,
+                barrier_max=relative_barrier_max,
             )
             if has_prompt_support:
                 (
                     target_dist_visual_prompt_relative_vll,
                     semantic_gate_visual_prompt_relative_vll,
+                    visual_prompt_relative_barrier_vll,
                     visual_prompt_relative_vll_stats,
                 ) = _relative_vll_target_distribution(
                     attention_dist=attention_dist,
@@ -472,6 +522,8 @@ def _compute_dgst_t_from_parts(
                     candidate_scope="visual_prompt",
                     stat_prefix="visual_prompt_relative_vll",
                     epsilon=relative_vll_mad_epsilon,
+                    barrier_margin=relative_barrier_margin,
+                    barrier_max=relative_barrier_max,
                 )
 
         delta_layer_stats = {}
@@ -497,7 +549,7 @@ def _compute_dgst_t_from_parts(
                 for gamma in gamma_values:
                     gamma_slug = _gamma_slug(gamma)
                     series_key = f"{target_slug}_delta_src_{gamma_slug}"
-                    target_dist_delta, semantic_gate_delta, target_stats = (
+                    target_dist_delta, semantic_gate_delta, barrier_delta, target_stats = (
                         _relative_vll_target_distribution(
                             attention_dist=attention_dist,
                             target_logits=layer_relative_logits,
@@ -507,6 +559,8 @@ def _compute_dgst_t_from_parts(
                             candidate_scope=candidate_scope,
                             stat_prefix=series_key,
                             epsilon=relative_vll_mad_epsilon,
+                            barrier_margin=relative_barrier_margin,
+                            barrier_max=relative_barrier_max,
                             attention_gamma=gamma,
                             attention_epsilon=target_attention_epsilon,
                         )
@@ -522,11 +576,13 @@ def _compute_dgst_t_from_parts(
                         support_states=layer_support_states,
                         semantic_probs=semantic_gate_delta,
                         support=delta_support,
-                        cost_mode=cost_mode,
+                        cost_mode=relative_cost,
                         lambda_d=lambda_d,
                         lambda_s=lambda_s,
                         lambda_t=lambda_t,
                         lambda_int=lambda_int,
+                        relative_barrier=barrier_delta,
+                        relative_barrier_lambda=relative_barrier_lambda,
                         ot_solver=ot_solver,
                     )
                     if target_slug == "rvll":
@@ -569,11 +625,13 @@ def _compute_dgst_t_from_parts(
                             support_states=layer_support_states,
                             semantic_probs=semantic_gate_delta,
                             support=delta_capped_support,
-                            cost_mode=cost_mode,
+                            cost_mode=relative_cost,
                             lambda_d=lambda_d,
                             lambda_s=lambda_s,
                             lambda_t=lambda_t,
                             lambda_int=lambda_int,
+                            relative_barrier=barrier_delta,
+                            relative_barrier_lambda=relative_barrier_lambda,
                             ot_solver=ot_solver,
                         )
                         if target_slug == "rvll":
@@ -675,19 +733,25 @@ def _compute_dgst_t_from_parts(
                 target_dist_relative_vll,
                 transport_top_k,
             )
-            transport_risk_relative_vll = _transport_risk_on_support(
+            relative_vll_risks = _transport_risks_by_cost(
                 source_dist=source_dist,
                 target_dist=target_dist_relative_vll,
                 support_states=layer_support_states,
                 semantic_probs=semantic_gate_relative_vll,
                 support=relative_vll_support,
-                cost_mode=cost_mode,
+                cost_modes=emit_relative_cost_modes,
                 lambda_d=lambda_d,
                 lambda_s=lambda_s,
                 lambda_t=lambda_t,
                 lambda_int=lambda_int,
+                relative_barrier=relative_barrier_vll,
+                relative_barrier_lambda=relative_barrier_lambda,
                 ot_solver=ot_solver,
             )
+            transport_risk_relative_vll = relative_vll_risks[relative_cost]
+            if emit_relative_cost_fields:
+                for mode, value in relative_vll_risks.items():
+                    relative_cost_series[mode]["risk"].append(float(value))
             if compute_capped_topmass_085:
                 relative_vll_capped_support = _capped_topmass_union_indices(
                     source_dist,
@@ -696,38 +760,54 @@ def _compute_dgst_t_from_parts(
                     min_k=capped_topmass_min_k,
                     max_k=capped_topmass_max_k,
                 )
-                transport_risk_relative_vll_capped_topmass_085 = _transport_risk_on_support(
+                relative_vll_capped_risks = _transport_risks_by_cost(
                     source_dist=source_dist,
                     target_dist=target_dist_relative_vll,
                     support_states=layer_support_states,
                     semantic_probs=semantic_gate_relative_vll,
                     support=relative_vll_capped_support,
-                    cost_mode=cost_mode,
+                    cost_modes=emit_relative_cost_modes,
                     lambda_d=lambda_d,
                     lambda_s=lambda_s,
                     lambda_t=lambda_t,
                     lambda_int=lambda_int,
+                    relative_barrier=relative_barrier_vll,
+                    relative_barrier_lambda=relative_barrier_lambda,
                     ot_solver=ot_solver,
                 )
+                transport_risk_relative_vll_capped_topmass_085 = (
+                    relative_vll_capped_risks[relative_cost]
+                )
+                if emit_relative_cost_fields:
+                    for mode, value in relative_vll_capped_risks.items():
+                        relative_cost_series[mode]["risk_cap"].append(float(value))
             if target_dist_visual_prompt_relative_vll is not None:
                 visual_prompt_relative_vll_support = _topk_union_indices(
                     source_dist,
                     target_dist_visual_prompt_relative_vll,
                     transport_top_k,
                 )
-                transport_risk_visual_prompt_relative_vll = _transport_risk_on_support(
+                visual_prompt_relative_vll_risks = _transport_risks_by_cost(
                     source_dist=source_dist,
                     target_dist=target_dist_visual_prompt_relative_vll,
                     support_states=layer_support_states,
                     semantic_probs=semantic_gate_visual_prompt_relative_vll,
                     support=visual_prompt_relative_vll_support,
-                    cost_mode=cost_mode,
+                    cost_modes=emit_relative_cost_modes,
                     lambda_d=lambda_d,
                     lambda_s=lambda_s,
                     lambda_t=lambda_t,
                     lambda_int=lambda_int,
+                    relative_barrier=visual_prompt_relative_barrier_vll,
+                    relative_barrier_lambda=relative_barrier_lambda,
                     ot_solver=ot_solver,
                 )
+                transport_risk_visual_prompt_relative_vll = (
+                    visual_prompt_relative_vll_risks[relative_cost]
+                )
+                if emit_relative_cost_fields:
+                    for mode, value in visual_prompt_relative_vll_risks.items():
+                        relative_cost_series[mode]["vp_risk"].append(float(value))
                 if compute_capped_topmass_085:
                     visual_prompt_relative_vll_capped_support = _capped_topmass_union_indices(
                         source_dist,
@@ -736,21 +816,27 @@ def _compute_dgst_t_from_parts(
                         min_k=capped_topmass_min_k,
                         max_k=capped_topmass_max_k,
                     )
-                    transport_risk_visual_prompt_relative_vll_capped_topmass_085 = (
-                        _transport_risk_on_support(
-                            source_dist=source_dist,
-                            target_dist=target_dist_visual_prompt_relative_vll,
-                            support_states=layer_support_states,
-                            semantic_probs=semantic_gate_visual_prompt_relative_vll,
-                            support=visual_prompt_relative_vll_capped_support,
-                            cost_mode=cost_mode,
-                            lambda_d=lambda_d,
-                            lambda_s=lambda_s,
-                            lambda_t=lambda_t,
-                            lambda_int=lambda_int,
-                            ot_solver=ot_solver,
-                        )
+                    visual_prompt_relative_vll_capped_risks = _transport_risks_by_cost(
+                        source_dist=source_dist,
+                        target_dist=target_dist_visual_prompt_relative_vll,
+                        support_states=layer_support_states,
+                        semantic_probs=semantic_gate_visual_prompt_relative_vll,
+                        support=visual_prompt_relative_vll_capped_support,
+                        cost_modes=emit_relative_cost_modes,
+                        lambda_d=lambda_d,
+                        lambda_s=lambda_s,
+                        lambda_t=lambda_t,
+                        lambda_int=lambda_int,
+                        relative_barrier=visual_prompt_relative_barrier_vll,
+                        relative_barrier_lambda=relative_barrier_lambda,
+                        ot_solver=ot_solver,
                     )
+                    transport_risk_visual_prompt_relative_vll_capped_topmass_085 = (
+                        visual_prompt_relative_vll_capped_risks[relative_cost]
+                    )
+                    if emit_relative_cost_fields:
+                        for mode, value in visual_prompt_relative_vll_capped_risks.items():
+                            relative_cost_series[mode]["vp_risk_cap"].append(float(value))
 
         prompt_last = prompt_last_hidden_states[layer_idx].to(layer_prediction_hidden.device).float()
         prompt_mean = prompt_mean_hidden_states[layer_idx].to(layer_prediction_hidden.device).float()
@@ -999,6 +1085,11 @@ def _compute_dgst_t_from_parts(
 
     result = {
         "dgst_t_score": float(final_score),
+        "dgst_t_relative_cost_mode": relative_cost,
+        "dgst_t_relative_cost_modes": list(emit_relative_cost_modes),
+        "dgst_t_relative_barrier_lambda": float(relative_barrier_lambda),
+        "dgst_t_relative_barrier_margin": float(relative_barrier_margin),
+        "dgst_t_relative_barrier_max": float(relative_barrier_max),
         "dgst_t_per_layer": risk_tensor,
         "dgst_t_transport_risk_per_layer": risk_tensor,
         "dgst_t_prompt_last_cosine_per_layer": torch.tensor(prompt_last_cosine_per_layer, dtype=torch.float32),
@@ -1084,6 +1175,62 @@ def _compute_dgst_t_from_parts(
                     target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer,
                     dtype=torch.float32,
                 )
+        for mode, values in relative_cost_series.items():
+            slug = _relative_cost_slug(mode)
+            risk_cost_tensor = torch.tensor(values["risk"], dtype=torch.float32)
+            if risk_cost_tensor.numel():
+                result[f"dgst_t_score_relative_vll_cost_{slug}"] = float(
+                    _baseline_excess_score(
+                        risk_cost_tensor,
+                        baseline_layers=baseline_layers,
+                        risk_start_layer=risk_start_layer,
+                        alpha=alpha,
+                    )
+                )
+                result[f"dgst_t_transport_risk_relative_vll_cost_{slug}_per_layer"] = (
+                    risk_cost_tensor
+                )
+            risk_cost_cap_tensor = torch.tensor(values["risk_cap"], dtype=torch.float32)
+            if risk_cost_cap_tensor.numel():
+                result[f"dgst_t_score_relative_vll_cost_{slug}_capped_topmass_085"] = float(
+                    _baseline_excess_score(
+                        risk_cost_cap_tensor,
+                        baseline_layers=baseline_layers,
+                        risk_start_layer=risk_start_layer,
+                        alpha=alpha,
+                    )
+                )
+                result[
+                    f"dgst_t_transport_risk_relative_vll_cost_{slug}_capped_topmass_085_per_layer"
+                ] = risk_cost_cap_tensor
+            vp_risk_cost_tensor = torch.tensor(values["vp_risk"], dtype=torch.float32)
+            if vp_risk_cost_tensor.numel():
+                result[f"dgst_t_score_visual_prompt_relative_vll_cost_{slug}"] = float(
+                    _baseline_excess_score(
+                        vp_risk_cost_tensor,
+                        baseline_layers=baseline_layers,
+                        risk_start_layer=risk_start_layer,
+                        alpha=alpha,
+                    )
+                )
+                result[
+                    f"dgst_t_transport_risk_visual_prompt_relative_vll_cost_{slug}_per_layer"
+                ] = vp_risk_cost_tensor
+            vp_risk_cost_cap_tensor = torch.tensor(values["vp_risk_cap"], dtype=torch.float32)
+            if vp_risk_cost_cap_tensor.numel():
+                result[
+                    f"dgst_t_score_visual_prompt_relative_vll_cost_{slug}_capped_topmass_085"
+                ] = float(
+                    _baseline_excess_score(
+                        vp_risk_cost_cap_tensor,
+                        baseline_layers=baseline_layers,
+                        risk_start_layer=risk_start_layer,
+                        alpha=alpha,
+                    )
+                )
+                result[
+                    f"dgst_t_transport_risk_visual_prompt_relative_vll_cost_{slug}_capped_topmass_085_per_layer"
+                ] = vp_risk_cost_cap_tensor
     if compute_topmass_085:
         result["dgst_t_transport_risk_topmass_085_per_layer"] = torch.tensor(
             risk_topmass_085_per_layer,
@@ -1142,6 +1289,71 @@ def _normalize_target_gate_mode(value: str) -> str:
     if mode == "dual":
         return "dual"
     raise ValueError("DGST-T target_gate_mode must be 'legacy_prob', 'relative_vll', or 'dual'.")
+
+
+def _normalize_relative_cost_mode(value: str | None, *, legacy_cost_mode: str) -> str:
+    if value is None:
+        return _normalize_legacy_cost_mode(legacy_cost_mode)
+    mode = str(value).strip().lower()
+    if mode in {"", "legacy", "inherit", "cost_mode"}:
+        return _normalize_legacy_cost_mode(legacy_cost_mode)
+    if mode in {"geo", "pure_geo", "geometric", "pure_geometric"}:
+        return "geo"
+    if mode in {
+        "target_barrier_geo",
+        "target_barrier",
+        "target_relative_barrier",
+        "tbar",
+    }:
+        return "target_barrier_geo"
+    if mode in {
+        "symmetric_barrier_geo",
+        "symmetric_barrier",
+        "symmetric_relative_barrier",
+        "sbar",
+    }:
+        return "symmetric_barrier_geo"
+    if mode in {"direct", "decomposed"}:
+        return _normalize_legacy_cost_mode(mode)
+    raise ValueError(
+        "relative_cost_mode must be one of: geo, target_barrier_geo, "
+        "symmetric_barrier_geo, direct, decomposed, or inherit."
+    )
+
+
+def _normalize_relative_cost_modes(
+    value: Sequence[str] | str | None,
+    *,
+    primary_cost_mode: str,
+    legacy_cost_mode: str,
+) -> list[str]:
+    if value is None:
+        return [str(primary_cost_mode)]
+    raw_modes = [value] if isinstance(value, str) else list(value)
+    modes = []
+    for raw in raw_modes:
+        mode = _normalize_relative_cost_mode(raw, legacy_cost_mode=legacy_cost_mode)
+        if mode not in modes:
+            modes.append(mode)
+    if primary_cost_mode not in modes:
+        modes.insert(0, str(primary_cost_mode))
+    return modes or [str(primary_cost_mode)]
+
+
+def _relative_cost_slug(mode: str) -> str:
+    name = _normalize_relative_cost_mode(mode, legacy_cost_mode="decomposed")
+    if name == "target_barrier_geo":
+        return "tbar"
+    if name == "symmetric_barrier_geo":
+        return "sbar"
+    return name
+
+
+def _normalize_legacy_cost_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode in {"direct", "decomposed"}:
+        return mode
+    raise ValueError("DGST-T cost_mode must be 'direct' or 'decomposed'.")
 
 
 def _normalize_source_modes(value: Sequence[str] | str | None) -> list[str]:
@@ -1254,9 +1466,11 @@ def _relative_vll_target_distribution(
     candidate_scope: str,
     stat_prefix: str,
     epsilon: float,
+    barrier_margin: float,
+    barrier_max: float,
     attention_gamma: float = 1.0,
     attention_epsilon: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     logits = torch.nan_to_num(target_logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
     if logits.numel() != attention_dist.numel():
         raise ValueError(
@@ -1281,8 +1495,13 @@ def _relative_vll_target_distribution(
     mad = torch.abs(candidate_logits - median).median()
     z = (candidate_logits - median) / (mad + max(float(epsilon), EPS))
     candidate_gate = torch.sigmoid(z)
+    candidate_barrier = torch.relu(-(z + float(barrier_margin))).clamp_max(
+        max(float(barrier_max), 0.0)
+    )
     semantic_gate = torch.zeros_like(logits, dtype=torch.float32)
     semantic_gate.index_copy_(0, candidate_index, candidate_gate.float())
+    relative_barrier = torch.zeros_like(logits, dtype=torch.float32)
+    relative_barrier.index_copy_(0, candidate_index, candidate_barrier.float())
 
     gamma = float(attention_gamma)
     attention_weight = torch.pow(
@@ -1302,10 +1521,12 @@ def _relative_vll_target_distribution(
         f"{stat_prefix}_logit_mad": float(mad.item()),
         f"{stat_prefix}_gate_mean": float(candidate_gate.mean().item()),
         f"{stat_prefix}_gate_max": float(candidate_gate.max().item()),
+        f"{stat_prefix}_barrier_mean": float(candidate_barrier.mean().item()),
+        f"{stat_prefix}_barrier_max": float(candidate_barrier.max().item()),
         f"{stat_prefix}_target_denominator": float(denominator.item()),
         f"{stat_prefix}_attention_gamma": float(gamma),
     }
-    return target_dist, semantic_gate, stats
+    return target_dist, semantic_gate, relative_barrier, stats
 
 
 def _has_prompt_support_tokens(
@@ -1429,6 +1650,42 @@ def _capped_topmass_union_indices(
     return torch.unique(torch.cat([src_idx, tgt_idx], dim=0), sorted=True)
 
 
+def _transport_risks_by_cost(
+    *,
+    source_dist: torch.Tensor,
+    target_dist: torch.Tensor,
+    support_states: torch.Tensor,
+    semantic_probs: torch.Tensor,
+    support: torch.Tensor,
+    cost_modes: Sequence[str],
+    lambda_d: float,
+    lambda_s: float,
+    lambda_t: float,
+    lambda_int: float,
+    relative_barrier: torch.Tensor | None,
+    relative_barrier_lambda: float,
+    ot_solver: str,
+) -> dict[str, float]:
+    return {
+        mode: _transport_risk_on_support(
+            source_dist=source_dist,
+            target_dist=target_dist,
+            support_states=support_states,
+            semantic_probs=semantic_probs,
+            support=support,
+            cost_mode=mode,
+            lambda_d=lambda_d,
+            lambda_s=lambda_s,
+            lambda_t=lambda_t,
+            lambda_int=lambda_int,
+            ot_solver=ot_solver,
+            relative_barrier=relative_barrier,
+            relative_barrier_lambda=relative_barrier_lambda,
+        )
+        for mode in cost_modes
+    }
+
+
 def _transport_risk_on_support(
     *,
     source_dist: torch.Tensor,
@@ -1442,6 +1699,8 @@ def _transport_risk_on_support(
     lambda_t: float,
     lambda_int: float,
     ot_solver: str,
+    relative_barrier: torch.Tensor | None = None,
+    relative_barrier_lambda: float = 1.0,
 ) -> float:
     if support.numel() == 0:
         return 0.0
@@ -1449,6 +1708,11 @@ def _transport_risk_on_support(
     local_target = _renormalize(target_dist.index_select(0, support))
     local_states = support_states.index_select(0, support)
     local_semantic = semantic_probs.index_select(0, support)
+    local_barrier = (
+        None
+        if relative_barrier is None
+        else relative_barrier.to(support.device).index_select(0, support)
+    )
 
     distance = _cosine_distance_matrix(local_states)
     source_penalty = torch.relu(1.0 - local_semantic)
@@ -1462,6 +1726,8 @@ def _transport_risk_on_support(
         lambda_s=lambda_s,
         lambda_t=lambda_t,
         lambda_int=lambda_int,
+        relative_barrier=local_barrier,
+        relative_barrier_lambda=relative_barrier_lambda,
     )
     transport_risk, _transport_plan = _wasserstein_1_exact(
         local_source,
@@ -1488,8 +1754,31 @@ def _build_cost_matrix(
     lambda_s: float,
     lambda_t: float,
     lambda_int: float,
+    relative_barrier: torch.Tensor | None = None,
+    relative_barrier_lambda: float = 1.0,
 ) -> torch.Tensor:
     mode = str(cost_mode).strip().lower()
+    if mode == "geo":
+        return float(lambda_d) * distance
+    if mode in {"target_barrier_geo", "symmetric_barrier_geo"}:
+        if relative_barrier is None:
+            raise ValueError(f"{mode} requires relative_barrier values.")
+        barrier = torch.nan_to_num(
+            relative_barrier.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        target_barrier = barrier.unsqueeze(0)
+        if mode == "target_barrier_geo":
+            multiplier = 1.0 + float(relative_barrier_lambda) * target_barrier
+        else:
+            source_barrier = barrier.unsqueeze(1)
+            multiplier = 1.0 + float(relative_barrier_lambda) * (
+                source_barrier + target_barrier
+            )
+        return float(lambda_d) * distance * multiplier
+
     source = source_penalty.float().unsqueeze(1)
     target = target_penalty.float().unsqueeze(0)
     interaction = distance.float() * (source + target)
