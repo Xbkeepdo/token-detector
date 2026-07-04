@@ -68,7 +68,7 @@ def _register_delta_source_aliases() -> None:
 
 
 def _register_relative_cost_aliases() -> None:
-    for slug in ("geo", "tbar", "sbar"):
+    for slug in ("geo", "tbar", "sbar", "tadd", "sadd", "tsadd"):
         for prefix in ("risk_relative_vll", "risk_visual_prompt_relative_vll"):
             block = f"{prefix}_cost_{slug}"
             key = f"dgst_t_transport_{prefix}_cost_{slug}_per_layer"

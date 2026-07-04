@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     f1_score,
     precision_score,
     recall_score,
@@ -389,6 +390,10 @@ def _metrics_from_probs(y_true: np.ndarray, probs: np.ndarray, *, positive_class
         auc = float(roc_auc_score(y_true, probs))
     except Exception:
         auc = float("nan")
+    try:
+        aupr = float(average_precision_score(y_true, probs))
+    except Exception:
+        aupr = float("nan")
 
     metrics = {
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
@@ -396,6 +401,7 @@ def _metrics_from_probs(y_true: np.ndarray, probs: np.ndarray, *, positive_class
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "auc": auc,
+        "aupr": aupr,
     }
     if positive_class == "non_hallucination":
         metrics["reported_positive_class"] = "non_hallucination"

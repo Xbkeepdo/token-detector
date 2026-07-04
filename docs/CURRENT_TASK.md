@@ -88,6 +88,43 @@
   - InternVL：MLP 总体未超过 XGB；最高为 `risk_relative_vll_cost_sbar+target_visual_hidden_cosine_relative_vll`，AUC 约 0.950，低于 XGB 总最高 `risk_visual_prompt_relative_vll_cost_tbar+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` 的约 0.960。
   - LLaVA：MLP 最高为 `risk_visual_prompt_relative_vll_cost_sbar_capped_topmass_085+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085`，AUC 约 0.852，几乎追平但略低于 XGB 最高 `risk_relative_vll_cost_tbar+target_visual_hidden_cosine_relative_vll` 的约 0.853。
   - 当前结论：MLP 可作为 sanity check/补充，未改写 cost 3-way 主结论；`sbar` 偶尔在 MLP 组合里变强，但不稳定，默认仍优先 `geo`，`tbar` 作为 ablation/候选。
+- 2026-07-03 补齐 cost 3-way 的 torch MLP / torch probe 对比，并和 DGST 原仓库 COCO500 baseline 对照：
+  - 当前 3-way 已跑两类 torch probe 组合：visual-only risk + visual-only cosine，以及 VP risk + VP cosine。两类都覆盖 `geo/tbar/sbar` 的 raw 与 cap085，共 12 组/模型；使用 `scripts/train_torch_probe_feature_sets.py` 默认配置：hidden=(128,64,32)、dropout=0.3、batch=16、epochs=100、lr=1e-3、wd=1e-5、seed=42、positive=hallucination。
+  - DGST 路径 `/home/apulis-dev/userdata/DGST/token-grounding-detector/outputs/*/COCO500` 没有 VP/cosine 字段，只有老的 `ads_per_layer/cgc_per_layer` 等字段；因此用同一个 torch probe 结构在 `ads+cgc` 训练矩阵上补跑 baseline，结果保存在当前项目 `outputs/relative_cost_3way_comparison/dgst_coco500_torch_probe_ads_cgc/`，未改动 DGST 仓库。
+  - 新增汇总：`outputs/relative_cost_3way_comparison/relative_cost_3way_torch_mlp_vs_dgst_coco500.md` 与 `.csv`。
+  - Qwen：DGST `ads+cgc` baseline AUC/F1 约 0.906/0.904；visual-only 最优为 `visual_geo_raw+visualcosine_raw`，AUC/F1 约 0.951/0.921，明显强于 VP 最优 `vp_tbar_raw+vpcosine_raw` 的约 0.929/0.929。
+  - InternVL：DGST baseline AUC/F1 约 0.934/0.944；visual-only 与 VP 的 best AUC 基本打平，均约 0.952；VP `geo raw` 的 F1 约 0.965，高于 visual-only best-AUC 行的约 0.958。
+  - LLaVA：DGST baseline AUC/F1 约 0.803/0.722；visual-only `visual_geo_raw+visualcosine_raw` AUC 约 0.849，略高于 VP best AUC `vp_tbar_cap085+vpcosine_cap085` 的约 0.847；visual-only `visual_geo_cap085+visualcosine_cap085` 给出最高 F1 约 0.789。
+  - 当前结论：torch MLP 口径下，三模型 visual-only family 和 VP family 的 best AUC 都高于 DGST 原始 ADS+CGC baseline；Qwen 明显更偏 visual-only，InternVL 两者接近，LLaVA visual-only 略优。
+- 2026-07-03 补齐 `risk/cosine/vprisk/vpcosine` 单特征消融：
+  - 新增汇总：`outputs/relative_cost_3way_comparison/relative_cost_3way_single_feature_ablation.md`、`relative_cost_3way_single_feature_ablation.csv`、`relative_cost_3way_single_feature_ablation_best_by_family.csv`。
+  - 四类 family：visual-only `risk`、visual-only `cosine`、visual+prompt `vprisk`、visual+prompt `vpcosine`。risk/vprisk 覆盖 `geo/tbar/sbar` raw 与 cap085，cosine/vpcosine 覆盖 raw 与 cap085。
+  - 已补齐三模型所有单特征的 torch probe；同时为此前缺失的 cosine/vpcosine 单特征补跑 XGB 与 sklearn-MLP。全量结果共 144 行，即 3 模型 × 16 feature sets × 3 classifiers。
+  - torch probe 单特征最优：Qwen 为 `vpcosine_cap085`，AUC/F1 约 0.929/0.924；InternVL 为 visual-only `cosine_raw`，AUC/F1 约 0.943/0.945；LLaVA 为 visual-only `cosine_cap085`，AUC/F1 约 0.816/0.748。
+  - 单特征结论：cosine-only 通常和 risk-only 持平或更强；Qwen 的单特征最佳是 VP cosine，InternVL/LLaVA 的单特征最佳是 visual-only cosine。risk 单独使用明显弱于 risk+cosine 组合，说明前面组合收益主要来自 cosine 与 risk 的互补，而不是 risk 单项。
+- 2026-07-03 补齐 visual-only risk 与 DGST ADS/CGC 的 torch MLP 互补性实验：
+  - 当前 3-way risk features 与 DGST 原仓库 `ADS/CGC` features 已按 `(image_id, response_token_idx, token_str, label)` 完整一一对齐；三模型都无重复 key、无缺失 key。
+  - 新增汇总：`outputs/relative_cost_3way_comparison/relative_cost_3way_risk_ads_cgc_torch_mlp.md`、`.csv`、`_summary.csv`，原始 torch artifacts 在 `outputs/relative_cost_3way_comparison/risk_ads_cgc_torch_probe/`。
+  - 仅使用 torch MLP/probe，feature sets 包括 `ADS`、`CGC`、`ADS+CGC`，以及 6 个 visual-only risk variant 分别加 `ADS` / `CGC`：`geo/tbar/sbar` raw 与 cap085。
+  - ADS/CGC 单项消融：三模型都是 `CGC` 明显强于 `ADS`；本次 torch run 中 Qwen/InternVL 的 `CGC` 也强于 `ADS+CGC`。Qwen `CGC` AUC/F1 约 0.945/0.906，InternVL 约 0.947/0.948，LLaVA 约 0.809/0.748。
+  - 相对 `ADS+CGC`，best risk mix 三模型都有提升：Qwen `risk_sbar_cap085+CGC` AUC 约 0.943，较 `ADS+CGC` +0.039；InternVL `risk_sbar_raw+CGC` AUC 约 0.966，+0.036；LLaVA `risk_geo_raw+ADS` AUC 约 0.847，+0.054。
+  - 若相对最强旧 baseline `CGC`，Qwen best risk mix 约低 0.001 AUC，基本打平；InternVL +0.019 AUC，LLaVA +0.038 AUC。结论：risk 对 InternVL/LLaVA 的 ADS/CGC 有明确补充，对 Qwen 主要是超过 `ADS+CGC` 但没有超过 `CGC-only`。
+- 2026-07-03 新增并完成 additive barrier cost 三变体实验：
+  - 新增 cost aliases：`target_additive_barrier_geo`/`tadd`、`source_additive_barrier_geo`/`sadd`、`two_end_additive_barrier_geo`/`tsadd`。公式分别为 `lambda_d*d_ij + lambda_t*b_j`、`lambda_d*d_ij + lambda_s*b_i`、`lambda_d*d_ij + lambda_s*b_i + lambda_t*b_j`；旧 `geo/tbar/sbar` 保持不变。
+  - 新增配置：`configs/model_configs_visualprompt_relativevll_cost_additive3.yaml`，同一次 feature extraction 输出 `geo/tadd/sadd/tsadd` 四套 visual 与 visual+prompt risk，raw/cap085 都覆盖。
+  - 三模型 full features 完成：Qwen 2190 行、InternVL 3715 行、LLaVA 1448 行；新增字段包括 `dgst_t_transport_risk_relative_vll_cost_{tadd,sadd,tsadd}_per_layer`、对应 capped 字段，以及 `risk_visual_prompt_relative_vll_cost_{tadd,sadd,tsadd}` 对应字段。
+  - 三模型均完成 32 个 feature set 的 XGB、sklearn MLP、torch probe；汇总目录：`outputs/relative_cost_additive3_comparison/`，包括 `relative_cost_additive3_summary.md`、`relative_cost_additive3_xgb_mlp_all.csv`、`relative_cost_additive3_torch_mlp_all.csv`、`relative_cost_additive3_best_by_family.csv`、`relative_cost_additive3_layerwise_summary.csv` 与 12 组 layerwise png/pdf/csv。
+  - 总体最好 AUC：Qwen 仍偏 `geo`，torch probe 最好为 visual risk+visual cosine `geo`，AUC 约 0.951；InternVL 最强为 `tadd` visual risk cap085+visual cosine cap085，XGB/torch AUC 约 0.960/0.959；LLaVA 中 `tadd` 对 VP combo 有收益，torch probe 最好 `vp tadd raw + vpcosine raw` AUC 约 0.858。
+  - 分类层面 additive 胜过 `geo` 的 family 数：XGB 13/24、MLP 10/24、torch probe 12/24；其中 `tadd` 最稳定，`sadd/tsadd` 更多表现为抬高 risk 绝对值和曲线均值差，但分类收益不稳定。当前建议：主线默认仍以 `geo` 为 baseline，`tadd` 作为有希望的 ablation/candidate，`sadd/tsadd` 仅保留为机制对照。
+- 2026-07-03 补跑 source 与 target 统一为 visual-only 的 geo cost risk 曲线：
+  - 新增配置：`configs/model_configs_visualonly_relativevll_cost_geo.yaml`，三模型均显式 `dgst_t_support_scope: "visual"`，`relative_cost_mode: "geo"`，`relative_cost_modes: ["geo"]`。
+  - 三模型 full features 已完成：Qwen 2190 行、InternVL 3715 行、LLaVA 1448 行；字段 `dgst_t_transport_risk_relative_vll_cost_geo_per_layer` 层数分别为 28/32/32，无 NaN/inf。
+  - 统一汇总目录：`outputs/vsource_vtarget_geo_risk_comparison/`，包含三模型单独曲线和合并图 `vsource_vtarget_geo_risk_3models_by_label.{png,pdf}`。
+  - 曲线结果：Qwen hall/non mean 约 0.249/0.228，diff_avg 约 +0.021，peak layer 19 diff 约 +0.080；InternVL 约 0.255/0.247，diff_avg 约 +0.008，peak layer 2 diff 约 +0.043；LLaVA 约 0.478/0.451，diff_avg 约 +0.027，peak layer 22 diff 约 +0.087。
+  - 已补跑 V source / V target 的 geo torch MLP，并与 additive3 中 VP source / VP target 的 geo torch MLP 对比：汇总表为 `outputs/vsource_vtarget_geo_risk_comparison/vsource_vtarget_geo_torch_mlp_vs_vp.md`，CSV 为 `vsource_vtarget_geo_torch_mlp_vs_vp_all.csv` 与 `vsource_vtarget_geo_torch_mlp_vs_vp_delta.csv`。
+  - torch MLP 对比结论：Qwen V/V 更强，best AUC 0.952 vs VP/VP 0.923；InternVL VP/VP 更强，0.952 vs V/V 0.942；LLaVA VP/VP 略强，0.844 vs V/V 0.827。matched feature 上 Qwen 四组 V/V AUC 均高于 VP/VP，InternVL 四组均低于 VP/VP，LLaVA 只有 risk cap085 的 V/V AUC 小幅高于 VP/VP。
+  - 已从保存的 torch probe checkpoint 回填 AUPR/average precision，并将 `scripts/train_torch_probe_feature_sets.py` 更新为后续默认输出 `aupr`。best AUPR：Qwen V/V 0.984 vs VP/VP 0.966；InternVL VP/VP 0.987 vs V/V 0.982；LLaVA VP/VP 0.844 vs V/V 0.782。
+  - 后续命名约定：需要明确写成 `V source / V target` 或 `VP source / VP target`，避免再用 `visual_raw` 这种会和 source/target 混淆的简称。
 
 ## Files changed recently
 - 新增：`configs/model_configs_visualonly.yaml`
@@ -115,6 +152,16 @@
 - 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-cost-3way/`
 - 新增输出目录：`outputs/llava_1_5_7b/COCO500-visualprompt-relativevll-cost-3way/`
 - 新增对比输出：`outputs/relative_cost_3way_comparison/`
+- 新增：`configs/model_configs_visualprompt_relativevll_cost_additive3.yaml`
+- 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualprompt-relativevll-cost-additive3/`
+- 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualprompt-relativevll-cost-additive3/`
+- 新增输出目录：`outputs/llava_1_5_7b/COCO500-visualprompt-relativevll-cost-additive3/`
+- 新增对比输出：`outputs/relative_cost_additive3_comparison/`
+- 新增：`configs/model_configs_visualonly_relativevll_cost_geo.yaml`
+- 新增输出目录：`outputs/qwen2_5_vl_7b/COCO500-visualonly-relativevll-cost-geo/`
+- 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualonly-relativevll-cost-geo/`
+- 新增输出目录：`outputs/llava_1_5_7b/COCO500-visualonly-relativevll-cost-geo/`
+- 新增对比输出：`outputs/vsource_vtarget_geo_risk_comparison/`
 
 ## Commands run
 - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model internvl_2_5_8b --config configs/model_configs_visualonly.yaml --output-dir outputs/internvl_2_5_8b/COCO500-visualonly --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
@@ -197,6 +244,11 @@
   - Qwen/InternVL 的 visual-only、visual-prompt 四组 full feature extraction 完成。
   - 四组逐层 plot 完成，结果位于各自 `COCO500-*-source-delta-gamma/results/`。
   - Qwen visual-only 与 Qwen visual-prompt 的 xgb/rf/mlp feature-set 消融完成；InternVL feature 与 plot 已完成，分类训练未作为本轮结论依据继续等待。
+- 2026-07-03 新增并验证 additive barrier cost 3-variant：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py features/extractor.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py scripts/train_torch_probe_feature_sets.py`
+  - 小张量验证 `tadd/sadd/tsadd`：zero barrier 等于 `geo`、target additive 只按列变、source additive 只按行变、two-end additive 等于 source+target-geo，且 cost finite/nonnegative。
+  - Qwen `--num-images 2` smoke test 通过，确认 16 个 additive3 risk 字段存在、层数正确、无 NaN/inf。
+  - 三模型 full feature extraction、32 feature sets 的 XGB/MLP/torch probe、12 组 layerwise plots 与统一 summary 均已完成。
 - 2026-07-02 新增并验证 relative VLL cost 3-way 重构：
   - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py features/extractor.py models/qwen_wrapper.py models/internvl_wrapper.py models/llava_wrapper.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py`
   - 小张量验证 `geo/tbar/sbar` cost matrix 有差异、`relative_cost_modes` 会同时输出三套字段、primary old visual-prompt risk 字段等于 `geo`。
@@ -212,6 +264,17 @@
 - 2026-07-03 补跑 MLP classifier：
   - 在 Qwen/InternVL/LLaVA 的 `COCO500-visualprompt-relativevll-cost-3way` 输出目录上，使用同一套 24 个 feature set 跑完 `--classifiers mlp --scoring auc`。
   - 重新生成 MLP vs XGB 汇总表：`outputs/relative_cost_3way_comparison/relative_cost_3way_mlp_summary.md`。
+- 2026-07-03 补跑 torch MLP / torch probe：
+  - 在 Qwen/InternVL/LLaVA 的 `COCO500-visualprompt-relativevll-cost-3way` 输出目录上，使用 `scripts/train_torch_probe_feature_sets.py` 跑完 6 个 VP+VPcosine feature set 与 6 个 visual-only risk+visual-only cosine feature set，并写入各自 selected feature JSON 的 `torch_probe` 字段。
+  - 用同一 torch probe 配置在 `/home/apulis-dev/userdata/DGST/token-grounding-detector/outputs/{qwen2_5_vl_7b,internvl_2_5_8b,llava_1_5_7b}/COCO500` 的 `ads+cgc` 特征上补跑 DGST baseline，结果写入 `outputs/relative_cost_3way_comparison/dgst_coco500_torch_probe_ads_cgc/`。
+  - 生成对比汇总：`outputs/relative_cost_3way_comparison/relative_cost_3way_torch_mlp_vs_dgst_coco500.md` 与 `.csv`。
+- 2026-07-03 补跑单特征消融：
+  - 使用 `scripts/train_torch_probe_feature_sets.py` 在三模型 3-way 输出目录上补齐 `risk/cosine/vprisk/vpcosine` 单特征 torch probe。
+  - 使用 `scripts/train_feature_sets.py --classifiers xgb mlp --scoring auc` 为缺失的 `cosine/vpcosine` 单特征补齐 XGB 与 sklearn-MLP。
+  - 生成单特征汇总：`outputs/relative_cost_3way_comparison/relative_cost_3way_single_feature_ablation.md`、`.csv`、`_best_by_family.csv`。
+- 2026-07-03 补跑 risk + ADS/CGC torch MLP：
+  - 自定义 inline trainer 将当前 3-way visual-only risk features 与 DGST `ADS/CGC` features 通过 token key 对齐后训练同一套 torch probe。
+  - 生成汇总：`outputs/relative_cost_3way_comparison/relative_cost_3way_risk_ads_cgc_torch_mlp.md`、`.csv`、`_summary.csv`。
 
 ## Known issues
 - 第一次 Qwen visual-only 抽取误用了 InternVL 的 `labeling.json/generations.json`，产物已移动到 `outputs/qwen2_5_vl_7b/COCO500-visualonly/bad_internvl_labels_20260630_194840/`，不要用于分析。

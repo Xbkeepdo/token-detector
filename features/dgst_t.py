@@ -1313,11 +1313,36 @@ def _normalize_relative_cost_mode(value: str | None, *, legacy_cost_mode: str) -
         "sbar",
     }:
         return "symmetric_barrier_geo"
+    if mode in {
+        "target_additive_barrier_geo",
+        "target_additive_barrier",
+        "target_additive",
+        "tadd",
+    }:
+        return "target_additive_barrier_geo"
+    if mode in {
+        "source_additive_barrier_geo",
+        "source_additive_barrier",
+        "source_additive",
+        "sadd",
+    }:
+        return "source_additive_barrier_geo"
+    if mode in {
+        "two_end_additive_barrier_geo",
+        "two_end_additive_barrier",
+        "two_end_additive",
+        "additive_barrier_geo",
+        "additive_barrier",
+        "tsadd",
+    }:
+        return "two_end_additive_barrier_geo"
     if mode in {"direct", "decomposed"}:
         return _normalize_legacy_cost_mode(mode)
     raise ValueError(
         "relative_cost_mode must be one of: geo, target_barrier_geo, "
-        "symmetric_barrier_geo, direct, decomposed, or inherit."
+        "symmetric_barrier_geo, target_additive_barrier_geo, "
+        "source_additive_barrier_geo, two_end_additive_barrier_geo, "
+        "direct, decomposed, or inherit."
     )
 
 
@@ -1346,6 +1371,12 @@ def _relative_cost_slug(mode: str) -> str:
         return "tbar"
     if name == "symmetric_barrier_geo":
         return "sbar"
+    if name == "target_additive_barrier_geo":
+        return "tadd"
+    if name == "source_additive_barrier_geo":
+        return "sadd"
+    if name == "two_end_additive_barrier_geo":
+        return "tsadd"
     return name
 
 
@@ -1778,6 +1809,25 @@ def _build_cost_matrix(
                 source_barrier + target_barrier
             )
         return float(lambda_d) * distance * multiplier
+    if mode in {
+        "target_additive_barrier_geo",
+        "source_additive_barrier_geo",
+        "two_end_additive_barrier_geo",
+    }:
+        if relative_barrier is None:
+            raise ValueError(f"{mode} requires relative_barrier values.")
+        barrier = torch.nan_to_num(
+            relative_barrier.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        cost = float(lambda_d) * distance
+        if mode in {"source_additive_barrier_geo", "two_end_additive_barrier_geo"}:
+            cost = cost + float(lambda_s) * barrier.unsqueeze(1)
+        if mode in {"target_additive_barrier_geo", "two_end_additive_barrier_geo"}:
+            cost = cost + float(lambda_t) * barrier.unsqueeze(0)
+        return cost
 
     source = source_penalty.float().unsqueeze(1)
     target = target_penalty.float().unsqueeze(0)
