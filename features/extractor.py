@@ -11,7 +11,7 @@ from PIL import Image
 from models.base_wrapper import BaseLVLMWrapper, GenerationOutput
 from features.attention import compute_alpha_img_alpha_text
 from features.dgst_t import compute_dgst_t
-from utils.io_utils import load_json, load_pkl, save_pkl
+from utils.io_utils import append_pkl, load_json, load_pkl
 
 
 def extract_features_for_dataset(
@@ -133,8 +133,8 @@ def extract_features_for_dataset(
             image_features.append(feat)
 
         all_features.extend(image_features)
-
-        save_pkl(all_features, output_path)
+        if image_features:
+            append_pkl(image_features, output_path)
 
     print(f"[Extractor] Done. {len(all_features)} DGST-T object tokens saved to {output_path}.")
     return all_features
@@ -242,17 +242,37 @@ def _build_feature_record(
         feat["dgst_t_relative_vll_logit_source"] = dgst_t[
             "dgst_t_relative_vll_logit_source"
         ]
+    if "dgst_t_source_distribution_mode" in dgst_t:
+        feat["dgst_t_source_distribution_mode"] = dgst_t[
+            "dgst_t_source_distribution_mode"
+        ]
     if "dgst_t_relative_cost_mode" in dgst_t:
         feat["dgst_t_relative_cost_mode"] = dgst_t["dgst_t_relative_cost_mode"]
     if "dgst_t_relative_cost_modes" in dgst_t:
         feat["dgst_t_relative_cost_modes"] = list(dgst_t["dgst_t_relative_cost_modes"])
+    if "dgst_t_relative_cost_state_modes" in dgst_t:
+        feat["dgst_t_relative_cost_state_modes"] = list(
+            dgst_t["dgst_t_relative_cost_state_modes"]
+        )
+    if "dgst_t_dual_scope" in dgst_t:
+        feat["dgst_t_dual_scope"] = bool(dgst_t["dgst_t_dual_scope"])
+    for key in ("dgst_t_dual_scope_vv_source_target", "dgst_t_dual_scope_vp_source_target"):
+        if key in dgst_t:
+            feat[key] = str(dgst_t[key])
     for key in (
         "dgst_t_relative_barrier_lambda",
         "dgst_t_relative_barrier_margin",
         "dgst_t_relative_barrier_max",
+        "dgst_t_ffn_evidence_top_k",
+        "dgst_t_ffn_evidence_rank",
+        "dgst_t_ffn_injection_eps",
     ):
         if key in dgst_t:
-            feat[key] = float(dgst_t[key])
+            feat[key] = (
+                int(dgst_t[key])
+                if key in {"dgst_t_ffn_evidence_top_k", "dgst_t_ffn_evidence_rank"}
+                else float(dgst_t[key])
+            )
     for key in (
         "dgst_t_transport_risk_relative_vll_per_layer",
         "dgst_t_transport_risk_relative_vll_capped_topmass_085_per_layer",
@@ -262,6 +282,8 @@ def _build_feature_record(
         "dgst_t_transport_risk_visual_prompt_relative_vll_capped_topmass_085_per_layer",
         "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer",
         "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer",
+        "dgst_t_visual_prompt_relative_vll_target_visual_mass_per_layer",
+        "dgst_t_visual_prompt_relative_vll_target_prompt_mass_per_layer",
     ):
         if key in dgst_t:
             feat[key] = dgst_t[key].tolist()
@@ -269,7 +291,12 @@ def _build_feature_record(
         if key in feat:
             continue
         if (
-            key.startswith(("dgst_t_risk_", "dgst_t_cos_", "dgst_t_transport_risk_"))
+            key.startswith((
+                "dgst_t_risk_",
+                "dgst_t_cos_",
+                "dgst_t_transport_risk_",
+                "dgst_t_ffn_",
+            ))
             and key.endswith("_per_layer")
         ):
             feat[key] = value.tolist() if hasattr(value, "tolist") else value
@@ -287,6 +314,7 @@ def _compute_dgst_t_result(model_out, cfg_dgst_t: dict) -> dict:
     return compute_dgst_t(
         model_out.dgst_t_raw,
         tau=cfg_dgst_t.get("tau", 0.07),
+        source_distribution_mode=cfg_dgst_t.get("source_distribution_mode", "softmax"),
         transport_top_k=cfg_dgst_t.get("transport_top_k", 64),
         cost_mode=cfg_dgst_t.get("cost_mode", "direct"),
         lambda_d=cfg_dgst_t.get("lambda_d", 1.0),
@@ -308,12 +336,22 @@ def _compute_dgst_t_result(model_out, cfg_dgst_t: dict) -> dict:
         relative_vll_mad_epsilon=cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6),
         relative_cost_mode=cfg_dgst_t.get("relative_cost_mode"),
         relative_cost_modes=cfg_dgst_t.get("relative_cost_modes"),
+        relative_cost_state_modes=cfg_dgst_t.get("relative_cost_state_modes"),
+        relative_cost_update_lambdas=cfg_dgst_t.get("relative_cost_update_lambdas"),
         relative_barrier_lambda=cfg_dgst_t.get("relative_barrier_lambda", 1.0),
         relative_barrier_margin=cfg_dgst_t.get("relative_barrier_margin", 0.5),
         relative_barrier_max=cfg_dgst_t.get("relative_barrier_max", 3.0),
         source_modes=cfg_dgst_t.get("source_modes"),
         target_attention_gammas=cfg_dgst_t.get("target_attention_gammas"),
         target_attention_epsilon=cfg_dgst_t.get("target_attention_epsilon", 1e-12),
+        compute_ffn_injection_features=cfg_dgst_t.get("compute_ffn_injection_features", True),
+        ffn_injection_evidence_top_k=cfg_dgst_t.get("ffn_injection_evidence_top_k", 32),
+        ffn_injection_evidence_rank=cfg_dgst_t.get("ffn_injection_evidence_rank", 8),
+        ffn_injection_eps=cfg_dgst_t.get("ffn_injection_eps", 1e-12),
+        compute_dual_scope=cfg_dgst_t.get(
+            "dgst_t_dual_scope",
+            cfg_dgst_t.get("compute_dual_scope", False),
+        ),
     )
 
 

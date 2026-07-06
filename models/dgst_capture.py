@@ -201,6 +201,7 @@ def build_dgst_t_raw(
     support_scope: str = "visual_prompt",
     semantic_chunk_size: int = 64,
     relative_vll_logit_source: str = "h_mid",
+    prompt_positions_override: Sequence[int] | None = None,
     keep_on_device: bool = False,
 ) -> dict[str, Any]:
     """Build the raw tensors consumed by features.dgst_t.compute_dgst_t."""
@@ -217,6 +218,7 @@ def build_dgst_t_raw(
         support_scope=support_scope,
         semantic_chunk_size=semantic_chunk_size,
         relative_vll_logit_source=relative_vll_logit_source,
+        prompt_positions_override=prompt_positions_override,
         keep_on_device=keep_on_device,
     )[0]
 
@@ -235,6 +237,7 @@ def build_dgst_t_raw_batch(
     support_scope: str = "visual_prompt",
     semantic_chunk_size: int = 64,
     relative_vll_logit_source: str = "h_mid",
+    prompt_positions_override: Sequence[int] | None = None,
     keep_on_device: bool = False,
 ) -> list[dict[str, Any]]:
     """Build per-token DGST-T raw tensors from one shared decoder forward."""
@@ -245,12 +248,16 @@ def build_dgst_t_raw_batch(
     if not target_ids:
         return []
 
-    prompt_positions = resolve_prompt_positions(
-        full_input_ids=full_input_ids,
-        prompt_tokenized_length=prompt_tokenized_length,
-        image_token_id=image_token_id,
-        visual_start=visual_start,
-        visual_end=visual_end,
+    prompt_positions = (
+        [int(position) for position in prompt_positions_override]
+        if prompt_positions_override is not None
+        else resolve_prompt_positions(
+            full_input_ids=full_input_ids,
+            prompt_tokenized_length=prompt_tokenized_length,
+            image_token_id=image_token_id,
+            visual_start=visual_start,
+            visual_end=visual_end,
+        )
     )
     support_positions = resolve_support_positions(
         visual_start=visual_start,
@@ -282,10 +289,20 @@ def build_dgst_t_raw_batch(
         )
         for token_id in target_ids
     ]
+    target_unembeddings = [
+        unembedding_for_token(
+            output_layer=output_layer,
+            target_token_id=token_id,
+            hidden_size=hidden_size,
+            device=captures[0]["h_mid"].device,
+        )
+        for token_id in target_ids
+    ]
 
     raw_parts = [
         {
             "source_ffn_states": [],
+            "source_attn_states": [],
             "prediction_hidden_states": [],
             "support_h_mid_states": [],
             "support_output_states": [],
@@ -302,6 +319,7 @@ def build_dgst_t_raw_batch(
 
     for layer_offset, capture in enumerate(captures):
         h_mid = capture["h_mid"][0]
+        o_attn = capture["o_attn"][0]
         o_ffn = capture["o_ffn"][0]
         layer_hidden = h_mid + o_ffn
         device = h_mid.device
@@ -356,6 +374,9 @@ def build_dgst_t_raw_batch(
             part["source_ffn_states"].append(
                 _raw_tensor(o_ffn[int(prediction_position), :], keep_on_device=keep_on_device)
             )
+            part["source_attn_states"].append(
+                _raw_tensor(o_attn[int(prediction_position), :], keep_on_device=keep_on_device)
+            )
             part["prediction_hidden_states"].append(
                 _raw_tensor(layer_hidden[int(prediction_position), :], keep_on_device=keep_on_device)
             )
@@ -395,6 +416,7 @@ def build_dgst_t_raw_batch(
                 "support_positions": [int(position) for position in support_positions],
                 "prompt_positions": [int(position) for position in prompt_positions],
                 "source_ffn_states": torch.stack(part["source_ffn_states"], dim=0),
+                "source_attn_states": torch.stack(part["source_attn_states"], dim=0),
                 "prediction_hidden_states": torch.stack(part["prediction_hidden_states"], dim=0),
                 "support_h_mid_states": torch.stack(part["support_h_mid_states"], dim=0),
                 "support_output_states": torch.stack(part["support_output_states"], dim=0),
@@ -411,6 +433,10 @@ def build_dgst_t_raw_batch(
                 ),
                 "target_embedding": _raw_tensor(
                     target_embeddings[target_offset],
+                    keep_on_device=keep_on_device,
+                ),
+                "target_unembedding": _raw_tensor(
+                    target_unembeddings[target_offset],
                     keep_on_device=keep_on_device,
                 ),
             }
@@ -659,6 +685,24 @@ def embedding_for_token(
         if 0 <= token_id < int(weight.shape[0]) and int(weight.shape[-1]) == int(hidden_size):
             return weight[token_id].detach().to(device=device, dtype=torch.float32)
     raise ValueError(f"Cannot resolve target token embedding for token_id={target_token_id}.")
+
+
+def unembedding_for_token(
+    *,
+    output_layer: Any,
+    target_token_id: int,
+    hidden_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    weight = getattr(output_layer, "weight", None)
+    token_id = int(target_token_id)
+    if (
+        weight is not None
+        and 0 <= token_id < int(weight.shape[0])
+        and int(weight.shape[-1]) == int(hidden_size)
+    ):
+        return weight[token_id].detach().to(device=device, dtype=torch.float32)
+    return torch.zeros(int(hidden_size), dtype=torch.float32, device=device)
 
 
 def _layer_attention_module(layer: Any):

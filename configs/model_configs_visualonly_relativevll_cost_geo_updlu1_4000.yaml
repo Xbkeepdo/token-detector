@@ -1,0 +1,111 @@
+models:
+  llava_1_5_7b:
+    hf_name: "/home/apulis-dev/userdata/models/llava/llava-hf/llava-1___5-7b-hf"
+    architecture: "concatenation"
+    num_visual_tokens: 576
+    dgst_t_support_scope: "visual"
+    image_size: 336
+    patch_size: 14
+    num_layers: 32
+    temperature: 0.1
+    top_p: 0.5
+    prompt_template: "USER: <image>\nDescribe this image.\nASSISTANT:"
+
+  internvl_2_5_8b:
+    hf_name: "/home/apulis-dev/userdata/models/InternVL2_5-8B"
+    architecture: "concatenation"
+    num_visual_tokens: 256
+    dgst_t_support_scope: "visual"
+    image_size: 448
+    patch_size: 14
+    num_layers: 32
+    temperature: 0.1
+    top_p: 0.5
+    img_context_token: "<IMG_CONTEXT>"
+    prompt_template: "<|im_start|>user\n<image>\nDescribe this image.<|im_end|>\n<|im_start|>assistant\n"
+
+  qwen2_5_vl_7b:
+    hf_name: "/home/apulis-dev/userdata/models/Qwen2.5-VL-7B-Instruct"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    dgst_t_support_scope: "visual"
+    image_size: 448
+    patch_size: 14
+    num_layers: 28
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    prompt_template: null
+
+feature_extraction:
+  ads:
+    top_patch_pct: 0.10
+    connectivity: 8
+    min_blob_area: 3
+    top_k_layers: 10
+  cgc:
+    top_k_pct: 0.05
+    mid_layer_pct: [0.25, 0.75]
+    use_attn_weighting: false
+  dgst_t:
+    tau: 0.07
+    transport_top_k: 64
+    cost_mode: "decomposed"
+    lambda_d: 1.0
+    lambda_s: 1.0
+    lambda_t: 1.0
+    lambda_int: 1.0
+    baseline_layers: 10
+    risk_start_layer: 15
+    alpha: 2.0
+    ot_solver: "emd"
+    atarget_visual_top_k: 32
+    compute_topmass_085: false
+    compute_capped_topmass_085: false
+    topmass_085_alpha: 0.85
+    capped_topmass_085_alpha: 0.85
+    capped_topmass_085_min_k: 32
+    capped_topmass_085_max_k: 64
+    target_gate_mode: "dual"
+    relative_vll_mad_epsilon: 1.0e-6
+    relative_vll_logit_source: "h_mid"
+    relative_cost_mode: "geo"
+    relative_cost_modes: ["geo"]
+    relative_cost_state_modes: ["state_update"]
+    relative_cost_update_lambdas: [1.0]
+    relative_barrier_lambda: 1.0
+    relative_barrier_margin: 0.5
+    relative_barrier_max: 3.0
+    compute_ffn_injection_features: false
+
+dataset:
+  coco_root: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco"
+  annotation_file: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco/annotations/instances_val2014.json"
+  captions_file: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco/annotations/captions_val2014.json"
+  num_images: 4000
+  train_ratio: 0.90
+  seed: 42
+
+classifiers:
+  xgb:
+    max_depth: [4, 6, 8]
+    learning_rate: [0.1, 0.05]
+    n_estimators: [100, 200, 500]
+  rf:
+    max_depth: [null, 10, 20]
+    n_estimators: [200, 400, 600]
+  mlp:
+    hidden_layer_sizes: [[64], [128], [256]]
+    learning_rate_init: [0.01, 0.001]
+    solver: ["adam", "sgd"]
+    max_iter: 500
+
+pope:
+  pope_dir: "data/pope"
+  splits: ["random", "popular", "adversarial"]
+  prompt_templates:
+    llava_1_5_7b: "USER: <image>\n{question}\nAnswer the question using a single word or phrase.\nASSISTANT:"
+    internvl_2_5_8b: "{question}\nAnswer the question using a single word or phrase."
+    qwen2_5_vl_7b: "{question}\nAnswer the question using a single word or phrase."
+    _default: "{question}\nAnswer the question using a single word or phrase."

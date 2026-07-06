@@ -124,7 +124,32 @@
   - 已补跑 V source / V target 的 geo torch MLP，并与 additive3 中 VP source / VP target 的 geo torch MLP 对比：汇总表为 `outputs/vsource_vtarget_geo_risk_comparison/vsource_vtarget_geo_torch_mlp_vs_vp.md`，CSV 为 `vsource_vtarget_geo_torch_mlp_vs_vp_all.csv` 与 `vsource_vtarget_geo_torch_mlp_vs_vp_delta.csv`。
   - torch MLP 对比结论：Qwen V/V 更强，best AUC 0.952 vs VP/VP 0.923；InternVL VP/VP 更强，0.952 vs V/V 0.942；LLaVA VP/VP 略强，0.844 vs V/V 0.827。matched feature 上 Qwen 四组 V/V AUC 均高于 VP/VP，InternVL 四组均低于 VP/VP，LLaVA 只有 risk cap085 的 V/V AUC 小幅高于 VP/VP。
   - 已从保存的 torch probe checkpoint 回填 AUPR/average precision，并将 `scripts/train_torch_probe_feature_sets.py` 更新为后续默认输出 `aupr`。best AUPR：Qwen V/V 0.984 vs VP/VP 0.966；InternVL VP/VP 0.987 vs V/V 0.982；LLaVA VP/VP 0.844 vs V/V 0.782。
+  - 2026-07-04 补跑 InternVL V/V geo source softmax tau ablation：新增 tau=0.05 与 tau=0.10，两者与基线 tau=0.07 使用同一标注/split。汇总目录：`outputs/internvl_source_tau_ablation_vsource_vtarget_geo/`。结论：tau 主要改变 risk 绝对值（tau 越小整体 risk 越高），hall/non 差值基本不变；raw diff_avg 约 0.0076/0.0082/0.0090，cap085 diff_avg 约 0.0053/0.0055/0.0057。
+  - 2026-07-04 补跑 InternVL V/V geo source no-softmax ablation：新增 `source_distribution_mode: "softmax" | "relu_norm"`，默认仍为 `softmax`；`relu_norm` 为 cosine 分数 clamp 到非负后直接归一化，全非正时退回均匀分布。新增配置 `configs/model_configs_visualonly_relativevll_cost_geo_source_relu.yaml`，输出目录 `outputs/internvl_2_5_8b/COCO500-visualonly-relativevll-cost-geo-source-relu/`，features 共 3715 行，labels `{1:3064,0:651}`，所有样本 `dgst_t_source_distribution_mode=relu_norm`，raw/cap085 字段无 NaN/inf。对比汇总：`outputs/internvl_source_nosoftmax_vsource_vtarget_geo/`。结论：相对 baseline softmax tau=0.07，no-softmax/relu_norm 提升 hall-non risk gap；raw diff_avg 从 0.0082 提到 0.0177，L16-32 从 0.0013 提到 0.0098；cap085 diff_avg 从 0.0055 提到 0.0130，L16-32 从 -0.0014 提到 0.0055。
+  - 同步补跑 InternVL V/V geo no-softmax 的 torch MLP/probe 四组 feature set，汇总 `outputs/internvl_source_nosoftmax_vsource_vtarget_geo/internvl_vv_geo_source_nosoftmax_torch_mlp.md`。分类结论：risk-only 明显提升，raw AUC 0.840->0.867，cap085 0.848->0.866；加 cosine 后 AUC 基本持平/小升，raw 0.942->0.943，cap085 0.936->0.942。VP/VP geo 仍保持最强 combo，raw risk+cosine AUC 约 0.952、F1 约 0.965。
+  - 2026-07-04 补跑 LLaVA VP/VP geo source no-softmax risk 曲线：新增配置 `configs/model_configs_visualprompt_relativevll_cost_geo_source_relu.yaml`，输出目录 `outputs/llava_1_5_7b/COCO500-visualprompt-relativevll-cost-geo-source-relu/`，features 共 1448 行，labels `{0:757,1:691}`，所有样本 `dgst_t_source_distribution_mode=relu_norm`，VP risk raw/cap085 字段无 NaN/inf。对比汇总：`outputs/llava_source_nosoftmax_vp_geo/`。结论：LLaVA VP/VP 下 no-softmax 会抬高 risk 绝对值，但 hall/non 仍主要反向（non-hall risk 更高）；raw H-N diff_avg 从 -0.0284 变为 -0.0169，cap085 从 -0.0359 变为 -0.0241，反向差值有所减弱但没有转成稳定正向。
   - 后续命名约定：需要明确写成 `V source / V target` 或 `VP source / VP target`，避免再用 `visual_raw` 这种会和 source/target 混淆的简称。
+- 2026-07-05 按用户要求检查 LLaVA `Raw SVD EIF Dose * risk_geo_raw`：
+  - 在 `scripts/train_feature_sets.py` 新增 computed feature alias `ffn_eifdose_svd_x_risk_geo_raw`，训练时逐层计算 `ffn_eifdose_svd * risk_geo_raw`；不改已有 `ffn_eifdose_svd`、`risk_geo_raw` 或 features.pkl 原字段含义。
+  - 已生成乘积曲线：`outputs/llava_ffn_injection_diagnostic/evidence_variants/llava_ffn_eifdose_svd_x_risk_geo_raw_by_label.{png,pdf,csv}`，SEM 版本为 `llava_ffn_eifdose_svd_x_risk_geo_raw_sem_by_label.{png,pdf,csv}`，曲线摘要为 `llava_ffn_eifdose_svd_x_risk_geo_raw_summary.md`。
+  - 曲线结果：features 共 1448 行，non=757、hall=691、32 层；乘积曲线 hall avg 约 0.182931，non avg 约 0.173482，H-N diff_avg 约 +0.009449；最大绝对差在第 1 层且为反向，H-N gap 约 -0.033289。
+  - 在原独立 8:2 split 目录 `outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly-train80-test20/` 上补跑 torch probe；仍是 train=400 images、val=[]、test=100 images，token rows train=1122/test=326，val 为空时 trainer 使用 train 作为 val。
+  - 训练汇总：`outputs/llava_ffn_injection_diagnostic/evidence_variants/llava_ffn_eifdose_svd_x_risk_geo_raw_torch_probe_summary.md` 与 `.csv`。乘积单特征 AUC/F1/AUPR 约 0.790/0.720/0.761，弱于单独 `ffn_eifdose_svd` 的 0.827/0.718/0.816，但强于单独 `risk_geo_raw` 的 0.749/0.658/0.732。
+  - 组合结果：`ffn_eifdose_svd_x_risk_geo_raw+visualcosine_raw` AUC/F1 约 0.836/0.764，低于 `ffn_eifdose_svd+visualcosine_raw` 的 0.868/0.785；`ffn_eifdose_svd_x_risk_geo_raw+risk_geo_raw+visualcosine_raw` AUC/F1 约 0.859/0.776，低于 `ffn_eifdose_svd+risk_geo_raw+visualcosine_raw` 的 0.883/0.814；把乘积作为额外交互项加入 `ffn_eifdose_svd+risk_geo_raw+visualcosine_raw` 后 AUC 约 0.882987，基本打平旧组合 0.882572，但 F1 降到约 0.801。
+  - 当前结论：乘法曲线会放大一部分中后层正向 H-N gap，但作为替代特征不如保留原始 EIF Dose；作为额外交互项没有明确实质收益，最多作为补充 ablation。
+- 2026-07-05 按用户要求检查 LLaVA `FAD * risk_geo_raw`：
+  - 在 `scripts/train_feature_sets.py` 新增 computed feature alias `ffn_fad_x_risk_geo_raw`，训练时逐层计算 `ffn_fad * risk_geo_raw`；不改已有 `ffn_fad`、`risk_geo_raw` 或 features.pkl 原字段含义。
+  - 已生成乘积曲线：`outputs/llava_ffn_injection_diagnostic/evidence_variants/llava_ffn_fad_x_risk_geo_raw_by_label.{png,pdf,csv}`，SEM 版本为 `llava_ffn_fad_x_risk_geo_raw_sem_by_label.{png,pdf,csv}`，曲线摘要为 `llava_ffn_fad_x_risk_geo_raw_summary.md`。
+  - 曲线结果：features 共 1448 行，non=757、hall=691、32 层；乘积曲线 hall avg 约 0.289963，non avg 约 0.257258，H-N diff_avg 约 +0.032705；最大绝对差在第 22 层，H-N gap 约 +0.093990。
+  - 在同一独立 8:2 split 目录 `outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly-train80-test20/` 上补跑 torch probe；仍是 train=400 images、val=[]、test=100 images，token rows train=1122/test=326，val 为空时 trainer 使用 train 作为 val。
+  - 训练汇总：`outputs/llava_ffn_injection_diagnostic/evidence_variants/llava_ffn_fad_x_risk_geo_raw_torch_probe_summary.md` 与 `.csv`。乘积单特征 AUC/F1/AUPR 约 0.820/0.741/0.787，弱于单独 `ffn_fad` 的 0.846/0.764/0.830，但强于单独 `risk_geo_raw` 的 0.749/0.658/0.732。
+  - 组合结果：`ffn_fad+risk_geo_raw` AUC/F1 约 0.870/0.809；`ffn_fad+risk_geo_raw+visualcosine_raw` AUC/F1 约 0.881/0.809；`ffn_fad_x_risk_geo_raw+risk_geo_raw+visualcosine_raw` AUC/F1 约 0.846/0.791，低于保留原始 FAD 与 risk 的组合。把乘积作为额外交互项加入 `ffn_fad+risk_geo_raw+visualcosine_raw` 后 AUC 约 0.881404，基本打平原组合 0.881028，但 F1 降到约 0.799。
+  - 当前结论：`FAD * risk` 曲线的类别分离明显强于 `Raw SVD EIF Dose * risk`，但训练上仍不适合作为替代特征；更稳的方式是保留 FAD 与 risk 两个原始因子，乘积最多作为 interaction ablation。
+- 2026-07-05 按用户要求为论文展示画 LLaVA `FAD * risk_geo_raw` 区分度图：
+  - 新增主图：`outputs/llava_ffn_injection_diagnostic/evidence_variants/llava_ffn_fad_x_risk_geo_raw_paper_separability.{png,pdf,csv}`，包含三 panel：hall/non mean + image-level bootstrap 95% CI、signed H-N gap + CI、per-layer ROC-AUC + CI。
+  - 新增分布图：`llava_ffn_fad_x_risk_geo_raw_selected_layer_violin.{png,pdf}`，选择 L1/L8/L22/L30/L32 展示分布重叠。
+  - 新增对比图：`llava_ffn_product_gap_auc_comparison.{png,pdf,csv}`，对比 `FAD * risk` 与 `Raw SVD EIF Dose * risk` 的逐层 H-N gap 和 AUC。
+  - 绘图统计：使用 1448 token rows、468 unique images；L22 是 `FAD * risk` 的 peak layer，H-N gap 约 +0.093990，单层 AUC 约 0.678520。主图显示 mean curve 看起来接近，但 gap/AUC panel 能更清楚表达中后层区分度。
 
 ## Files changed recently
 - 新增：`configs/model_configs_visualonly.yaml`
@@ -162,8 +187,31 @@
 - 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualonly-relativevll-cost-geo/`
 - 新增输出目录：`outputs/llava_1_5_7b/COCO500-visualonly-relativevll-cost-geo/`
 - 新增对比输出：`outputs/vsource_vtarget_geo_risk_comparison/`
+- 新增：`configs/model_configs_visualonly_relativevll_cost_geo_source_relu.yaml`
+- 新增输出目录：`outputs/internvl_2_5_8b/COCO500-visualonly-relativevll-cost-geo-source-relu/`
+- 新增对比输出：`outputs/internvl_source_nosoftmax_vsource_vtarget_geo/`
+- 新增：`configs/model_configs_visualprompt_relativevll_cost_geo_source_relu.yaml`
+- 新增输出目录：`outputs/llava_1_5_7b/COCO500-visualprompt-relativevll-cost-geo-source-relu/`
+- 新增对比输出：`outputs/llava_source_nosoftmax_vp_geo/`
+- 更新：`scripts/train_feature_sets.py` 新增 `ffn_eifdose_svd_x_risk_geo_raw` 乘积特征别名。
+- 新增诊断输出：`outputs/llava_ffn_injection_diagnostic/evidence_variants/llava_ffn_eifdose_svd_x_risk_geo_raw_*`。
+- 更新：`scripts/train_feature_sets.py` 新增 `ffn_fad_x_risk_geo_raw` 乘积特征别名。
+- 新增诊断输出：`outputs/llava_ffn_injection_diagnostic/evidence_variants/llava_ffn_fad_x_risk_geo_raw_*`。
+- 新增论文展示图输出：`outputs/llava_ffn_injection_diagnostic/evidence_variants/llava_ffn_fad_x_risk_geo_raw_paper_separability.*`、`llava_ffn_fad_x_risk_geo_raw_selected_layer_violin.*`、`llava_ffn_product_gap_auc_comparison.*`。
+- 更新训练输出：`outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly-train80-test20/results/` 增加乘积特征 torch probe 结果与 artifacts。
 
 ## Commands run
+- 2026-07-05 乘积特征检查：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile scripts/train_feature_sets.py scripts/train_torch_probe_feature_sets.py`
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 验证 `ffn_eifdose_svd_x_risk_geo_raw` alias 可解析，train/test 矩阵分别为 `(1122, 32)` 与 `(326, 32)`，乘积与手工逐层相乘最大误差为 0，且无 NaN/inf。
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 读取 `outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly/features.pkl`，生成 `llava_ffn_eifdose_svd_x_risk_geo_raw_by_label` 与 `_sem_by_label` 曲线、CSV 和摘要。
+  - `CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/train_torch_probe_feature_sets.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_evidence_variants_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly-train80-test20 --feature-sets ffn_eifdose_svd+risk_geo_raw ffn_eifdose_svd_x_risk_geo_raw ffn_eifdose_svd_x_risk_geo_raw+risk_geo_raw ffn_eifdose_svd_x_risk_geo_raw+ffn_eifdose_svd ffn_eifdose_svd_x_risk_geo_raw+ffn_eifdose_svd+risk_geo_raw ffn_eifdose_svd_x_risk_geo_raw+visualcosine_raw ffn_eifdose_svd_x_risk_geo_raw+risk_geo_raw+visualcosine_raw ffn_eifdose_svd_x_risk_geo_raw+ffn_eifdose_svd+risk_geo_raw+visualcosine_raw --device cuda:0`
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 从 `llava_1_5_7b_selected_feature_sets.json` 生成乘积特征 torch probe 汇总 `llava_ffn_eifdose_svd_x_risk_geo_raw_torch_probe_summary.md/.csv`。
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 验证 `ffn_fad_x_risk_geo_raw` alias 可解析，train/test 矩阵分别为 `(1122, 32)` 与 `(326, 32)`，乘积与手工逐层相乘最大误差为 0，且无 NaN/inf。
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 读取 `outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly/features.pkl`，生成 `llava_ffn_fad_x_risk_geo_raw_by_label` 与 `_sem_by_label` 曲线、CSV 和摘要。
+  - `CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/train_torch_probe_feature_sets.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_evidence_variants_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly-train80-test20 --feature-sets ffn_fad+risk_geo_raw ffn_fad+visualcosine_raw ffn_fad+risk_geo_raw+visualcosine_raw ffn_fad_x_risk_geo_raw ffn_fad_x_risk_geo_raw+risk_geo_raw ffn_fad_x_risk_geo_raw+ffn_fad ffn_fad_x_risk_geo_raw+ffn_fad+risk_geo_raw ffn_fad_x_risk_geo_raw+visualcosine_raw ffn_fad_x_risk_geo_raw+risk_geo_raw+visualcosine_raw ffn_fad_x_risk_geo_raw+ffn_fad+risk_geo_raw+visualcosine_raw --device cuda:0`
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 从 `llava_1_5_7b_selected_feature_sets.json` 生成 FAD 乘积特征 torch probe 汇总 `llava_ffn_fad_x_risk_geo_raw_torch_probe_summary.md/.csv`。
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 使用 image-level bootstrap 生成论文展示图 `llava_ffn_fad_x_risk_geo_raw_paper_separability`、selected-layer violin 和 `FAD * risk` vs `Raw SVD EIF Dose * risk` gap/AUC 对比图。
 - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model internvl_2_5_8b --config configs/model_configs_visualonly.yaml --output-dir outputs/internvl_2_5_8b/COCO500-visualonly --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
 - `CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model qwen2_5_vl_7b --config configs/model_configs_visualonly.yaml --output-dir outputs/qwen2_5_vl_7b/COCO500-visualonly --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`
 - 使用 `/opt/conda/private/envs/vicr/bin/python` 读取 `features.pkl` 并生成逐层 risk 的 png/pdf/csv。
@@ -291,3 +339,120 @@
 - relative VLL cost 主线建议先用 `geo`；如果需要追求 InternVL visual+prompt、Qwen capped VP combo 或 LLaVA visual+cosine 的小幅 AUC，可把 `tbar` 作为 ablation 候选；`sbar` 不建议作为默认。
 - 下一步可只挑最有希望的 finalnorm 分支（Qwen cosine、InternVL visual+prompt risk）补跑 torch probe 或换 split seed 做稳定性检查；source 侧回到 legacy source 与当前默认 attention-guided target。
 - 如需和原 visual+prompt/direct 直接对比，可把原 `COCO500/results/*risk_layerwise_by_label.csv` 与本次 `COCO500-visualprompt-relativevll` CSV 做同图差值分析。
+
+## 2026-07-05 LLaVA FFN injection diagnostic
+- 本轮目标：在 LLaVA object-token 预测位置增加三条 FFN 注入诊断逐层特征，并用 visual-only relative VLL cost-geo 主线验证曲线和 torch probe。
+- 新增特征：
+  - FAD / `dgst_t_ffn_attn_dominance_per_layer`：`log((||O_ffn||+eps)/(||O_attn||+eps))`。
+  - EIFDose / `dgst_t_ffn_evidence_orthogonal_dose_per_layer`：基于 visual relative VLL target distribution 的 top-K 视觉 token 证据子空间，计算 `||(I-Pi_E) O_ffn||/(||h_mid||+eps)`；默认 `top_k=32`、`rank=8`、`eps=1e-12`。
+  - LogitLift / `dgst_t_ffn_logit_lift_per_layer`：只用 LM head / output embedding 中目标 token 行向量，计算 `W_U[target_token_id]^T O_ffn`，不加 bias、不做 softmax。
+- 代码变更：
+  - `models/dgst_capture.py`：raw capture 增加 `source_attn_states` 和 `target_unembedding`，供 FFN/attention 对比与目标 token unembedding 投影使用。
+  - `features/dgst_t.py`：实现三条 FFN injection 特征、逐层字段、layer stats（`ffn_attn_dominance`、`ffn_evidence_orthogonal_dose`、`ffn_logit_lift`、`ffn_evidence_subspace_rank_used`），并保留旧 raw fallback。
+  - `features/extractor.py`、`models/{llava_wrapper,internvl_wrapper,qwen_wrapper}.py`：透传 `feature_extraction.dgst_t` 中的 FFN injection 配置，保存新增 per-layer 字段和元信息。
+  - `scripts/train_feature_sets.py`、`scripts/plot_layerwise_feature_comparison.py`：增加 `ffn_fad`、`ffn_eifdose`、`ffn_logitlift`、`risk_geo_raw`、`visualcosine_raw` 等 aliases。
+  - 新增 `configs/model_configs_llava_ffn_injection_visualonly.yaml`、`scripts/plot_llava_ffn_injection_diagnostic.py`、`scripts/summarize_llava_ffn_injection_probe.py`。
+- 已运行命令：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py models/dgst_capture.py features/extractor.py models/llava_wrapper.py models/qwen_wrapper.py models/internvl_wrapper.py scripts/train_torch_probe_feature_sets.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py scripts/plot_llava_ffn_injection_diagnostic.py scripts/summarize_llava_ffn_injection_probe.py`
+  - 小张量 inline 测试：验证 FAD 正负、LogitLift dot product、EIFDose 子空间内接近 0 / 正交方向为正、旧 raw 缺少 `source_attn_states` 时不破坏 legacy risk/cosine。
+  - 准备 LLaVA 输出目录并复用旧 COCO500 metadata：`mkdir -p outputs/llava_1_5_7b/COCO500-ffn-injection-visualonly`，`cp -n outputs/llava_1_5_7b/COCO500-visualonly-relativevll-cost-geo/{labeling.json,generations.json,image_splits.json} outputs/llava_1_5_7b/COCO500-ffn-injection-visualonly/`。
+  - smoke extraction：`CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_injection_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-injection-visualonly --device cuda:0 --resume --num-images 2`。
+  - full extraction：`CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_injection_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-injection-visualonly --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`。
+  - 曲线绘制：`/opt/conda/private/envs/vicr/bin/python scripts/plot_llava_ffn_injection_diagnostic.py --features-pkl outputs/llava_1_5_7b/COCO500-ffn-injection-visualonly/features.pkl --output-dir outputs/llava_ffn_injection_diagnostic`。
+  - torch probe：`CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/train_torch_probe_feature_sets.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_injection_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-injection-visualonly --feature-sets ffn_fad ffn_eifdose ffn_logitlift risk_geo_raw visualcosine_raw risk_geo_raw+visualcosine_raw ffn_fad+visualcosine_raw ffn_eifdose+visualcosine_raw ffn_logitlift+visualcosine_raw ffn_eifdose+risk_geo_raw ffn_eifdose+risk_geo_raw+visualcosine_raw --device cuda:0`。
+  - probe 汇总与 artifact 复制：`/opt/conda/private/envs/vicr/bin/python scripts/summarize_llava_ffn_injection_probe.py --results-json outputs/llava_1_5_7b/COCO500-ffn-injection-visualonly/results/llava_1_5_7b_selected_feature_sets.json --output-dir outputs/llava_ffn_injection_diagnostic`，并复制 `results/torch_probe/` 到 `outputs/llava_ffn_injection_diagnostic/torch_probe/`。
+- 输出产物：
+  - LLaVA 特征：`outputs/llava_1_5_7b/COCO500-ffn-injection-visualonly/features.pkl`，共 1448 行，label 分布 `{0: 757, 1: 691}`；三条 FFN injection 字段均为 1448 行、32 层、无 NaN/inf。
+  - 逐层曲线：`outputs/llava_ffn_injection_diagnostic/llava_ffn_attn_dominance_by_label.{png,pdf,csv}`、`llava_ffn_evidence_orthogonal_dose_by_label.{png,pdf,csv}`、`llava_ffn_logit_lift_by_label.{png,pdf,csv}`、`llava_ffn_injection_3features_by_label.{png,pdf,csv}`。
+  - 曲线摘要：`outputs/llava_ffn_injection_diagnostic/llava_ffn_injection_summary.md`。
+  - torch probe 汇总：`outputs/llava_ffn_injection_diagnostic/llava_ffn_injection_torch_probe_summary.md`、`llava_ffn_injection_torch_probe.csv`，并已复制逐 run artifacts 到 `outputs/llava_ffn_injection_diagnostic/torch_probe/`。
+- 初步结果：
+  - 曲线均值分离较小但方向总体为 hallucination 更高：FAD hall-non diff_avg 约 `+0.027`，EIFDose 约 `+0.002`，LogitLift 约 `+0.033`。
+  - 单 FFN 特征已有强信号：`ffn_fad` AUC=`0.867843`、F1=`0.773723`；`ffn_eifdose` AUC=`0.829412`；`ffn_logitlift` AUC=`0.821765`。
+  - baseline 中 `risk_geo_raw+visualcosine_raw` AUC=`0.838235`、F1=`0.750000`；单独 `visualcosine_raw` AUC=`0.807059`，单独 `risk_geo_raw` AUC=`0.737255`。
+  - 最佳组合是 `ffn_eifdose+risk_geo_raw+visualcosine_raw`：AUC=`0.883333`、F1=`0.753623`、AUPR=`0.869921`；最高 F1 是 `ffn_fad+visualcosine_raw`：F1=`0.789116`、AUC=`0.874706`。
+- 2026-07-05 追加 training-free 检查：
+  - 输出：`outputs/llava_ffn_injection_diagnostic/llava_ffn_injection_trainingfree_summary.md`、`llava_ffn_injection_trainingfree_mean_scores.csv`、`llava_ffn_injection_trainingfree_val_threshold.csv`、`llava_ffn_injection_trainingfree_train_threshold.csv`。
+  - 注意：当前 `image_splits.json` 中 val/test image IDs 完全相同（50/50 overlap），因此之前 torch probe 与 val-threshold training-free 都不是独立 held-out；没有 train/test overlap。
+  - 固定 mean-over-layers raw score 的 test AUC 较弱：`ffn_fad` AUC=`0.580196`、`ffn_eifdose` AUC=`0.509412`、`ffn_logitlift` AUC=`0.587059`。F1@0 基本退化为 almost/all-positive baseline（约 `0.64455`）。
+  - 用 train split 选择 reducer/direction/threshold 后再报 test：`ffn_fad` AUC=`0.550000`、F1=`0.653266`；`ffn_eifdose` AUC=`0.551569`、F1=`0.640000`；`ffn_logitlift` AUC=`0.562353`、F1=`0.650718`；三特征 z-avg AUC=`0.562353`、F1=`0.644550`。
+  - 结论：三条 FFN 特征的 training-free scalar 检测效果一般，主要是弱排序或高召回低精度；torch probe 好很多，说明有效信息主要来自多层联合权重/形状，而不是简单均值或单阈值。
+- 2026-07-05 追加 train/test 8:2、无验证集 torch probe：
+  - 新目录：`outputs/llava_1_5_7b/COCO500-ffn-injection-visualonly-train80-test20/`，复用同一份 `features.pkl` symlink，重新生成 `image_splits.json`：train/test=`400/100` images，`val=[]`，train-test overlap=`0`。
+  - 实际有 object-token rows 的 split：train=`1198` rows（label 0/1=`621/577`），test=`250` rows（label 0/1=`136/114`）。
+  - 运行命令：`CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/train_torch_probe_feature_sets.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_injection_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-injection-visualonly-train80-test20 --feature-sets ffn_fad ffn_eifdose ffn_logitlift risk_geo_raw visualcosine_raw risk_geo_raw+visualcosine_raw ffn_fad+visualcosine_raw ffn_eifdose+visualcosine_raw ffn_logitlift+visualcosine_raw ffn_eifdose+risk_geo_raw ffn_eifdose+risk_geo_raw+visualcosine_raw --device cuda:0`。
+  - 因 `val=[]`，现有训练脚本会提示 `val split unusable ... using train as val`；因此 checkpoint/epoch 选择在 train 上完成，但最终指标在独立 test split 上评估。
+  - 汇总输出：`outputs/llava_ffn_injection_diagnostic/train80_test20/llava_ffn_injection_torch_probe_summary.md`、`.csv`，并复制 artifacts 到 `outputs/llava_ffn_injection_diagnostic/train80_test20/torch_probe/`。
+  - 结果：`ffn_fad` 单特征 AUC=`0.886481`、F1=`0.798246`；`ffn_eifdose` AUC=`0.883578`、F1=`0.771930`；`ffn_logitlift` AUC=`0.785991`、F1=`0.721030`。
+  - baseline：`risk_geo_raw+visualcosine_raw` AUC=`0.838751`、F1=`0.727273`；单独 `visualcosine_raw` AUC=`0.805018`；单独 `risk_geo_raw` AUC=`0.795472`。
+  - 最佳组合：`ffn_fad+visualcosine_raw` AUC=`0.928083`、F1=`0.841202`、AUPR=`0.915318`；`ffn_eifdose+risk_geo_raw+visualcosine_raw` AUC=`0.902993`、F1=`0.787330`。
+  - 结论：去掉 val/test 重合后，FFN torch probe 仍然很强，且 `ffn_fad` 单特征明显超过 risk/cosine baseline；不过因为无独立 val，模型选择仍建议后续用 train/val/test 三分或固定 epoch 复查。
+- 2026-07-05 追加 risk/cosine 按 label 逐层图：
+  - 按 `outputs/llava_ffn_injection_diagnostic` 中 FFN 图同样方法（每层按 label 求 mean，阴影为 mean±std）绘制 `risk_geo_raw` 与 `visualcosine_raw`。
+  - 输出：`outputs/llava_ffn_injection_diagnostic/llava_risk_geo_raw_by_label.{png,pdf,csv}`、`llava_visualcosine_raw_by_label.{png,pdf,csv}`、`llava_risk_geo_raw_visualcosine_raw_by_label.{png,pdf,csv}`、`llava_risk_geo_visualcosine_summary.md`。
+  - 曲线摘要：`risk_geo_raw` hall/non 平均约 `0.478108/0.450728`，H-N diff_avg=`+0.0273802`；`visualcosine_raw` hall/non 平均约 `0.212542/0.255011`，H-N diff_avg=`-0.0424693`。
+- 2026-07-05 追加 FFN 信号乘以 risk 的逐层图：
+  - 按同样方法绘制逐层 element-wise product：`risk_geo_raw * ffn_fad`、`risk_geo_raw * ffn_eifdose`、`risk_geo_raw * ffn_logitlift`。
+  - 输出：`outputs/llava_ffn_injection_diagnostic/llava_ffn_fad_x_risk_geo_raw_by_label.{png,pdf,csv}`、`llava_ffn_eifdose_x_risk_geo_raw_by_label.{png,pdf,csv}`、`llava_ffn_logitlift_x_risk_geo_raw_by_label.{png,pdf,csv}`、`llava_ffn_x_risk_geo_raw_3features_by_label.{png,pdf,csv}`、`llava_ffn_x_risk_geo_raw_summary.md`。
+  - 曲线摘要：`ffn_fad_x_risk_geo_raw` hall/non 平均约 `0.289963/0.257258`，H-N diff_avg=`+0.0327054`；`ffn_eifdose_x_risk_geo_raw` 约 `0.183119/0.173710`，diff_avg=`+0.00940887`；`ffn_logitlift_x_risk_geo_raw` 约 `0.556280/0.496885`，diff_avg=`+0.0593954`。
+- 2026-07-05 追加“两种 FFN evidence subspace”变体：
+  - 目标：不覆盖旧 `ffn_eifdose` / `dgst_t_ffn_evidence_orthogonal_dose_per_layer`，新增 Raw SVD 与 Centered PCA 两种 evidence subspace，各自输出 EIF Fraction 和 EIF Dose。
+  - 新增 per-layer 字段：`dgst_t_ffn_eif_fraction_svd_per_layer`、`dgst_t_ffn_eif_dose_svd_per_layer`、`dgst_t_ffn_eif_fraction_pca_per_layer`、`dgst_t_ffn_eif_dose_pca_per_layer`。
+  - 新增 layer stats：`ffn_eif_fraction_svd`、`ffn_eif_dose_svd`、`ffn_eif_fraction_pca`、`ffn_eif_dose_pca`、`ffn_evidence_svd_rank_used`、`ffn_evidence_pca_rank_used`。
+  - 训练/绘图 alias：`ffn_eiffrac_svd`、`ffn_eifdose_svd`、`ffn_eiffrac_pca`、`ffn_eifdose_pca`；旧 `ffn_fad`、`ffn_eifdose`、`ffn_logitlift` alias 未改名。
+  - 实现口径：evidence anchors 继续使用 relative-VLL visual target distribution 的 top-K visual tokens，`K=32`、`rank=8`、`eps=1e-8`；anchor state 使用 visual support token 的 `h_mid`。Raw SVD 直接对 `S[K,d]` 做 SVD；Centered PCA 先减去 anchor 均值再 SVD。Fraction 为 `||f_orth||^2/(||O_ffn||^2+eps)`，Dose 为 `||f_orth||/(||h_mid_t||+eps)`，其中 `h_mid_t=prediction_hidden-O_ffn`。
+  - 新增配置/脚本：`configs/model_configs_llava_ffn_evidence_variants_visualonly.yaml`、`scripts/plot_llava_ffn_evidence_variants.py`、`scripts/summarize_llava_ffn_evidence_variants_probe.py`。
+  - 静态检查与小张量测试已通过：
+    - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py features/extractor.py models/dgst_capture.py models/llava_wrapper.py models/qwen_wrapper.py models/internvl_wrapper.py scripts/train_torch_probe_feature_sets.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py scripts/plot_llava_ffn_evidence_variants.py scripts/summarize_llava_ffn_evidence_variants_probe.py scripts/plot_llava_ffn_injection_diagnostic.py scripts/summarize_llava_ffn_injection_probe.py`
+    - inline tensor tests 覆盖：Raw SVD 在 `O_ffn` 落入 anchor span 时 fraction/dose 接近 0、正交时 fraction 接近 1；Centered PCA 使用 `K-1` rank cap；identical anchors 时 PCA rank=0 且 projection 为 0 维子空间；旧 FFN/risk/cosine aliases 仍可解析。
+  - 特征抽取：
+    - smoke：`CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_evidence_variants_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly --device cuda:0 --resume --num-images 2`，生成 10 rows，四个新字段均为 32 层、无 NaN/inf。
+    - full：`CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_evidence_variants_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`。
+    - full 输出：`outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly/features.pkl`，共 1448 object-token rows，labels `{0:757,1:691}`，覆盖 468 张有 object-token row 的图片；四个新字段均为 1448 行、32 层、无 NaN/inf；`ffn_evidence_svd_rank_used` 与 `ffn_evidence_pca_rank_used` 在 46336 个 layer stats 上均为 8。
+    - 新字段全局均值/范围：`eif_fraction_svd` mean=`0.984482`、min/max=`0.447743/0.999761`；`eif_dose_svd` mean=`0.388989`、min/max=`0.128346/1.625233`；`eif_fraction_pca` mean=`0.989467`、min/max=`0.583439/0.999834`；`eif_dose_pca` mean=`0.390497`、min/max=`0.128424/1.637382`。
+  - 曲线输出目录：`outputs/llava_ffn_injection_diagnostic/evidence_variants/`。
+    - 单特征图：`llava_ffn_eif_fraction_svd_by_label.{png,pdf,csv}`、`llava_ffn_eif_dose_svd_by_label.{png,pdf,csv}`、`llava_ffn_eif_fraction_pca_by_label.{png,pdf,csv}`、`llava_ffn_eif_dose_pca_by_label.{png,pdf,csv}`。
+    - 合并图与摘要：`llava_ffn_evidence_variants_4features_by_label.{png,pdf,csv}`、`llava_ffn_evidence_variants_summary.md`。
+    - 曲线摘要：四条新曲线 hall/non 平均差都很小；`ffn_eif_fraction_svd` diff_avg=`+0.001769`，`ffn_eif_dose_svd` diff_avg=`+0.002076`，`ffn_eif_fraction_pca` diff_avg=`+0.001716`，`ffn_eif_dose_pca` diff_avg=`+0.002191`。Fraction 几乎贴近 1，说明 rank=8 visual evidence subspace 对 FFN update 的解释能量很少。
+  - 独立 train/test=8:2 torch probe：
+    - 新目录：`outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly-train80-test20/`，复用完整 `features.pkl` symlink，重新生成 `image_splits.json`：train/test=`400/100` images，`val=[]`，train-test overlap=`0`。
+    - 实际有 object-token rows 的 split：train=`1122` rows、test=`326` rows；feature images 覆盖 train/test=`373/95`。
+    - 运行命令：`CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/train_torch_probe_feature_sets.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_evidence_variants_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-evidence-variants-visualonly-train80-test20 --feature-sets risk_geo_raw visualcosine_raw risk_geo_raw+visualcosine_raw ffn_fad ffn_eifdose ffn_logitlift ffn_eiffrac_svd ffn_eifdose_svd ffn_eiffrac_pca ffn_eifdose_pca ffn_eiffrac_svd+visualcosine_raw ffn_eifdose_svd+visualcosine_raw ffn_eiffrac_pca+visualcosine_raw ffn_eifdose_pca+visualcosine_raw ffn_eiffrac_svd+risk_geo_raw+visualcosine_raw ffn_eifdose_svd+risk_geo_raw+visualcosine_raw ffn_eiffrac_pca+risk_geo_raw+visualcosine_raw ffn_eifdose_pca+risk_geo_raw+visualcosine_raw --device cuda:0`。
+    - 汇总输出：`outputs/llava_ffn_injection_diagnostic/evidence_variants/llava_ffn_evidence_variants_torch_probe_summary.md`、`llava_ffn_evidence_variants_torch_probe.csv`；完整 artifacts 已复制到 `outputs/llava_ffn_injection_diagnostic/evidence_variants/torch_probe/`。
+    - baseline：`risk_geo_raw` AUC/F1=`0.748870/0.658307`，`visualcosine_raw`=`0.778820/0.721408`，`risk_geo_raw+visualcosine_raw`=`0.807904/0.746082`。
+    - 旧 FFN 单项：`ffn_fad` AUC/F1=`0.845577/0.763975`，`ffn_eifdose`=`0.825686/0.714286`，`ffn_logitlift`=`0.756706/0.666667`。
+    - 新单项：最好 AUC 是 `ffn_eifdose_pca` AUC=`0.830018`、F1=`0.708197`；最好 F1 是 `ffn_eiffrac_svd` F1=`0.724036`、AUC=`0.784019`。整体与旧 `ffn_eifdose` 接近，但未超过 `ffn_fad`。
+    - 新 + cosine：最好为 `ffn_eifdose_pca+visualcosine_raw`，AUC/F1=`0.873305/0.788060`；`ffn_eifdose_svd+visualcosine_raw` AUC/F1=`0.867880/0.784884`。
+    - 新 + risk + cosine：最好为 `ffn_eifdose_svd+risk_geo_raw+visualcosine_raw`，AUC/F1/AUPR=`0.882572/0.813953/0.859939`；`ffn_eifdose_pca+risk_geo_raw+visualcosine_raw` AUC/F1=`0.875603/0.808260`。当前新变体的最强组合 F1 明显高于 baseline 与旧 FFN 单项，但 AUC 与旧 injection 最佳组合接近。
+  - 注意：本轮 full extraction 结束仍出现一次 multiprocessing `resource_tracker` leaked semaphore warning；主进程退出码为 0，`features.pkl`、plot 和 torch probe 均成功生成并通过字段检查。由于 `val=[]`，torch probe 的 checkpoint/epoch 选择使用 train split；test split 独立，但严格泛化比较仍建议后续改为 train/val/test 三分或固定 epoch。当前只跑 LLaVA，Qwen/InternVL 还未扩展。
+- 2026-07-05 追加 FFN gate ratio / FGR 方案：
+  - 公式：`a_l = ||O_ffn,t^l|| / (||O_ffn,t^l|| + ||h_mid,t^l|| + eps)`，其中 `h_mid,t^l = prediction_hidden - O_ffn,t^l`；`FGR_l = a_l * risk_geo_raw_l`。
+  - 新增 per-layer 字段：`dgst_t_ffn_gate_ratio_per_layer`、`dgst_t_ffn_fgr_per_layer`；新增 layer stats：`ffn_gate_ratio`、`ffn_fgr`；训练 alias：`ffn_gate`、`ffn_fgr`。已有 `ffn_fad`、`ffn_eifdose`、`ffn_logitlift`、risk/cosine 字段未改名。
+  - 新增配置：`configs/model_configs_llava_ffn_gate_ratio_visualonly.yaml`；输出目录：`outputs/llava_1_5_7b/COCO500-ffn-gate-ratio-visualonly/`。
+  - 静态与小张量检查已通过：
+    - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py features/extractor.py scripts/train_feature_sets.py scripts/train_torch_probe_feature_sets.py`
+    - inline test 验证 `a_l` 数值等于 `||O_ffn||/(||O_ffn||+||h_mid||+eps)`，`ffn_gate`/`ffn_fgr` alias 可解析，fake row 的逐层取值正确。
+  - 特征抽取：
+    - smoke：`CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_gate_ratio_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-gate-ratio-visualonly --device cuda:0 --num-images 2`，10 rows，`a_l`、`FGR`、risk 均为 32 层、无 NaN/inf，`FGR=a_l*risk` 最大误差约 `1e-8`。
+    - full：`CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/extract_features.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_gate_ratio_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-gate-ratio-visualonly --device cuda:0 --feature-devices cuda:0 cuda:1 --resume`。
+    - full 输出：1448 rows，labels `{0:757,1:691}`，覆盖 468 张有 object-token row 的图片；`dgst_t_ffn_gate_ratio_per_layer` 与 `dgst_t_ffn_fgr_per_layer` 均为 1448 行、32 层、无 NaN/inf；`a_l` 范围约 `0.1141~0.6286`，`FGR` 范围约 `0.0102~0.3925`。
+  - 曲线输出：`outputs/llava_ffn_injection_diagnostic/ffn_gate_ratio/llava_ffn_gate_ratio_by_label.{png,pdf,csv}`、`llava_ffn_fgr_by_label.{png,pdf,csv}`、`llava_ffn_gate_ratio_fgr_by_label.{png,pdf,csv}`、`llava_ffn_gate_ratio_fgr_summary.md`。
+  - 曲线摘要：`a_l` hall/non 平均约 `0.273037/0.271746`，H-N diff_avg 约 `+0.001292`，两类几乎重合；`FGR` hall/non 平均约 `0.129074/0.122261`，H-N diff_avg 约 `+0.006813`，peak layer 为第 23 层，H-N gap 约 `+0.017657`。乘以 risk 后曲线分离略增强，但仍弱于之前 `FAD*risk` 的 diff_avg 约 `+0.032705`。
+  - 独立 train/test=8:2 torch probe：
+    - 新目录：`outputs/llava_1_5_7b/COCO500-ffn-gate-ratio-visualonly-train80-test20/`，复用完整 `features.pkl` symlink，`image_splits.json` 为 train/test=`400/100` images，`val=[]`，train-test overlap=`0`。
+    - 实际有 object-token rows 的 split：train=`1122` rows（label 0/1=`589/533`），test=`326` rows（label 0/1=`168/158`），feature images train/test=`373/95`。
+    - 运行命令：`CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python scripts/train_torch_probe_feature_sets.py --model llava_1_5_7b --config configs/model_configs_llava_ffn_gate_ratio_visualonly.yaml --output-dir outputs/llava_1_5_7b/COCO500-ffn-gate-ratio-visualonly-train80-test20 --feature-sets risk_geo_raw visualcosine_raw risk_geo_raw+visualcosine_raw ffn_fad ffn_fad+risk_geo_raw+visualcosine_raw ffn_gate ffn_fgr ffn_gate+risk_geo_raw ffn_fgr+risk_geo_raw ffn_gate+visualcosine_raw ffn_fgr+visualcosine_raw ffn_gate+risk_geo_raw+visualcosine_raw ffn_fgr+risk_geo_raw+visualcosine_raw ffn_gate+ffn_fgr ffn_gate+ffn_fgr+risk_geo_raw ffn_gate+ffn_fgr+risk_geo_raw+visualcosine_raw --device cuda:0`。
+    - 汇总输出：`outputs/llava_ffn_injection_diagnostic/ffn_gate_ratio/llava_ffn_gate_ratio_fgr_torch_probe_summary.md`、`.csv`，完整 artifacts 已复制到 `outputs/llava_ffn_injection_diagnostic/ffn_gate_ratio/torch_probe/`。
+    - baseline：`risk_geo_raw` AUC/F1=`0.748870/0.658307`，`visualcosine_raw`=`0.778820/0.721408`，`risk_geo_raw+visualcosine_raw`=`0.807904/0.746082`；旧强 baseline `ffn_fad` AUC/F1=`0.845577/0.763975`，`ffn_fad+risk_geo_raw+visualcosine_raw`=`0.881028/0.808511`。
+    - 新单项：`ffn_gate` AUC/F1=`0.830885/0.738170`，明显强于 `ffn_fgr` 的 `0.764165/0.716763`；说明直接给 MLP 看 `a_l` 比只看乘积 `a_l*risk` 更有信息。
+    - 新组合：`ffn_gate+risk_geo_raw` AUC/F1=`0.853187/0.771014`，`ffn_fgr+risk_geo_raw`=`0.807452/0.759420`；`ffn_gate+risk_geo_raw+visualcosine_raw` AUC/F1=`0.870630/0.812121`，是本轮新方案 F1 最高组合；`ffn_gate+ffn_fgr+risk_geo_raw+visualcosine_raw` AUC/F1=`0.874548/0.781250`，AUPR=`0.876234`。
+    - 结论：`FGR` 曲线确实比单独 `a_l` 更有可见 H-N gap，但训练上不如保留 `a_l` 与 risk 两个因子分开给 MLP；当前最稳用法是 `ffn_gate + risk_geo_raw + visualcosine_raw`。它相对 `risk_geo_raw+visualcosine_raw` 提升 AUC `+0.062726`、F1 `+0.066040`，但 AUC 仍低于 `ffn_fad+risk_geo_raw+visualcosine_raw` `0.010398`，F1 略高 `0.003611`。
+- 注意事项 / 风险：
+  - full extraction 结束时出现一次 Python multiprocessing `resource_tracker` leaked semaphore warning；`features.pkl` 与后续 plot/probe 均已成功生成，字段检查通过。
+  - 当前 LLaVA 输出目录的 val/test split 重合会让模型选择后的 test 指标偏乐观；严谨比较需要重新生成独立 val/test split 或使用 train-calibrated threshold / fixed score。
+  - 旧 raw capture 不含 `source_attn_states` / `target_unembedding`，只能走兼容 fallback，不能得到真实 FFN injection 值；需要重新 capture/extract 后再分析这些特征。
+  - 当前只完成 LLaVA、一个 COCO500 split；结论应视为首轮证据，后续建议补 Qwen/InternVL 或换 split seed 做稳定性检查。
+- 下一步建议：
+  - 先把 `ffn_fad` 作为单特征强 baseline，`ffn_eifdose+risk_geo_raw+visualcosine_raw` 作为当前最强组合继续跟 `geo/tbar/sbar`、ADS/CGC baseline 对齐比较。
+  - 补一张跨特征 summary 图或表，把 `ffn_fad`、`ffn_eifdose`、`risk_geo_raw`、`visualcosine_raw` 与组合的 AUC/F1 放在同一页，方便论文/汇报使用。
+  - 若扩展到 Qwen/InternVL，优先复用本轮 config 和 scripts，只替换 model/output-dir；不要复用旧 features.pkl 直接训练 FFN injection 特征。

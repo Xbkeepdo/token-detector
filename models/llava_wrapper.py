@@ -15,6 +15,7 @@ from models.dgst_capture import (
     build_dgst_t_raw,
     build_dgst_t_raw_batch,
     hidden_states_from_captures,
+    merged_position_for_tokenized_position,
     pre_token_prediction_positions,
     resolve_prompt_positions,
     run_forward_with_dgst_captures,
@@ -156,6 +157,14 @@ class LLaVAWrapper(BaseLVLMWrapper):
         pred_token_str = self.tokenizer.decode([pred_token_id], skip_special_tokens=False)
         last_logits = out.logits[0, -1].float().cpu()
         dgst_target_id = int(target_token_id) if target_token_id is not None else int(pred_token_id)
+        prompt_positions_override = self._resolve_dgst_prompt_support_positions(
+            full_input_ids=input_ids[0].tolist(),
+            prompt_tokenized_length=prompt_tokenized_length,
+            image_token_id=image_token_id,
+            visual_start=img_start,
+            visual_end=img_end,
+            cfg_dgst_t=cfg_dgst_t,
+        )
         dgst_t_raw = build_dgst_t_raw(
             model=self.model,
             full_input_ids=input_ids[0].tolist(),
@@ -172,6 +181,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 if cfg_dgst_t is not None
                 else "h_mid"
             ),
+            prompt_positions_override=prompt_positions_override,
         )
 
         return ModelOutput(
@@ -242,12 +252,20 @@ class LLaVAWrapper(BaseLVLMWrapper):
 
         expanded_seq_len = int(out.attentions[0].shape[-1])
         visual_token_count = int(img_end - img_start)
-        prompt_positions = resolve_prompt_positions(
+        full_prompt_positions = resolve_prompt_positions(
             full_input_ids=input_ids[0].tolist(),
             prompt_tokenized_length=prompt_tokenized_length,
             image_token_id=image_token_id,
             visual_start=img_start,
             visual_end=img_end,
+        )
+        support_prompt_positions = self._resolve_dgst_prompt_support_positions(
+            full_input_ids=input_ids[0].tolist(),
+            prompt_tokenized_length=prompt_tokenized_length,
+            image_token_id=image_token_id,
+            visual_start=img_start,
+            visual_end=img_end,
+            cfg_dgst_t=cfg_dgst_t,
         )
         prediction_positions = pre_token_prediction_positions(
             full_input_ids=input_ids[0].tolist(),
@@ -255,7 +273,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
             response_token_indices=requested_indices,
             image_token_id=image_token_id,
             visual_token_count=visual_token_count,
-            prompt_positions=prompt_positions,
+            prompt_positions=full_prompt_positions,
         )
         dgst_results = None
         dgst_raws = None
@@ -271,7 +289,9 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 target_token_ids=targets,
                 prediction_positions=prediction_positions,
                 support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+                prompt_positions_override=support_prompt_positions,
                 tau=cfg_dgst_t.get("tau", 0.07),
+                source_distribution_mode=cfg_dgst_t.get("source_distribution_mode", "softmax"),
                 transport_top_k=cfg_dgst_t.get("transport_top_k", 64),
                 cost_mode=cfg_dgst_t.get("cost_mode", "direct"),
                 lambda_d=cfg_dgst_t.get("lambda_d", 1.0),
@@ -294,12 +314,22 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 relative_vll_logit_source=cfg_dgst_t.get("relative_vll_logit_source", "h_mid"),
                 relative_cost_mode=cfg_dgst_t.get("relative_cost_mode"),
                 relative_cost_modes=cfg_dgst_t.get("relative_cost_modes"),
+                relative_cost_state_modes=cfg_dgst_t.get("relative_cost_state_modes"),
+                relative_cost_update_lambdas=cfg_dgst_t.get("relative_cost_update_lambdas"),
                 relative_barrier_lambda=cfg_dgst_t.get("relative_barrier_lambda", 1.0),
                 relative_barrier_margin=cfg_dgst_t.get("relative_barrier_margin", 0.5),
                 relative_barrier_max=cfg_dgst_t.get("relative_barrier_max", 3.0),
                 source_modes=cfg_dgst_t.get("source_modes"),
                 target_attention_gammas=cfg_dgst_t.get("target_attention_gammas"),
                 target_attention_epsilon=cfg_dgst_t.get("target_attention_epsilon", 1e-12),
+                compute_ffn_injection_features=cfg_dgst_t.get("compute_ffn_injection_features", True),
+                ffn_injection_evidence_top_k=cfg_dgst_t.get("ffn_injection_evidence_top_k", 32),
+                ffn_injection_evidence_rank=cfg_dgst_t.get("ffn_injection_evidence_rank", 8),
+                ffn_injection_eps=cfg_dgst_t.get("ffn_injection_eps", 1e-12),
+                compute_dual_scope=cfg_dgst_t.get(
+                    "dgst_t_dual_scope",
+                    cfg_dgst_t.get("compute_dual_scope", False),
+                ),
             )
         else:
             dgst_raws = build_dgst_t_raw_batch(
@@ -314,6 +344,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 prediction_positions=prediction_positions,
                 support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
                 relative_vll_logit_source="h_mid",
+                prompt_positions_override=support_prompt_positions,
             )
 
         outputs: List[ModelOutput] = []
@@ -357,6 +388,85 @@ class LLaVAWrapper(BaseLVLMWrapper):
     def _find_img_range_from_embeds(self, inputs: dict) -> Tuple[int, int]:
         """Fallback: estimate img_start by counting non-image prompt tokens."""
         return 4, 4 + NUM_VISUAL_TOKENS
+
+    def _resolve_dgst_prompt_support_positions(
+        self,
+        *,
+        full_input_ids: Sequence[int],
+        prompt_tokenized_length: int,
+        image_token_id: int,
+        visual_start: int,
+        visual_end: int,
+        cfg_dgst_t: Optional[dict],
+    ) -> list[int] | None:
+        if cfg_dgst_t is None:
+            return None
+        mode = str(
+            cfg_dgst_t.get(
+                "dgst_t_prompt_support_mode",
+                cfg_dgst_t.get("prompt_support_mode", "full"),
+            )
+        ).strip().lower()
+        if mode in {"full", "all", "template"}:
+            return None
+        if mode not in {"user_text", "user", "semantic"}:
+            raise ValueError(
+                "dgst_t_prompt_support_mode must be 'full' or 'user_text', "
+                f"got {mode!r}."
+            )
+
+        user_text = str(
+            cfg_dgst_t.get(
+                "dgst_t_user_prompt_text",
+                cfg_dgst_t.get("user_prompt_text", "Describe this image."),
+            )
+        )
+        prompt_ids = [int(token_id) for token_id in full_input_ids[: int(prompt_tokenized_length)]]
+        span = self._find_user_text_token_span(
+            prompt_ids=prompt_ids,
+            user_text=user_text,
+            image_token_id=int(image_token_id),
+        )
+        visual_count = int(visual_end) - int(visual_start)
+        return [
+            int(
+                merged_position_for_tokenized_position(
+                    full_input_ids=full_input_ids,
+                    tokenized_position=tokenized_position,
+                    image_token_id=int(image_token_id),
+                    visual_token_count=visual_count,
+                )
+            )
+            for tokenized_position in range(span[0], span[1])
+        ]
+
+    def _find_user_text_token_span(
+        self,
+        *,
+        prompt_ids: Sequence[int],
+        user_text: str,
+        image_token_id: int,
+    ) -> tuple[int, int]:
+        target = _normalize_prompt_text(user_text)
+        if not target:
+            raise ValueError("dgst_t_user_prompt_text must be non-empty in user_text mode.")
+        matches: list[tuple[int, int]] = []
+        max_span = min(32, int(len(prompt_ids)))
+        for start in range(int(len(prompt_ids))):
+            for end in range(start + 1, min(int(len(prompt_ids)), start + max_span) + 1):
+                span_ids = [int(token_id) for token_id in prompt_ids[start:end]]
+                if int(image_token_id) in span_ids:
+                    continue
+                decoded = self.tokenizer.decode(span_ids, skip_special_tokens=False)
+                if _normalize_prompt_text(decoded) == target:
+                    matches.append((start, end))
+        if not matches:
+            decoded_prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+            raise ValueError(
+                "Could not locate dgst_t_user_prompt_text in LLaVA prompt tokens: "
+                f"{user_text!r}. Decoded prompt={decoded_prompt!r}"
+            )
+        return min(matches, key=lambda item: (item[1] - item[0], item[0]))
 
     @staticmethod
     def _extract_attention_features(
@@ -446,6 +556,10 @@ def _to_device_dtype(inputs: dict, device: str, dtype: torch.dtype) -> dict:
         else:
             result[key] = value
     return result
+
+
+def _normalize_prompt_text(text: str) -> str:
+    return " ".join(str(text).strip().split())
 
 class LLaVANextWrapper(LLaVAWrapper):
     """Wrapper for LLaVA-Next (1.6) — dynamic resolution variant of LLaVA."""

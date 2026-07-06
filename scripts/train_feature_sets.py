@@ -35,6 +35,9 @@ FEATURE_ALIASES = {
     "visual_prompt_relative_vll_risk": "risk_visual_prompt_relative_vll",
     "risk_visual_prompt_relative_vll_capped_topmass_085": "risk_visual_prompt_relative_vll_capped_topmass_085",
     "visual_prompt_relative_vll_capped_topmass_085": "risk_visual_prompt_relative_vll_capped_topmass_085",
+    "risk_geo_raw": "risk_relative_vll_cost_geo",
+    "risk_geo_cap085": "risk_relative_vll_cost_geo_capped_topmass_085",
+    "risk_geo_capped_topmass_085": "risk_relative_vll_cost_geo_capped_topmass_085",
     "prompt_confidence": "prompt_confidence_top3",
     "prompt_confidence_top3": "prompt_confidence_top3",
     "prompt_confidence_max": "prompt_confidence_max",
@@ -49,10 +52,14 @@ FEATURE_ALIASES = {
     "target_visual_hidden_cosine_capped_topmass_085": "target_visual_hidden_cosine_capped_topmass_085",
     "visual_cosine_relative_vll": "target_visual_hidden_cosine_relative_vll",
     "target_visual_hidden_cosine_relative_vll": "target_visual_hidden_cosine_relative_vll",
+    "visualcosine_raw": "target_visual_hidden_cosine_relative_vll",
+    "cosine_raw": "target_visual_hidden_cosine_relative_vll",
     "visual_cosine_relative_vll_capped_topmass_085": "target_visual_hidden_cosine_relative_vll_capped_topmass_085",
     "target_visual_hidden_cosine_relative_vll_capped_topmass_085": (
         "target_visual_hidden_cosine_relative_vll_capped_topmass_085"
     ),
+    "visualcosine_cap085": "target_visual_hidden_cosine_relative_vll_capped_topmass_085",
+    "cosine_cap085": "target_visual_hidden_cosine_relative_vll_capped_topmass_085",
     "visual_prompt_cosine_visual_prompt_relative_vll": "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll",
     "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll": (
         "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll"
@@ -67,6 +74,40 @@ FEATURE_ALIASES = {
     "target_visual_prompt_hidden_cosine_capped_topmass_085": "target_visual_prompt_hidden_cosine_capped_topmass_085",
     "prompt_last_cosine": "prompt_last_cosine",
     "prompt_mean_cosine": "prompt_mean_cosine",
+    "ffn_fad": "ffn_fad",
+    "fad": "ffn_fad",
+    "ffn_fad_x_risk_geo_raw": "ffn_fad_x_risk_geo_raw",
+    "fad_x_risk_geo_raw": "ffn_fad_x_risk_geo_raw",
+    "risk_geo_raw_x_ffn_fad": "ffn_fad_x_risk_geo_raw",
+    "ffn_fad*risk_geo_raw": "ffn_fad_x_risk_geo_raw",
+    "risk_geo_raw*ffn_fad": "ffn_fad_x_risk_geo_raw",
+    "ffn_gate": "ffn_gate",
+    "ffn_gate_ratio": "ffn_gate",
+    "ffn_update_gate": "ffn_gate",
+    "ffn_a": "ffn_gate",
+    "ffn_al": "ffn_gate",
+    "ffn_fgr": "ffn_fgr",
+    "fgr": "ffn_fgr",
+    "ffn_gate_x_risk_geo_raw": "ffn_fgr",
+    "ffn_gate*risk_geo_raw": "ffn_fgr",
+    "risk_geo_raw*ffn_gate": "ffn_fgr",
+    "ffn_eifdose": "ffn_eifdose",
+    "eifdose": "ffn_eifdose",
+    "ffn_logitlift": "ffn_logitlift",
+    "logitlift": "ffn_logitlift",
+    "ffn_eiffrac_svd": "ffn_eiffrac_svd",
+    "eiffrac_svd": "ffn_eiffrac_svd",
+    "ffn_eifdose_svd": "ffn_eifdose_svd",
+    "eifdose_svd": "ffn_eifdose_svd",
+    "ffn_eifdose_svd_x_risk_geo_raw": "ffn_eifdose_svd_x_risk_geo_raw",
+    "eifdose_svd_x_risk_geo_raw": "ffn_eifdose_svd_x_risk_geo_raw",
+    "risk_geo_raw_x_ffn_eifdose_svd": "ffn_eifdose_svd_x_risk_geo_raw",
+    "ffn_eifdose_svd*risk_geo_raw": "ffn_eifdose_svd_x_risk_geo_raw",
+    "risk_geo_raw*ffn_eifdose_svd": "ffn_eifdose_svd_x_risk_geo_raw",
+    "ffn_eiffrac_pca": "ffn_eiffrac_pca",
+    "eiffrac_pca": "ffn_eiffrac_pca",
+    "ffn_eifdose_pca": "ffn_eifdose_pca",
+    "eifdose_pca": "ffn_eifdose_pca",
     "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine": "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine",
     "risk_capped_topmass_085_times_inverse_target_visual_hidden_cosine": "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine",
     "risk_capped_topmass_085*(1-target_visual_hidden_cosine)": "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine",
@@ -103,6 +144,15 @@ FEATURE_KEYS = {
     "target_visual_prompt_hidden_cosine_capped_topmass_085": "dgst_t_target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer",
     "prompt_last_cosine": "dgst_t_prompt_last_cosine_per_layer",
     "prompt_mean_cosine": "dgst_t_prompt_mean_cosine_per_layer",
+    "ffn_fad": "dgst_t_ffn_attn_dominance_per_layer",
+    "ffn_eifdose": "dgst_t_ffn_evidence_orthogonal_dose_per_layer",
+    "ffn_logitlift": "dgst_t_ffn_logit_lift_per_layer",
+    "ffn_eiffrac_svd": "dgst_t_ffn_eif_fraction_svd_per_layer",
+    "ffn_eifdose_svd": "dgst_t_ffn_eif_dose_svd_per_layer",
+    "ffn_eiffrac_pca": "dgst_t_ffn_eif_fraction_pca_per_layer",
+    "ffn_eifdose_pca": "dgst_t_ffn_eif_dose_pca_per_layer",
+    "ffn_gate": "dgst_t_ffn_gate_ratio_per_layer",
+    "ffn_fgr": "dgst_t_ffn_fgr_per_layer",
 }
 
 LAYER_STAT_KEYS = {
@@ -124,6 +174,15 @@ LAYER_STAT_KEYS = {
     "target_visual_prompt_hidden_cosine_capped_topmass_085": "target_hidden_capped_topmass_085_visual_prompt_cosine",
     "context_confidence": "context_confidence",
     "context_confidence_max_prompt": "context_confidence_max_prompt",
+    "ffn_fad": "ffn_attn_dominance",
+    "ffn_eifdose": "ffn_evidence_orthogonal_dose",
+    "ffn_logitlift": "ffn_logit_lift",
+    "ffn_eiffrac_svd": "ffn_eif_fraction_svd",
+    "ffn_eifdose_svd": "ffn_eif_dose_svd",
+    "ffn_eiffrac_pca": "ffn_eif_fraction_pca",
+    "ffn_eifdose_pca": "ffn_eif_dose_pca",
+    "ffn_gate": "ffn_gate_ratio",
+    "ffn_fgr": "ffn_fgr",
 }
 
 
@@ -183,6 +242,19 @@ def _register_relative_cost_aliases() -> None:
                     ),
                 }
             )
+    for state_slug in (
+        "mid",
+        "out",
+        "avg",
+        "stateupd_lu005",
+        "stateupd_lu01",
+        "stateupd_lu02",
+        "stateupd_lu1",
+    ):
+        for prefix in ("risk_relative_vll", "risk_visual_prompt_relative_vll"):
+            block = f"{prefix}_cost_geo_{state_slug}"
+            FEATURE_ALIASES[block] = block
+            FEATURE_KEYS[block] = f"dgst_t_transport_{prefix}_cost_geo_{state_slug}_per_layer"
 
 
 _register_delta_source_aliases()
@@ -341,6 +413,26 @@ def feature_block(feat: dict, block: str) -> np.ndarray:
                 f"the same shape, got {risk.shape} and {visual.shape}."
             )
         return (risk * (1.0 - visual)).astype(np.float32)
+
+    if block == "ffn_eifdose_svd_x_risk_geo_raw":
+        dose = feature_block(feat, "ffn_eifdose_svd")
+        risk = feature_block(feat, "risk_relative_vll_cost_geo")
+        if dose.shape != risk.shape:
+            raise ValueError(
+                "ffn_eifdose_svd and risk_geo_raw must have the same shape, "
+                f"got {dose.shape} and {risk.shape}."
+            )
+        return (dose * risk).astype(np.float32)
+
+    if block == "ffn_fad_x_risk_geo_raw":
+        fad = feature_block(feat, "ffn_fad")
+        risk = feature_block(feat, "risk_relative_vll_cost_geo")
+        if fad.shape != risk.shape:
+            raise ValueError(
+                "ffn_fad and risk_geo_raw must have the same shape, "
+                f"got {fad.shape} and {risk.shape}."
+            )
+        return (fad * risk).astype(np.float32)
 
     key = FEATURE_KEYS[block]
     values = feat.get(key)

@@ -44,6 +44,20 @@ FEATURE_KEYS = {
     "target_visual_prompt_hidden_cosine_capped_topmass_085": "dgst_t_target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer",
     "context_confidence": "dgst_t_context_confidence_per_layer",
     "context_confidence_max_prompt": "dgst_t_context_confidence_max_prompt_per_layer",
+    "ffn_fad": "dgst_t_ffn_attn_dominance_per_layer",
+    "fad": "dgst_t_ffn_attn_dominance_per_layer",
+    "ffn_eifdose": "dgst_t_ffn_evidence_orthogonal_dose_per_layer",
+    "eifdose": "dgst_t_ffn_evidence_orthogonal_dose_per_layer",
+    "ffn_logitlift": "dgst_t_ffn_logit_lift_per_layer",
+    "logitlift": "dgst_t_ffn_logit_lift_per_layer",
+    "ffn_eiffrac_svd": "dgst_t_ffn_eif_fraction_svd_per_layer",
+    "eiffrac_svd": "dgst_t_ffn_eif_fraction_svd_per_layer",
+    "ffn_eifdose_svd": "dgst_t_ffn_eif_dose_svd_per_layer",
+    "eifdose_svd": "dgst_t_ffn_eif_dose_svd_per_layer",
+    "ffn_eiffrac_pca": "dgst_t_ffn_eif_fraction_pca_per_layer",
+    "eiffrac_pca": "dgst_t_ffn_eif_fraction_pca_per_layer",
+    "ffn_eifdose_pca": "dgst_t_ffn_eif_dose_pca_per_layer",
+    "eifdose_pca": "dgst_t_ffn_eif_dose_pca_per_layer",
 }
 
 
@@ -84,6 +98,18 @@ def _register_relative_cost_aliases() -> None:
                     f"{prefix}_{slug}_capped_topmass_085": cap_key,
                 }
             )
+    for state_slug in (
+        "mid",
+        "out",
+        "avg",
+        "stateupd_lu005",
+        "stateupd_lu01",
+        "stateupd_lu02",
+        "stateupd_lu1",
+    ):
+        for prefix in ("risk_relative_vll", "risk_visual_prompt_relative_vll"):
+            block = f"{prefix}_cost_geo_{state_slug}"
+            FEATURE_KEYS[block] = f"dgst_t_transport_{prefix}_cost_geo_{state_slug}_per_layer"
 
 
 _register_delta_source_aliases()

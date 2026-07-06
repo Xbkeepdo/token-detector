@@ -16,6 +16,7 @@ from models.dgst_capture import (
     resolve_prompt_positions,
     run_forward_with_dgst_captures,
 )
+from models.prompt_support import resolve_prompt_support_positions
 from features.dgst_t import compute_dgst_t_batch_from_captures
 
 IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
@@ -179,6 +180,16 @@ class InternVLWrapper(BaseLVLMWrapper):
         pred_token_str = self.tokenizer.decode([pred_token_id], skip_special_tokens=False)
         last_logits = out.logits[0, -1].float().cpu()
         dgst_target_id = int(target_token_id) if target_token_id is not None else int(pred_token_id)
+        prompt_positions_override = resolve_prompt_support_positions(
+            tokenizer=self.tokenizer,
+            full_input_ids=input_ids[0].tolist(),
+            prompt_tokenized_length=prompt_tokenized_length,
+            image_token_id=int(self._img_ctx_id),
+            visual_start=img_start,
+            visual_end=img_end,
+            cfg_dgst_t=cfg_dgst_t,
+            model_name="InternVL",
+        )
         dgst_t_raw = build_dgst_t_raw(
             model=self.model,
             full_input_ids=input_ids[0].tolist(),
@@ -195,6 +206,7 @@ class InternVLWrapper(BaseLVLMWrapper):
                 if cfg_dgst_t is not None
                 else "h_mid"
             ),
+            prompt_positions_override=prompt_positions_override,
         )
 
         return ModelOutput(
@@ -256,12 +268,22 @@ class InternVLWrapper(BaseLVLMWrapper):
             raise RuntimeError("DGST-T batch extraction requires attention weights; use eager attention.")
 
         seq_len = int(out.attentions[0].shape[-1])
-        prompt_positions = resolve_prompt_positions(
+        full_prompt_positions = resolve_prompt_positions(
             full_input_ids=input_ids[0].tolist(),
             prompt_tokenized_length=prompt_tokenized_length,
             image_token_id=int(self._img_ctx_id),
             visual_start=img_start,
             visual_end=img_end,
+        )
+        support_prompt_positions = resolve_prompt_support_positions(
+            tokenizer=self.tokenizer,
+            full_input_ids=input_ids[0].tolist(),
+            prompt_tokenized_length=prompt_tokenized_length,
+            image_token_id=int(self._img_ctx_id),
+            visual_start=img_start,
+            visual_end=img_end,
+            cfg_dgst_t=cfg_dgst_t,
+            model_name="InternVL",
         )
         prediction_positions = pre_token_prediction_positions(
             full_input_ids=input_ids[0].tolist(),
@@ -269,7 +291,7 @@ class InternVLWrapper(BaseLVLMWrapper):
             response_token_indices=requested_indices,
             image_token_id=int(self._img_ctx_id),
             visual_token_count=int(img_end - img_start),
-            prompt_positions=prompt_positions,
+            prompt_positions=full_prompt_positions,
         )
         dgst_results = None
         dgst_raws = None
@@ -285,7 +307,9 @@ class InternVLWrapper(BaseLVLMWrapper):
                 target_token_ids=targets,
                 prediction_positions=prediction_positions,
                 support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+                prompt_positions_override=support_prompt_positions,
                 tau=cfg_dgst_t.get("tau", 0.07),
+                source_distribution_mode=cfg_dgst_t.get("source_distribution_mode", "softmax"),
                 transport_top_k=cfg_dgst_t.get("transport_top_k", 64),
                 cost_mode=cfg_dgst_t.get("cost_mode", "direct"),
                 lambda_d=cfg_dgst_t.get("lambda_d", 1.0),
@@ -308,12 +332,22 @@ class InternVLWrapper(BaseLVLMWrapper):
                 relative_vll_logit_source=cfg_dgst_t.get("relative_vll_logit_source", "h_mid"),
                 relative_cost_mode=cfg_dgst_t.get("relative_cost_mode"),
                 relative_cost_modes=cfg_dgst_t.get("relative_cost_modes"),
+                relative_cost_state_modes=cfg_dgst_t.get("relative_cost_state_modes"),
+                relative_cost_update_lambdas=cfg_dgst_t.get("relative_cost_update_lambdas"),
                 relative_barrier_lambda=cfg_dgst_t.get("relative_barrier_lambda", 1.0),
                 relative_barrier_margin=cfg_dgst_t.get("relative_barrier_margin", 0.5),
                 relative_barrier_max=cfg_dgst_t.get("relative_barrier_max", 3.0),
                 source_modes=cfg_dgst_t.get("source_modes"),
                 target_attention_gammas=cfg_dgst_t.get("target_attention_gammas"),
                 target_attention_epsilon=cfg_dgst_t.get("target_attention_epsilon", 1e-12),
+                compute_ffn_injection_features=cfg_dgst_t.get("compute_ffn_injection_features", True),
+                ffn_injection_evidence_top_k=cfg_dgst_t.get("ffn_injection_evidence_top_k", 32),
+                ffn_injection_evidence_rank=cfg_dgst_t.get("ffn_injection_evidence_rank", 8),
+                ffn_injection_eps=cfg_dgst_t.get("ffn_injection_eps", 1e-12),
+                compute_dual_scope=cfg_dgst_t.get(
+                    "dgst_t_dual_scope",
+                    cfg_dgst_t.get("compute_dual_scope", False),
+                ),
             )
         else:
             dgst_raws = build_dgst_t_raw_batch(
@@ -328,6 +362,7 @@ class InternVLWrapper(BaseLVLMWrapper):
                 prediction_positions=prediction_positions,
                 support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
                 relative_vll_logit_source="h_mid",
+                prompt_positions_override=support_prompt_positions,
             )
 
         outputs: List[ModelOutput] = []
