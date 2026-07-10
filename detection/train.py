@@ -23,6 +23,11 @@ except ImportError:
 
 from utils.io_utils import load_pkl, save_pkl
 
+LABEL_HALLUCINATED = 0
+LABEL_REAL = 1
+POSITIVE_LABEL = LABEL_REAL
+POSITIVE_CLASS_NAME = "real"
+
 
 def build_feature_matrix(
     features: List[dict],
@@ -158,7 +163,7 @@ def grid_search(
     if len(np.unique(y_train)) < 2:
         raise ValueError(
             f"Training set contains only one class {np.unique(y_train)}. "
-            "Need at least one sample of each class (0=true, 1=hallucinated)."
+            "Need at least one sample of each class (0=hallucinated, 1=real)."
         )
 
     for params in ParameterGrid(param_grid):
@@ -167,13 +172,18 @@ def grid_search(
         y_pred = clf.predict(X_val)
 
         if scoring == "f1":
-            score = f1_score(y_val, y_pred, zero_division=0)
+            score = f1_score(
+                y_val,
+                y_pred,
+                pos_label=POSITIVE_LABEL,
+                zero_division=0,
+            )
         elif scoring == "accuracy":
             score = accuracy_score(y_val, y_pred)
         elif scoring == "auc":
             try:
-                y_prob = clf.predict_proba(X_val)[:, 1]
-                score = roc_auc_score(y_val, y_prob)
+                y_prob = _positive_class_scores(clf, X_val)
+                score = roc_auc_score(_positive_class_targets(y_val), y_prob)
             except Exception:
                 score = -1.0
         else:
@@ -196,17 +206,24 @@ def evaluate_classifier(
     y_pred = clf.predict(X)
 
     try:
-        y_prob = clf.predict_proba(X)[:, 1]
-        auc = roc_auc_score(y, y_prob)
+        y_prob = _positive_class_scores(clf, X)
+        auc = roc_auc_score(_positive_class_targets(y), y_prob)
     except Exception:
         auc = float("nan")
 
     return {
-        "precision": precision_score(y, y_pred, zero_division=0),
-        "recall":    recall_score(y, y_pred, zero_division=0),
-        "f1":        f1_score(y, y_pred, zero_division=0),
+        "precision": precision_score(
+            y, y_pred, pos_label=POSITIVE_LABEL, zero_division=0
+        ),
+        "recall":    recall_score(
+            y, y_pred, pos_label=POSITIVE_LABEL, zero_division=0
+        ),
+        "f1":        f1_score(
+            y, y_pred, pos_label=POSITIVE_LABEL, zero_division=0
+        ),
         "accuracy":  accuracy_score(y, y_pred),
         "auc":       auc,
+        "reported_positive_class": POSITIVE_CLASS_NAME,
     }
 
 
@@ -243,8 +260,8 @@ def train_and_evaluate(
     )
     print(
         f"[Train] Label balance — "
-        f"train: {y_train.mean():.2%} hallucinated, "
-        f"test: {y_test.mean():.2%} hallucinated"
+        f"train: {np.mean(y_train == LABEL_HALLUCINATED):.2%} hallucinated, "
+        f"test: {np.mean(y_test == LABEL_HALLUCINATED):.2%} hallucinated"
     )
 
     if X_train.shape[0] == 0:
@@ -255,7 +272,7 @@ def train_and_evaluate(
     if len(np.unique(y_train)) < 2:
         raise ValueError(
             f"[Train] train split has only one class {np.unique(y_train)}. "
-            "Need both class 0 (true) and class 1 (hallucinated) tokens."
+            "Need both class 0 (hallucinated) and class 1 (real) tokens."
         )
     if X_val.shape[0] == 0 or len(np.unique(y_val)) < 2:
         print(
@@ -330,6 +347,27 @@ def train_and_evaluate(
     print(f"\n[Train] Results saved to {results_path}")
 
     return all_results
+
+
+def _positive_class_targets(labels: np.ndarray) -> np.ndarray:
+    labels = np.asarray(labels, dtype=np.int32)
+    return (labels == POSITIVE_LABEL).astype(np.int32)
+
+
+def _positive_class_scores(clf, X: np.ndarray) -> np.ndarray:
+    if hasattr(clf, "predict_proba"):
+        probs = clf.predict_proba(X)
+        classes = list(getattr(clf, "classes_", []))
+        if POSITIVE_LABEL in classes:
+            return probs[:, classes.index(POSITIVE_LABEL)]
+        return 1.0 - probs[:, -1]
+    if hasattr(clf, "decision_function"):
+        scores = clf.decision_function(X)
+        classes = list(getattr(clf, "classes_", []))
+        if POSITIVE_LABEL in classes and classes.index(POSITIVE_LABEL) == 0:
+            return -np.asarray(scores, dtype=np.float32)
+        return np.asarray(scores, dtype=np.float32)
+    return (clf.predict(X) == POSITIVE_LABEL).astype(np.float32)
 
 
 def _sanitise_grid(grid: dict) -> None:

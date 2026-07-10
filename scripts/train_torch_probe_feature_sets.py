@@ -40,16 +40,8 @@ from utils.io_utils import load_json, load_pkl, save_json
 
 DEFAULT_FEATURE_SETS = [
     "risk",
-    "risk_topmass_085",
-    "risk_capped_topmass_085",
-    "context_confidence",
-    "context_confidence_max_prompt",
-    "target_visual_hidden_cosine",
-    "risk+context_confidence",
-    "risk+context_confidence_max_prompt",
-    "risk+target_visual_hidden_cosine",
-    "prompt_last_cosine",
-    "risk+prompt_last_cosine",
+    "target_cosine",
+    "risk+target_cosine",
 ]
 
 
@@ -57,14 +49,14 @@ DEFAULT_FEATURE_SETS = [
 class TorchProbeConfig:
     hidden_sizes: tuple[int, ...] = (128, 64, 32)
     dropout: float = 0.3
-    batch_size: int = 16
+    batch_size: int = 256
     num_epochs: int = 100
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
     lr_factor: float = 0.5
     lr_patience: int = 5
     seed: int = 42
-    positive_class: str = "hallucination"
+    positive_class: str = "real"
 
 
 class MatrixDataset(Dataset):
@@ -118,7 +110,7 @@ def parse_args():
     parser.add_argument("--config", default="configs/model_configs.yaml")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--feature-sets", nargs="+", default=DEFAULT_FEATURE_SETS)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-epochs", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
@@ -130,9 +122,9 @@ def parse_args():
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--positive-class",
-        choices=["hallucination", "non_hallucination"],
-        default="hallucination",
-        help="Use hallucination for direct comparison with token-detector metrics.",
+        choices=["real", "non_hallucination", "hallucination"],
+        default="real",
+        help="Positive class for PR/RC/F1/AUC. Use real to match the SVAR code.",
     )
     parser.add_argument(
         "--paper-config",
@@ -403,8 +395,8 @@ def _metrics_from_probs(y_true: np.ndarray, probs: np.ndarray, *, positive_class
         "auc": auc,
         "aupr": aupr,
     }
-    if positive_class == "non_hallucination":
-        metrics["reported_positive_class"] = "non_hallucination"
+    if positive_class in ("real", "non_hallucination"):
+        metrics["reported_positive_class"] = "real"
     else:
         metrics["reported_positive_class"] = "hallucination"
     return metrics
@@ -413,8 +405,8 @@ def _metrics_from_probs(y_true: np.ndarray, probs: np.ndarray, *, positive_class
 def _targets_for_positive_class(labels: np.ndarray, positive_class: str) -> np.ndarray:
     labels = np.asarray(labels, dtype=np.int32)
     if positive_class == "hallucination":
-        return labels
-    return 1 - labels
+        return (labels == 0).astype(np.float32)
+    return (labels == 1).astype(np.float32)
 
 
 def _resolve_device(value: str) -> torch.device:

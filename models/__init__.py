@@ -2,6 +2,14 @@
 
 _REGISTRY = {
     "llava_1_5_7b": ("models.llava_wrapper", "LLaVAWrapper"),
+    "llava_onevision_1_5_8b": (
+        "models.llava_onevision_wrapper",
+        "LLaVAOneVisionWrapper",
+    ),
+    "llava_onevision_1_5_8b_instruct": (
+        "models.llava_onevision_wrapper",
+        "LLaVAOneVisionWrapper",
+    ),
     "internvl_2_5_8b": ("models.internvl_wrapper", "InternVLWrapper"),
     "qwen2_5_vl_7b": ("models.qwen_wrapper", "QwenVLWrapper"),
 }

@@ -277,16 +277,74 @@ def _build_feature_record(
         "dgst_t_transport_risk_relative_vll_per_layer",
         "dgst_t_transport_risk_relative_vll_capped_topmass_085_per_layer",
         "dgst_t_target_visual_hidden_cosine_relative_vll_per_layer",
+        "dgst_t_target_visual_hidden_cosine16_relative_vll_per_layer",
         "dgst_t_target_visual_hidden_cosine_relative_vll_capped_topmass_085_per_layer",
+        "dgst_t_target_visual_hpre_cosine_relative_vll_per_layer",
+        "dgst_t_target_visual_hpre_cosine16_relative_vll_per_layer",
+        "dgst_t_target_visual_hpre_cosine_relative_vll_capped_topmass_085_per_layer",
+        "dgst_t_relative_vll_evidence_strength_per_layer",
+        "dgst_t_r_es_relative_vll_cost_geo_per_layer",
         "dgst_t_transport_risk_visual_prompt_relative_vll_per_layer",
         "dgst_t_transport_risk_visual_prompt_relative_vll_capped_topmass_085_per_layer",
         "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer",
+        "dgst_t_target_visual_prompt_hidden_cosine16_visual_prompt_relative_vll_per_layer",
         "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer",
+        "dgst_t_target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_per_layer",
+        "dgst_t_target_visual_prompt_hpre_cosine16_visual_prompt_relative_vll_per_layer",
+        "dgst_t_target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer",
         "dgst_t_visual_prompt_relative_vll_target_visual_mass_per_layer",
         "dgst_t_visual_prompt_relative_vll_target_prompt_mass_per_layer",
+        "dgst_t_visual_prompt_relative_vll_evidence_visual_mass_per_layer",
+        "dgst_t_visual_prompt_relative_vll_evidence_prompt_mass_per_layer",
+        "dgst_t_visual_prompt_relative_vll_evidence_strength_per_layer",
+        "dgst_t_visual_prompt_relative_vll_source_visual_mass_per_layer",
+        "dgst_t_visual_prompt_relative_vll_source_prompt_mass_per_layer",
+        "dgst_t_m_p_per_layer",
+        "dgst_t_c_vp_relative_vll_cost_geo_per_layer",
+        "dgst_t_vv_source_entropy_per_layer",
+        "dgst_t_vv_target_entropy_per_layer",
+        "dgst_t_vv_evidence_entropy_per_layer",
+        "dgst_t_vv_source_topk_entropy_per_layer",
+        "dgst_t_vp_source_entropy_per_layer",
+        "dgst_t_vp_target_entropy_per_layer",
+        "dgst_t_vp_evidence_entropy_per_layer",
+        "dgst_t_vp_source_topk_entropy_per_layer",
     ):
         if key in dgst_t:
             feat[key] = dgst_t[key].tolist()
+    for key in (
+        "dgst_t_vv_support_positions",
+        "dgst_t_vp_support_positions",
+    ):
+        if key in dgst_t:
+            feat[key] = [int(position) for position in dgst_t[key]]
+    for key, value in dgst_t.items():
+        if not key.endswith(
+            (
+                "_capped_topmass_085_support_indices_per_layer",
+                "_capped_topmass_085_support_positions_per_layer",
+            )
+        ):
+            continue
+        feat[key] = [[int(item) for item in layer_values] for layer_values in value]
+    for key in (
+        "dgst_t_vv_attention_dist_per_layer",
+        "dgst_t_vp_attention_dist_per_layer",
+        "dgst_t_vv_support_attention_per_layer",
+        "dgst_t_vp_support_attention_per_layer",
+        "dgst_t_vv_source_dist_per_layer",
+        "dgst_t_vp_source_dist_per_layer",
+        "dgst_t_vv_source_hmid_proj_dist_per_layer",
+        "dgst_t_vp_source_hmid_proj_dist_per_layer",
+        "dgst_t_vv_source_hprev_cos_dist_per_layer",
+        "dgst_t_vp_source_hprev_cos_dist_per_layer",
+        "dgst_t_vv_source_hprev_proj_dist_per_layer",
+        "dgst_t_vp_source_hprev_proj_dist_per_layer",
+        "dgst_t_vv_semantic_gate_per_layer",
+        "dgst_t_vp_semantic_gate_per_layer",
+    ):
+        if key in dgst_t:
+            feat[key] = dgst_t[key].detach().cpu()
     for key, value in dgst_t.items():
         if key in feat:
             continue
@@ -295,8 +353,15 @@ def _build_feature_record(
                 "dgst_t_risk_",
                 "dgst_t_cos_",
                 "dgst_t_transport_risk_",
+                "dgst_t_js_",
+                "dgst_t_kl_",
                 "dgst_t_ffn_",
             ))
+            and key.endswith("_per_layer")
+        ):
+            feat[key] = value.tolist() if hasattr(value, "tolist") else value
+        elif (
+            key.startswith(("dgst_t_vv_", "dgst_t_vp_"))
             and key.endswith("_per_layer")
         ):
             feat[key] = value.tolist() if hasattr(value, "tolist") else value

@@ -23,6 +23,8 @@ from utils.io_utils import load_pkl
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "outputs" / "relative_cost_state_variants_comparison"
+LABEL_HALLUCINATED = 0
+LABEL_REAL = 1
 
 MODELS = {
     "qwen2_5_vl_7b": "Qwen2.5-VL-7B",
@@ -82,7 +84,7 @@ def main() -> None:
                 grouped = _group_by_label(features, key)
                 stats = _stats_by_label(grouped)
                 stats_by_variant[variant] = stats
-                diff = stats[1]["mean"] - stats[0]["mean"]
+                diff = stats[LABEL_HALLUCINATED]["mean"] - stats[LABEL_REAL]["mean"]
                 peak = int(np.argmax(np.abs(diff)))
                 curve_summaries.append(
                     {
@@ -92,16 +94,16 @@ def main() -> None:
                         "mode_label": mode_info["label"],
                         "variant": variant,
                         "variant_label": display,
-                        "n_hallucination": stats[1]["n"],
-                        "n_non_hallucination": stats[0]["n"],
-                        "mean_hallucination": float(stats[1]["mean"].mean()),
-                        "mean_non_hallucination": float(stats[0]["mean"].mean()),
+                        "n_hallucination": stats[LABEL_HALLUCINATED]["n"],
+                        "n_non_hallucination": stats[LABEL_REAL]["n"],
+                        "mean_hallucination": float(stats[LABEL_HALLUCINATED]["mean"].mean()),
+                        "mean_non_hallucination": float(stats[LABEL_REAL]["mean"].mean()),
                         "mean_gap_h_minus_non": float(diff.mean()),
                         "peak_abs_gap_layer": peak,
                         "peak_abs_gap_h_minus_non": float(diff[peak]),
                     }
                 )
-                for layer in range(stats[0]["mean"].shape[0]):
+                for layer in range(stats[LABEL_HALLUCINATED]["mean"].shape[0]):
                     layer_rows.append(
                         {
                             "model": model,
@@ -111,12 +113,12 @@ def main() -> None:
                             "variant": variant,
                             "variant_label": display,
                             "layer": layer,
-                            "n_hallucination": stats[1]["n"],
-                            "n_non_hallucination": stats[0]["n"],
-                            "hallucination_mean": float(stats[1]["mean"][layer]),
-                            "hallucination_sem": float(stats[1]["sem"][layer]),
-                            "non_hallucination_mean": float(stats[0]["mean"][layer]),
-                            "non_hallucination_sem": float(stats[0]["sem"][layer]),
+                            "n_hallucination": stats[LABEL_HALLUCINATED]["n"],
+                            "n_non_hallucination": stats[LABEL_REAL]["n"],
+                            "hallucination_mean": float(stats[LABEL_HALLUCINATED]["mean"][layer]),
+                            "hallucination_sem": float(stats[LABEL_HALLUCINATED]["sem"][layer]),
+                            "non_hallucination_mean": float(stats[LABEL_REAL]["mean"][layer]),
+                            "non_hallucination_sem": float(stats[LABEL_REAL]["sem"][layer]),
                             "gap_h_minus_non": float(diff[layer]),
                         }
                     )
@@ -180,13 +182,13 @@ def _plot_curves(
 ) -> None:
     fig, axes = plt.subplots(2, 4, figsize=(18, 8), sharex=False)
     axes_flat = axes.reshape(-1)
-    class_colors = {1: "#d55e00", 0: "#0072b2"}
-    class_labels = {1: "Hallucination", 0: "Non-hallucination"}
+    class_colors = {LABEL_HALLUCINATED: "#d55e00", LABEL_REAL: "#0072b2"}
+    class_labels = {LABEL_HALLUCINATED: "Hallucination", LABEL_REAL: "Non-hallucination"}
     for index, (variant, display) in enumerate(VARIANTS):
         ax = axes_flat[index]
         stats = stats_by_variant[variant]
-        layers = np.arange(stats[0]["mean"].shape[0])
-        for label in (1, 0):
+        layers = np.arange(stats[LABEL_HALLUCINATED]["mean"].shape[0])
+        for label in (LABEL_HALLUCINATED, LABEL_REAL):
             mean = stats[label]["mean"]
             sem = stats[label]["sem"]
             ax.plot(
@@ -220,8 +222,8 @@ def _plot_gaps(
     ax.axhline(0.0, color="#444444", linewidth=1.0, alpha=0.8)
     for variant, display in VARIANTS:
         stats = stats_by_variant[variant]
-        layers = np.arange(stats[0]["mean"].shape[0])
-        gap = stats[1]["mean"] - stats[0]["mean"]
+        layers = np.arange(stats[LABEL_HALLUCINATED]["mean"].shape[0])
+        gap = stats[LABEL_HALLUCINATED]["mean"] - stats[LABEL_REAL]["mean"]
         ax.plot(layers, gap, color=COLORS[variant], linewidth=2.1, label=display)
     ax.set_title(f"{model_label} {mode_label} raw risk gap")
     ax.set_xlabel("Layer")

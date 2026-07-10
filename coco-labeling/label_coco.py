@@ -21,15 +21,23 @@ from data.coco_loader import load_coco_samples, train_val_split
 from utils.io_utils import load_json, save_json
 
 _CHAIR_PATH = Path(__file__).with_name("coco_chair.py")
-_SPEC = importlib.util.spec_from_file_location("coco_chair", _CHAIR_PATH)
+_CHAIR_MODULE_NAME = "coco_chair"
+_SPEC = importlib.util.spec_from_file_location(_CHAIR_MODULE_NAME, _CHAIR_PATH)
 if _SPEC is None or _SPEC.loader is None:
     raise ImportError(f"Cannot import {_CHAIR_PATH}")
 _CHAIR = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_CHAIR)
+sys.modules[_CHAIR_MODULE_NAME] = _CHAIR
+try:
+    _SPEC.loader.exec_module(_CHAIR)
+except Exception:
+    if sys.modules.get(_CHAIR_MODULE_NAME) is _CHAIR:
+        del sys.modules[_CHAIR_MODULE_NAME]
+    raise
 CocoChairEvaluator = _CHAIR.CocoChairEvaluator
 chair_summary = _CHAIR.chair_summary
-dedupe_mentions_by_object = _CHAIR.dedupe_mentions_by_object
 iter_ground_truth_entries = _CHAIR.iter_ground_truth_entries
+LABEL_HALLUCINATED = _CHAIR.LABEL_HALLUCINATED
+LABEL_REAL = _CHAIR.LABEL_REAL
 
 
 def parse_args():
@@ -95,7 +103,10 @@ def main() -> None:
 
     generations_path = os.path.join(args.output_dir, "generations.json")
     labeling_path = os.path.join(args.output_dir, "labeling.json")
+    generation_shard_dir = os.path.join(args.output_dir, "generation_shards")
     generations = load_json(generations_path) if args.resume and os.path.exists(generations_path) else {}
+    if args.resume:
+        _merge_generation_shards(generations, generation_shard_dir)
 
     if args.caption_file:
         print(f"[COCO-CHAIR] Loading tokenizer for {model_cfg['hf_name']}")
@@ -107,6 +118,7 @@ def main() -> None:
             samples=selected_samples,
             generations=generations,
             generations_path=generations_path,
+            generation_shard_dir=generation_shard_dir,
         )
 
     labeling: dict[str, dict] = {}
@@ -114,29 +126,25 @@ def main() -> None:
         image_id = int(row["image_id"])
         caption = str(row["caption"])
         token_ids = _generation_token_ids(generations, image_id, caption, tokenizer)
+        chair_info = evaluator.compute_chair_token(image_id, caption)
         spans = _chair_token_spans(
             evaluator=evaluator,
             tokenizer=tokenizer,
             image_id=image_id,
             caption=caption,
             token_ids=token_ids,
+            chair_info=chair_info,
         )
-        eval_info = evaluator.evaluate_caption(image_id, caption)
         generations[str(image_id)] = {
             "generated_text": caption,
             "response_token_ids": [int(token_id) for token_id in token_ids],
         }
-        labeling[str(image_id)] = {
-            "image_id": image_id,
-            "generated_text": caption,
-            "hallucinated_words": [
-                span["word"] for span in spans if int(span.get("label", 0)) == 1
-            ],
-            "object_token_spans": spans,
-            "chair_s": eval_info["chair_s"],
-            "chair_i": eval_info["chair_i"],
-            "ground_truth_objects": eval_info["ground_truth_objects"],
-        }
+        labeling[str(image_id)] = _compact_label_entry(
+            image_id=image_id,
+            caption=caption,
+            spans=spans,
+            chair_info=chair_info,
+        )
 
     save_json(generations, generations_path)
     save_json(labeling, labeling_path)
@@ -178,6 +186,7 @@ def _caption_rows_from_generation(
     samples: list[dict],
     generations: dict,
     generations_path: str,
+    generation_shard_dir: str,
 ):
     from models import build_model
 
@@ -201,11 +210,13 @@ def _caption_rows_from_generation(
             model_cfg=model_cfg,
             samples=pending,
             devices=devices,
+            shard_dir=generation_shard_dir,
         ):
             generations[str(image_id)] = {
                 "generated_text": caption,
                 "response_token_ids": [int(token_id) for token_id in token_ids],
             }
+            save_json(generations, generations_path)
         save_json(generations, generations_path)
         tokenizer = _load_tokenizer(model_cfg["hf_name"])
     else:
@@ -231,7 +242,9 @@ def _parallel_generate(
     model_cfg: dict,
     samples: list[dict],
     devices: list[str],
+    shard_dir: str,
 ) -> list[tuple[int, str, list[int]]]:
+    os.makedirs(shard_dir, exist_ok=True)
     chunks = [[] for _ in devices]
     for index, sample in enumerate(samples):
         chunks[index % len(devices)].append(sample)
@@ -239,7 +252,17 @@ def _parallel_generate(
     results = []
     with ctx.Pool(processes=len(devices)) as pool:
         jobs = [
-            pool.apply_async(_generate_worker, (worker_id, model_key, model_cfg, device, chunk))
+            pool.apply_async(
+                _generate_worker,
+                (
+                    worker_id,
+                    model_key,
+                    model_cfg,
+                    device,
+                    chunk,
+                    os.path.join(shard_dir, f"worker_{worker_id}.jsonl"),
+                ),
+            )
             for worker_id, (device, chunk) in enumerate(zip(devices, chunks))
             if chunk
         ]
@@ -254,18 +277,63 @@ def _generate_worker(
     model_cfg: dict,
     device: str,
     samples: list[dict],
+    shard_path: str,
 ) -> list[tuple[int, str, list[int]]]:
     from models import build_model
 
     print(f"[COCO-CHAIR worker {worker_id}] Loading model '{model_key}' on {device}.")
     wrapper = build_model(model_key, model_cfg, device=device)
     rows = []
-    for sample in tqdm(samples, desc=f"Generating worker {worker_id}"):
-        image_id = int(sample["image_id"])
-        image = Image.open(sample["image_path"]).convert("RGB")
-        gen_out = wrapper.generate(image)
-        rows.append((image_id, gen_out.generated_text, [int(token_id) for token_id in gen_out.response_token_ids]))
+    with open(shard_path, "a", encoding="utf-8", buffering=1) as shard_handle:
+        for sample in tqdm(samples, desc=f"Generating worker {worker_id}"):
+            image_id = int(sample["image_id"])
+            image = Image.open(sample["image_path"]).convert("RGB")
+            gen_out = wrapper.generate(image)
+            token_ids = [int(token_id) for token_id in gen_out.response_token_ids]
+            row = (image_id, gen_out.generated_text, token_ids)
+            rows.append(row)
+            shard_handle.write(
+                json.dumps(
+                    {
+                        "image_id": image_id,
+                        "generated_text": gen_out.generated_text,
+                        "response_token_ids": token_ids,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            shard_handle.flush()
     return rows
+
+
+def _merge_generation_shards(generations: dict, shard_dir: str) -> None:
+    path = Path(shard_dir)
+    if not path.exists():
+        return
+    merged = 0
+    for shard_path in sorted(path.glob("*.jsonl")):
+        with shard_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                image_id = int(row["image_id"])
+                caption = str(row.get("generated_text") or row.get("caption") or "")
+                if not caption:
+                    continue
+                generations[str(image_id)] = {
+                    "generated_text": caption,
+                    "response_token_ids": [
+                        int(token_id) for token_id in row.get("response_token_ids", [])
+                    ],
+                }
+                merged += 1
+    if merged:
+        print(f"[COCO-CHAIR] Recovered {merged} generated rows from generation shards.")
 
 
 def _all_generations_available(samples: list[dict], generations: dict) -> bool:
@@ -339,9 +407,11 @@ def _chair_token_spans(
     image_id: int,
     caption: str,
     token_ids: list[int],
+    chair_info: dict | None = None,
 ) -> list[dict]:
-    eval_info = evaluator.evaluate_caption(image_id, caption)
-    mentions = dedupe_mentions_by_object(eval_info["object_mentions"])
+    if chair_info is None:
+        chair_info = evaluator.compute_chair_token(image_id, caption)
+    mentions = chair_info["object_mentions"]
     spans = []
     for mention in mentions:
         char_start = int(mention["char_start"])
@@ -356,14 +426,50 @@ def _chair_token_spans(
             continue
         spans.append(
             {
-                "word": mention["canonical_name"],
+                "word": mention["canonical_object"],
                 "surface": caption[char_start:char_end],
+                "word_idx": int(mention["word_idx"]),
                 "token_indices": list(range(first_idx, first_idx + len(mention_ids))),
-                "label": int(mention.get("hallucinated", 0)),
+                "label": int(mention["label"]),
             }
         )
     spans.sort(key=lambda item: item["token_indices"][0])
     return spans
+
+
+def _compact_label_entry(
+    *,
+    image_id: int,
+    caption: str,
+    spans: list[dict],
+    chair_info: dict,
+) -> dict:
+    object_spans = [
+        {
+            "word": str(span["word"]),
+            "surface": str(span.get("surface", span["word"])),
+            "token_indices": [int(idx) for idx in span.get("token_indices", [])],
+            "word_idx": int(span["word_idx"]),
+            "label": int(span["label"]),
+        }
+        for span in spans
+        if int(span.get("label", -100)) in (LABEL_HALLUCINATED, LABEL_REAL)
+    ]
+    return {
+        "image_id": int(image_id),
+        "generated_text": caption,
+        "hallucinated_words": [
+            span["surface"] for span in object_spans
+            if int(span["label"]) == LABEL_HALLUCINATED
+        ],
+        "real_words": [
+            span["surface"] for span in object_spans
+            if int(span["label"]) == LABEL_REAL
+        ],
+        "object_token_spans": object_spans,
+        "chair_s": int(chair_info["metrics"]["CHAIRs"]),
+        "chair_i": float(chair_info["metrics"]["CHAIRi"]),
+    }
 
 
 def _save_ground_truth(evaluator, splits: dict, path: str) -> None:

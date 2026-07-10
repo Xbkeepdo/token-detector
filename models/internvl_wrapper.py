@@ -103,9 +103,17 @@ class InternVLWrapper(BaseLVLMWrapper):
             response_ids = []
             past_key_values = None
             cur_embeds = input_embeds
-            eos_token_id = self.tokenizer.eos_token_id
+            stop_token_ids = set(_as_token_id_list(self.tokenizer.eos_token_id))
+            im_end_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+            unk_token_id = getattr(self.tokenizer, "unk_token_id", None)
+            if (
+                isinstance(im_end_token_id, int)
+                and im_end_token_id >= 0
+                and im_end_token_id != unk_token_id
+            ):
+                stop_token_ids.add(int(im_end_token_id))
 
-            for _ in range(256):
+            for _ in range(self.generation_max_new_tokens):
                 out = self.model.language_model(
                     inputs_embeds=cur_embeds,
                     past_key_values=past_key_values,
@@ -115,7 +123,7 @@ class InternVLWrapper(BaseLVLMWrapper):
                 past_key_values = out.past_key_values
                 next_token_id = int(out.logits[0, -1].argmax())
                 response_ids.append(next_token_id)
-                if next_token_id == eos_token_id:
+                if next_token_id in stop_token_ids:
                     break
                 cur_embeds = self.model.language_model.get_input_embeddings()(
                     torch.tensor([[next_token_id]], device=self.device)
@@ -503,6 +511,14 @@ def _extract_hidden_states(
         token_list.append(hs[0, -1, :])
         patch_list.append(hs[0, img_start:img_end, :])
     return torch.stack(token_list, 0), torch.stack(patch_list, 0)
+
+
+def _as_token_id_list(token_id_or_ids) -> list[int]:
+    if token_id_or_ids is None:
+        return []
+    if isinstance(token_id_or_ids, int):
+        return [int(token_id_or_ids)]
+    return [int(token_id) for token_id in token_id_or_ids]
 
 
 def _extract_attention_features_at_position(

@@ -15,6 +15,17 @@ def get_model_cfg(config: dict, model_key: str) -> dict:
             f"Model '{model_key}' not found in config. "
             f"Available: {list(config['models'].keys())}"
         )
+    cfg = dict(cfg)
+    experiment = config.get("experiment") or {}
+    scope = experiment.get("dgst_t_support_scope")
+    mode = str(experiment.get("mode", "")).strip().lower()
+    if scope is None:
+        if mode in ("vv", "v", "visual", "visual_only"):
+            scope = "visual"
+        elif mode in ("vp", "visual_prompt", "visual+prompt", "visual_prompt_only"):
+            scope = "visual_prompt"
+    if scope is not None:
+        cfg["dgst_t_support_scope"] = str(scope)
     return cfg
 
 

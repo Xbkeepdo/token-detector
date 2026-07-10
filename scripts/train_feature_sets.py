@@ -35,9 +35,95 @@ FEATURE_ALIASES = {
     "visual_prompt_relative_vll_risk": "risk_visual_prompt_relative_vll",
     "risk_visual_prompt_relative_vll_capped_topmass_085": "risk_visual_prompt_relative_vll_capped_topmass_085",
     "visual_prompt_relative_vll_capped_topmass_085": "risk_visual_prompt_relative_vll_capped_topmass_085",
+    "js_relative_vll": "js_relative_vll",
+    "js_vv": "js_relative_vll",
+    "vv_js": "js_relative_vll",
+    "kl_target_source_relative_vll": "kl_target_source_relative_vll",
+    "kl_target_source_vv": "kl_target_source_relative_vll",
+    "vv_kl_target_source": "kl_target_source_relative_vll",
+    "kl_t_s_relative_vll": "kl_target_source_relative_vll",
+    "kl_source_target_relative_vll": "kl_source_target_relative_vll",
+    "kl_source_target_vv": "kl_source_target_relative_vll",
+    "vv_kl_source_target": "kl_source_target_relative_vll",
+    "kl_s_t_relative_vll": "kl_source_target_relative_vll",
+    "js_visual_prompt_relative_vll": "js_visual_prompt_relative_vll",
+    "js_vp": "js_visual_prompt_relative_vll",
+    "vp_js": "js_visual_prompt_relative_vll",
+    "kl_target_source_visual_prompt_relative_vll": "kl_target_source_visual_prompt_relative_vll",
+    "kl_target_source_vp": "kl_target_source_visual_prompt_relative_vll",
+    "vp_kl_target_source": "kl_target_source_visual_prompt_relative_vll",
+    "kl_t_s_visual_prompt_relative_vll": "kl_target_source_visual_prompt_relative_vll",
+    "kl_source_target_visual_prompt_relative_vll": "kl_source_target_visual_prompt_relative_vll",
+    "kl_source_target_vp": "kl_source_target_visual_prompt_relative_vll",
+    "vp_kl_source_target": "kl_source_target_visual_prompt_relative_vll",
+    "kl_s_t_visual_prompt_relative_vll": "kl_source_target_visual_prompt_relative_vll",
     "risk_geo_raw": "risk_relative_vll_cost_geo",
     "risk_geo_cap085": "risk_relative_vll_cost_geo_capped_topmass_085",
     "risk_geo_capped_topmass_085": "risk_relative_vll_cost_geo_capped_topmass_085",
+    "risk_hmid_proj": "risk_relative_vll_source_hmid_proj",
+    "hmid_proj": "risk_relative_vll_source_hmid_proj",
+    "risk_hprev_cos": "risk_relative_vll_source_hprev_cos",
+    "hprev_cos": "risk_relative_vll_source_hprev_cos",
+    "risk_hprev_proj": "risk_relative_vll_source_hprev_proj",
+    "hprev_proj": "risk_relative_vll_source_hprev_proj",
+    "vp_risk_hmid_proj": "risk_visual_prompt_relative_vll_source_hmid_proj",
+    "vp_hmid_proj": "risk_visual_prompt_relative_vll_source_hmid_proj",
+    "vp_risk_hprev_cos": "risk_visual_prompt_relative_vll_source_hprev_cos",
+    "vp_hprev_cos": "risk_visual_prompt_relative_vll_source_hprev_cos",
+    "vp_risk_hprev_proj": "risk_visual_prompt_relative_vll_source_hprev_proj",
+    "vp_hprev_proj": "risk_visual_prompt_relative_vll_source_hprev_proj",
+    "c_vp": "c_vp",
+    "cvp": "c_vp",
+    "m_p": "m_p",
+    "mp": "m_p",
+    "r_es": "r_es",
+    "res": "r_es",
+    "es": "relative_vll_evidence_strength",
+    "evidence_strength": "relative_vll_evidence_strength",
+    "vv_raw_es": "vv_raw_evidence_strength",
+    "vv_support_es": "vv_raw_evidence_strength",
+    "vv_support_attention_x_semantic_gate": "vv_raw_evidence_strength",
+    "vv_support_attention*semantic_gate": "vv_raw_evidence_strength",
+    "vv_support_attention_times_semantic_gate": "vv_raw_evidence_strength",
+    "vp_es": "visual_prompt_relative_vll_evidence_strength",
+    "vp_evidence_strength": "visual_prompt_relative_vll_evidence_strength",
+    "vp_raw_es": "vp_raw_evidence_strength",
+    "vp_support_es": "vp_raw_evidence_strength",
+    "vp_support_attention_x_semantic_gate": "vp_raw_evidence_strength",
+    "vp_support_attention*semantic_gate": "vp_raw_evidence_strength",
+    "vp_support_attention_times_semantic_gate": "vp_raw_evidence_strength",
+    "vp_raw_ev": "vp_raw_evidence_visual_mass",
+    "vp_raw_evidence_visual_mass": "vp_raw_evidence_visual_mass",
+    "vp_raw_ep": "vp_raw_evidence_prompt_mass",
+    "vp_raw_evidence_prompt_mass": "vp_raw_evidence_prompt_mass",
+    "t_v": "visual_prompt_relative_vll_evidence_visual_mass",
+    "tv": "visual_prompt_relative_vll_evidence_visual_mass",
+    "evidence_visual_mass": "visual_prompt_relative_vll_evidence_visual_mass",
+    "t_p": "visual_prompt_relative_vll_evidence_prompt_mass",
+    "tp": "visual_prompt_relative_vll_evidence_prompt_mass",
+    "evidence_prompt_mass": "visual_prompt_relative_vll_evidence_prompt_mass",
+    "b_v": "visual_prompt_relative_vll_source_visual_mass",
+    "bv": "visual_prompt_relative_vll_source_visual_mass",
+    "source_visual_mass": "visual_prompt_relative_vll_source_visual_mass",
+    "b_p": "visual_prompt_relative_vll_source_prompt_mass",
+    "bp": "visual_prompt_relative_vll_source_prompt_mass",
+    "source_prompt_mass": "visual_prompt_relative_vll_source_prompt_mass",
+    "vv_source_entropy": "vv_source_entropy",
+    "vv_h_source": "vv_source_entropy",
+    "vv_target_entropy": "vv_target_entropy",
+    "vv_h_target": "vv_target_entropy",
+    "vv_evidence_entropy": "vv_evidence_entropy",
+    "vv_h_evidence": "vv_evidence_entropy",
+    "vv_source_topk_entropy": "vv_source_topk_entropy",
+    "vv_h_source_topk": "vv_source_topk_entropy",
+    "vp_source_entropy": "vp_source_entropy",
+    "vp_h_source": "vp_source_entropy",
+    "vp_target_entropy": "vp_target_entropy",
+    "vp_h_target": "vp_target_entropy",
+    "vp_evidence_entropy": "vp_evidence_entropy",
+    "vp_h_evidence": "vp_evidence_entropy",
+    "vp_source_topk_entropy": "vp_source_topk_entropy",
+    "vp_h_source_topk": "vp_source_topk_entropy",
     "prompt_confidence": "prompt_confidence_top3",
     "prompt_confidence_top3": "prompt_confidence_top3",
     "prompt_confidence_max": "prompt_confidence_max",
@@ -54,6 +140,56 @@ FEATURE_ALIASES = {
     "target_visual_hidden_cosine_relative_vll": "target_visual_hidden_cosine_relative_vll",
     "visualcosine_raw": "target_visual_hidden_cosine_relative_vll",
     "cosine_raw": "target_visual_hidden_cosine_relative_vll",
+    "hprecosine": "target_visual_hpre_cosine_relative_vll",
+    "hpre_cosine": "target_visual_hpre_cosine_relative_vll",
+    "hprecosine_raw": "target_visual_hpre_cosine_relative_vll",
+    "visual_hpre_cosine": "target_visual_hpre_cosine_relative_vll",
+    "target_visual_hpre_cosine": "target_visual_hpre_cosine_relative_vll",
+    "target_visual_hpre_cosine_relative_vll": "target_visual_hpre_cosine_relative_vll",
+    "hprecosine16": "target_visual_hpre_cosine16_relative_vll",
+    "hpre_cosine16": "target_visual_hpre_cosine16_relative_vll",
+    "visual_hpre_cosine16": "target_visual_hpre_cosine16_relative_vll",
+    "target_visual_hpre_cosine16": "target_visual_hpre_cosine16_relative_vll",
+    "target_visual_hpre_cosine16_relative_vll": "target_visual_hpre_cosine16_relative_vll",
+    "hprecosine_cap085": "target_visual_hpre_cosine_relative_vll_capped_topmass_085",
+    "hpre_cosine_cap085": "target_visual_hpre_cosine_relative_vll_capped_topmass_085",
+    "target_visual_hpre_cosine_relative_vll_capped_topmass_085": (
+        "target_visual_hpre_cosine_relative_vll_capped_topmass_085"
+    ),
+    "pingyi_cosine": "target_visual_hidden_cosine_relative_vll_shift1",
+    "shifted_cosine": "target_visual_hidden_cosine_relative_vll_shift1",
+    "visualcosine_pingyi": "target_visual_hidden_cosine_relative_vll_shift1",
+    "visualcosine_shift1": "target_visual_hidden_cosine_relative_vll_shift1",
+    "target_cosine_pingyi": "target_visual_hidden_cosine_relative_vll_shift1",
+    "target_cosine_shift1": "target_visual_hidden_cosine_relative_vll_shift1",
+    "target_cosine": "target_cosine",
+    "targetcosine": "target_cosine",
+    "cosine16": "cosine16",
+    "target_cosine16": "cosine16",
+    "visualcosine16_raw": "cosine16",
+    "vp_target_cosine": "vp_target_cosine",
+    "visual_prompt_target_cosine": "vp_target_cosine",
+    "vp_hprecosine": "vp_hpre_cosine",
+    "vp_hpre_cosine": "vp_hpre_cosine",
+    "visual_prompt_hpre_cosine": "vp_hpre_cosine",
+    "target_visual_prompt_hpre_cosine": "vp_hpre_cosine",
+    "target_visual_prompt_hpre_cosine_visual_prompt_relative_vll": "vp_hpre_cosine",
+    "vp_hprecosine16": "vp_hpre_cosine16",
+    "vp_hpre_cosine16": "vp_hpre_cosine16",
+    "visual_prompt_hpre_cosine16": "vp_hpre_cosine16",
+    "target_visual_prompt_hpre_cosine16": "vp_hpre_cosine16",
+    "target_visual_prompt_hpre_cosine16_visual_prompt_relative_vll": "vp_hpre_cosine16",
+    "vp_hprecosine_cap085": "target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_capped_topmass_085",
+    "vp_hpre_cosine_cap085": "target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_capped_topmass_085",
+    "target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_capped_topmass_085": (
+        "target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_capped_topmass_085"
+    ),
+    "vp_pingyi_cosine": "vp_target_cosine_shift1",
+    "vp_shifted_cosine": "vp_target_cosine_shift1",
+    "vp_target_cosine_pingyi": "vp_target_cosine_shift1",
+    "vp_target_cosine_shift1": "vp_target_cosine_shift1",
+    "vp_cosine16": "vp_cosine16",
+    "visual_prompt_cosine16": "vp_cosine16",
     "visual_cosine_relative_vll_capped_topmass_085": "target_visual_hidden_cosine_relative_vll_capped_topmass_085",
     "target_visual_hidden_cosine_relative_vll_capped_topmass_085": (
         "target_visual_hidden_cosine_relative_vll_capped_topmass_085"
@@ -124,6 +260,65 @@ FEATURE_KEYS = {
     "risk_visual_prompt_relative_vll_capped_topmass_085": (
         "dgst_t_transport_risk_visual_prompt_relative_vll_capped_topmass_085_per_layer"
     ),
+    "risk_relative_vll_source_hmid_proj": (
+        "dgst_t_transport_risk_relative_vll_source_hmid_proj_per_layer"
+    ),
+    "risk_relative_vll_source_hprev_cos": (
+        "dgst_t_transport_risk_relative_vll_source_hprev_cos_per_layer"
+    ),
+    "risk_relative_vll_source_hprev_proj": (
+        "dgst_t_transport_risk_relative_vll_source_hprev_proj_per_layer"
+    ),
+    "risk_visual_prompt_relative_vll_source_hprev_cos": (
+        "dgst_t_transport_risk_visual_prompt_relative_vll_source_hprev_cos_per_layer"
+    ),
+    "risk_visual_prompt_relative_vll_source_hmid_proj": (
+        "dgst_t_transport_risk_visual_prompt_relative_vll_source_hmid_proj_per_layer"
+    ),
+    "risk_visual_prompt_relative_vll_source_hprev_proj": (
+        "dgst_t_transport_risk_visual_prompt_relative_vll_source_hprev_proj_per_layer"
+    ),
+    "c_vp": "dgst_t_c_vp_relative_vll_cost_geo_per_layer",
+    "m_p": "dgst_t_m_p_per_layer",
+    "r_es": "dgst_t_r_es_relative_vll_cost_geo_per_layer",
+    "relative_vll_evidence_strength": "dgst_t_relative_vll_evidence_strength_per_layer",
+    "vv_raw_evidence_strength": "dgst_t_vv_raw_evidence_strength_per_layer",
+    "visual_prompt_relative_vll_evidence_strength": (
+        "dgst_t_visual_prompt_relative_vll_evidence_strength_per_layer"
+    ),
+    "vp_raw_evidence_strength": "dgst_t_vp_raw_evidence_strength_per_layer",
+    "vp_raw_evidence_visual_mass": "dgst_t_vp_raw_evidence_visual_mass_per_layer",
+    "vp_raw_evidence_prompt_mass": "dgst_t_vp_raw_evidence_prompt_mass_per_layer",
+    "visual_prompt_relative_vll_evidence_visual_mass": (
+        "dgst_t_visual_prompt_relative_vll_evidence_visual_mass_per_layer"
+    ),
+    "visual_prompt_relative_vll_evidence_prompt_mass": (
+        "dgst_t_visual_prompt_relative_vll_evidence_prompt_mass_per_layer"
+    ),
+    "visual_prompt_relative_vll_source_visual_mass": (
+        "dgst_t_visual_prompt_relative_vll_source_visual_mass_per_layer"
+    ),
+    "visual_prompt_relative_vll_source_prompt_mass": (
+        "dgst_t_visual_prompt_relative_vll_source_prompt_mass_per_layer"
+    ),
+    "vv_source_entropy": "dgst_t_vv_source_entropy_per_layer",
+    "vv_target_entropy": "dgst_t_vv_target_entropy_per_layer",
+    "vv_evidence_entropy": "dgst_t_vv_evidence_entropy_per_layer",
+    "vv_source_topk_entropy": "dgst_t_vv_source_topk_entropy_per_layer",
+    "vp_source_entropy": "dgst_t_vp_source_entropy_per_layer",
+    "vp_target_entropy": "dgst_t_vp_target_entropy_per_layer",
+    "vp_evidence_entropy": "dgst_t_vp_evidence_entropy_per_layer",
+    "vp_source_topk_entropy": "dgst_t_vp_source_topk_entropy_per_layer",
+    "js_relative_vll": "dgst_t_js_relative_vll_per_layer",
+    "kl_target_source_relative_vll": "dgst_t_kl_target_source_relative_vll_per_layer",
+    "kl_source_target_relative_vll": "dgst_t_kl_source_target_relative_vll_per_layer",
+    "js_visual_prompt_relative_vll": "dgst_t_js_visual_prompt_relative_vll_per_layer",
+    "kl_target_source_visual_prompt_relative_vll": (
+        "dgst_t_kl_target_source_visual_prompt_relative_vll_per_layer"
+    ),
+    "kl_source_target_visual_prompt_relative_vll": (
+        "dgst_t_kl_source_target_visual_prompt_relative_vll_per_layer"
+    ),
     "prompt_confidence_top3": "dgst_t_prompt_confidence_top3_per_layer",
     "prompt_confidence_max": "dgst_t_prompt_confidence_max_per_layer",
     "context_confidence": "dgst_t_context_confidence_per_layer",
@@ -132,14 +327,39 @@ FEATURE_KEYS = {
     "target_visual_prompt_hidden_cosine": "dgst_t_target_visual_prompt_hidden_cosine_per_layer",
     "target_visual_hidden_cosine_capped_topmass_085": "dgst_t_target_visual_hidden_cosine_capped_topmass_085_per_layer",
     "target_visual_hidden_cosine_relative_vll": "dgst_t_target_visual_hidden_cosine_relative_vll_per_layer",
+    "cosine16": "dgst_t_target_visual_hidden_cosine16_relative_vll_per_layer",
+    "target_visual_hpre_cosine_relative_vll": (
+        "dgst_t_target_visual_hpre_cosine_relative_vll_per_layer"
+    ),
+    "target_visual_hpre_cosine16_relative_vll": (
+        "dgst_t_target_visual_hpre_cosine16_relative_vll_per_layer"
+    ),
     "target_visual_hidden_cosine_relative_vll_capped_topmass_085": (
         "dgst_t_target_visual_hidden_cosine_relative_vll_capped_topmass_085_per_layer"
+    ),
+    "target_visual_hpre_cosine_relative_vll_capped_topmass_085": (
+        "dgst_t_target_visual_hpre_cosine_relative_vll_capped_topmass_085_per_layer"
     ),
     "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll": (
         "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer"
     ),
+    "vp_target_cosine": (
+        "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_per_layer"
+    ),
+    "vp_cosine16": (
+        "dgst_t_target_visual_prompt_hidden_cosine16_visual_prompt_relative_vll_per_layer"
+    ),
+    "vp_hpre_cosine": (
+        "dgst_t_target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_per_layer"
+    ),
+    "vp_hpre_cosine16": (
+        "dgst_t_target_visual_prompt_hpre_cosine16_visual_prompt_relative_vll_per_layer"
+    ),
     "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085": (
         "dgst_t_target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer"
+    ),
+    "target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_capped_topmass_085": (
+        "dgst_t_target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer"
     ),
     "target_visual_prompt_hidden_cosine_capped_topmass_085": "dgst_t_target_visual_prompt_hidden_cosine_capped_topmass_085_per_layer",
     "prompt_last_cosine": "dgst_t_prompt_last_cosine_per_layer",
@@ -162,14 +382,24 @@ LAYER_STAT_KEYS = {
     "target_visual_prompt_hidden_cosine": "target_hidden_top32_visual_prompt_cosine",
     "target_visual_hidden_cosine_capped_topmass_085": "target_hidden_capped_topmass_085_visual_cosine",
     "target_visual_hidden_cosine_relative_vll": "target_hidden_top32_visual_cosine_relative_vll",
+    "target_visual_hpre_cosine_relative_vll": "target_hpre_top32_visual_cosine_relative_vll",
     "target_visual_hidden_cosine_relative_vll_capped_topmass_085": (
         "target_hidden_capped_topmass_085_visual_cosine_relative_vll"
+    ),
+    "target_visual_hpre_cosine_relative_vll_capped_topmass_085": (
+        "target_hpre_capped_topmass_085_visual_cosine_relative_vll"
     ),
     "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll": (
         "target_hidden_top32_visual_prompt_cosine_visual_prompt_relative_vll"
     ),
+    "vp_hpre_cosine": (
+        "target_hpre_top32_visual_prompt_cosine_visual_prompt_relative_vll"
+    ),
     "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll_capped_topmass_085": (
         "target_hidden_capped_topmass_085_visual_prompt_cosine_visual_prompt_relative_vll"
+    ),
+    "target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_capped_topmass_085": (
+        "target_hpre_capped_topmass_085_visual_prompt_cosine_visual_prompt_relative_vll"
     ),
     "target_visual_prompt_hidden_cosine_capped_topmass_085": "target_hidden_capped_topmass_085_visual_prompt_cosine",
     "context_confidence": "context_confidence",
@@ -220,7 +450,7 @@ def _register_delta_source_aliases() -> None:
 
 
 def _register_relative_cost_aliases() -> None:
-    for slug in ("geo", "tbar", "sbar", "tadd", "sadd", "tsadd"):
+    for slug in ("geo", "tbar", "sbar", "tadd", "sadd", "tsadd", "qmatch"):
         for prefix in ("risk_relative_vll", "risk_visual_prompt_relative_vll"):
             block = f"{prefix}_cost_{slug}"
             cap_block = f"{block}_capped_topmass_085"
@@ -257,8 +487,53 @@ def _register_relative_cost_aliases() -> None:
             FEATURE_KEYS[block] = f"dgst_t_transport_{prefix}_cost_geo_{state_slug}_per_layer"
 
 
+def _register_topk_region_aliases() -> None:
+    source_specs = (
+        ("", ("",)),
+        ("hmid_proj", ("hmid_proj", "hmid")),
+        ("hprev_cos", ("hprev_cos", "hpre_cos")),
+        ("hprev_proj", ("hprev_proj", "hpre_proj")),
+    )
+    stat_names = ("skm", "tkm", "cov_st", "es")
+    selectors = ("union", "rec", "target")
+    variants = ("lk", "", "la", "lp")
+
+    for scope in ("vv", "vp"):
+        for source_key, source_aliases in source_specs:
+            stem = f"dgst_t_{scope}"
+            alias_middle = ""
+            if source_key:
+                stem = f"{stem}_source_{source_key}"
+                alias_middle = f"_{source_key}"
+            for stat in stat_names:
+                block = f"{scope}{alias_middle}_topk_{stat}"
+                key = f"{stem}_topk_{stat}_per_layer"
+                FEATURE_ALIASES[block] = block
+                FEATURE_KEYS[block] = key
+                if scope == "vv" and not source_key:
+                    FEATURE_ALIASES[f"topk_{stat}"] = block
+                for source_alias in source_aliases:
+                    if source_alias:
+                        alias = f"{scope}_{source_alias}_topk_{stat}"
+                        FEATURE_ALIASES[alias] = block
+            for selector in selectors:
+                for variant in variants:
+                    suffix = f"_{variant}" if variant else ""
+                    block = f"{scope}{alias_middle}_r_{selector}{suffix}"
+                    key = f"{stem}_r_{selector}{suffix}_per_layer"
+                    FEATURE_ALIASES[block] = block
+                    FEATURE_KEYS[block] = key
+                    if scope == "vv" and not source_key:
+                        FEATURE_ALIASES[f"r_{selector}{suffix}"] = block
+                    for source_alias in source_aliases:
+                        if source_alias:
+                            alias = f"{scope}_{source_alias}_r_{selector}{suffix}"
+                            FEATURE_ALIASES[alias] = block
+
+
 _register_delta_source_aliases()
 _register_relative_cost_aliases()
+_register_topk_region_aliases()
 
 
 def parse_args():
@@ -271,14 +546,8 @@ def parse_args():
         nargs="+",
         default=[
             "risk",
-            "risk_topmass_085",
-            "risk_capped_topmass_085",
-            "context_confidence",
-            "context_confidence_max_prompt",
-            "target_visual_hidden_cosine",
-            "risk+context_confidence",
-            "risk+context_confidence_max_prompt",
-            "risk+target_visual_hidden_cosine",
+            "target_cosine",
+            "risk+target_cosine",
         ],
         help="Feature blocks to concatenate, e.g. risk+context_confidence.",
     )
@@ -404,6 +673,28 @@ def build_selected_matrix(features: Sequence[dict], blocks: Sequence[str]) -> tu
 
 
 def feature_block(feat: dict, block: str) -> np.ndarray:
+    if block == "target_visual_hidden_cosine_relative_vll_shift1":
+        return _shift_right_one_layer(feature_block(feat, "target_visual_hidden_cosine_relative_vll"))
+
+    if block == "vp_target_cosine_shift1":
+        return _shift_right_one_layer(feature_block(feat, "vp_target_cosine"))
+
+    if block == "target_cosine":
+        for key in (
+            "dgst_t_target_visual_hidden_cosine_relative_vll_per_layer",
+            "dgst_t_target_visual_hidden_cosine_per_layer",
+            "dgst_t_atarget_visual_cosine_per_layer",
+        ):
+            values = feat.get(key)
+            if values is not None:
+                return np.asarray(values, dtype=np.float32).reshape(-1)
+        raise KeyError(
+            "Feature block 'target_cosine' requires one of "
+            "dgst_t_target_visual_hidden_cosine_relative_vll_per_layer, "
+            "dgst_t_target_visual_hidden_cosine_per_layer, or "
+            "dgst_t_atarget_visual_cosine_per_layer."
+        )
+
     if block == "risk_capped_topmass_085_x_1_minus_target_visual_hidden_cosine":
         risk = feature_block(feat, "risk_capped_topmass_085")
         visual = feature_block(feat, "target_visual_hidden_cosine")
@@ -434,6 +725,25 @@ def feature_block(feat: dict, block: str) -> np.ndarray:
             )
         return (fad * risk).astype(np.float32)
 
+    if block == "vv_raw_evidence_strength":
+        values = feat.get(FEATURE_KEYS[block])
+        if values is not None:
+            return np.asarray(values, dtype=np.float32).reshape(-1)
+        evidence = feature_block(feat, "relative_vll_evidence_strength")
+        alpha_img = feat.get("alpha_img_per_layer")
+        if alpha_img is None:
+            raise KeyError(
+                "Feature block 'vv_raw_evidence_strength' requires either "
+                "'dgst_t_vv_raw_evidence_strength_per_layer' or 'alpha_img_per_layer'."
+            )
+        alpha = np.asarray(alpha_img, dtype=np.float32).reshape(-1)
+        if evidence.shape != alpha.shape:
+            raise ValueError(
+                "relative_vll_evidence_strength and alpha_img_per_layer must have "
+                f"the same shape, got {evidence.shape} and {alpha.shape}."
+            )
+        return (evidence * alpha).astype(np.float32)
+
     key = FEATURE_KEYS[block]
     values = feat.get(key)
     if values is None and block == "risk":
@@ -445,6 +755,16 @@ def feature_block(feat: dict, block: str) -> np.ndarray:
     if values is None:
         raise KeyError(f"Feature block {block!r} requires missing key {key!r}.")
     return np.asarray(values, dtype=np.float32).reshape(-1)
+
+
+def _shift_right_one_layer(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        return values
+    shifted = np.empty_like(values)
+    shifted[0] = 0.0
+    shifted[1:] = values[:-1]
+    return shifted
 
 
 def _sanitise_grid(grid: dict) -> None:

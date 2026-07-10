@@ -45,8 +45,8 @@ FEATURES = [
 ]
 
 LABEL_NAMES = {
-    0: "non_hallucination",
-    1: "hallucination",
+    0: "hallucination",
+    1: "non_hallucination",
 }
 
 LABEL_COLORS = {

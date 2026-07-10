@@ -73,7 +73,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 do_sample=False,
                 temperature=self.cfg["temperature"],
                 top_p=self.cfg["top_p"],
-                max_new_tokens=256,
+                max_new_tokens=self.generation_max_new_tokens,
             )
 
         prompt_len = inputs["input_ids"].shape[1]

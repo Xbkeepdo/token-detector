@@ -62,17 +62,16 @@ feature_extraction:
     ot_solver: "emd"
     atarget_visual_top_k: 32
     compute_topmass_085: false
-    compute_capped_topmass_085: true
-    topmass_085_alpha: 0.85
-    capped_topmass_085_alpha: 0.85
-    capped_topmass_085_min_k: 32
-    capped_topmass_085_max_k: 64
+    compute_capped_topmass_085: false
     target_gate_mode: "dual"
     relative_vll_mad_epsilon: 1.0e-6
     relative_vll_logit_source: "h_mid"
-    source_modes: ["legacy_ffn", "delta_src"]
-    target_attention_gammas: [0.0, 0.5, 1.0]
-    target_attention_epsilon: 1.0e-12
+    relative_cost_mode: "geo"
+    relative_barrier_lambda: 1.0
+    relative_barrier_margin: 0.5
+    relative_barrier_max: 3.0
+    dgst_t_dual_scope: true
+    compute_ffn_injection_features: false
 
 dataset:
   coco_root: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco"

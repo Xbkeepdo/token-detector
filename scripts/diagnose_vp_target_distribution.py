@@ -23,7 +23,7 @@ from PIL import Image
 
 from data.coco_loader import load_coco_samples
 from features.dgst_t import (
-    _relative_vll_target_distribution,
+    _relative_vll_evidence_signal,
     _renormalize,
     _source_distribution,
     _topk_union_indices,
@@ -151,7 +151,7 @@ def _select_cases(
         if image_id not in sample_by_id:
             continue
         spans = labels[image_id].get("object_token_spans") or []
-        hall_span = next((span for span in spans if int(span.get("label", 0)) == 1), None)
+        hall_span = next((span for span in spans if int(span.get("label", 1)) == 0), None)
         non_span = next((span for span in spans if int(span.get("label", 0)) == 0), None)
         if hall_span is not None:
             hall_cases.append(_case_from_span(image_id, sample_by_id[image_id], labels[image_id], hall_span))
@@ -243,8 +243,8 @@ def _diagnose_case(
             target_token_ids=[target_token_id],
             chunk_size=128,
         )[:, 0]
-        target_vp, gate_vp, barrier_vp, stats_vp = _relative_vll_target_distribution(
-            attention_dist=attention_dist,
+        target_vp, gate_vp, barrier_vp, stats_vp = _relative_vll_evidence_signal(
+            attention_signal=support_attention.float(),
             target_logits=target_logits,
             support_positions=support_positions,
             visual_start=context["visual_start"],
@@ -255,8 +255,8 @@ def _diagnose_case(
             barrier_margin=float(dgst_cfg.get("relative_barrier_margin", 0.5)),
             barrier_max=float(dgst_cfg.get("relative_barrier_max", 3.0)),
         )
-        target_v, _gate_v, _barrier_v, stats_v = _relative_vll_target_distribution(
-            attention_dist=attention_dist,
+        target_v, _gate_v, _barrier_v, stats_v = _relative_vll_evidence_signal(
+            attention_signal=support_attention.float(),
             target_logits=target_logits,
             support_positions=support_positions,
             visual_start=context["visual_start"],

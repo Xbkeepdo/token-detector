@@ -34,6 +34,8 @@ VARIANTS = [
     ("full_prompt", "Full prompt VP", BASELINE_DIR),
     ("user_prompt_only", "User prompt only VP", USERPROMPT_DIR),
 ]
+LABEL_HALLUCINATED = 0
+LABEL_REAL = 1
 
 
 def main() -> None:
@@ -51,24 +53,34 @@ def main() -> None:
                     "variant": slug,
                     "variant_label": label,
                     "layer": layer,
-                    "n_hallucination": row[1]["n"],
-                    "n_non_hallucination": row[0]["n"],
-                    "hallucination_mean": row[1]["mean"],
-                    "hallucination_sem": row[1]["sem"],
-                    "non_hallucination_mean": row[0]["mean"],
-                    "non_hallucination_sem": row[0]["sem"],
-                    "gap_h_minus_non": row[1]["mean"] - row[0]["mean"],
+                    "n_hallucination": row[LABEL_HALLUCINATED]["n"],
+                    "n_non_hallucination": row[LABEL_REAL]["n"],
+                    "hallucination_mean": row[LABEL_HALLUCINATED]["mean"],
+                    "hallucination_sem": row[LABEL_HALLUCINATED]["sem"],
+                    "non_hallucination_mean": row[LABEL_REAL]["mean"],
+                    "non_hallucination_sem": row[LABEL_REAL]["sem"],
+                    "gap_h_minus_non": row[LABEL_HALLUCINATED]["mean"] - row[LABEL_REAL]["mean"],
                 }
             )
-        gaps = np.array([row[1]["mean"] - row[0]["mean"] for row in stats], dtype=np.float64)
+        gaps = np.array(
+            [
+                row[LABEL_HALLUCINATED]["mean"] - row[LABEL_REAL]["mean"]
+                for row in stats
+            ],
+            dtype=np.float64,
+        )
         curve_rows.append(
             {
                 "variant": slug,
                 "variant_label": label,
-                "n_hallucination": stats[0][1]["n"],
-                "n_non_hallucination": stats[0][0]["n"],
-                "mean_hallucination": float(np.mean([row[1]["mean"] for row in stats])),
-                "mean_non_hallucination": float(np.mean([row[0]["mean"] for row in stats])),
+                "n_hallucination": stats[0][LABEL_HALLUCINATED]["n"],
+                "n_non_hallucination": stats[0][LABEL_REAL]["n"],
+                "mean_hallucination": float(
+                    np.mean([row[LABEL_HALLUCINATED]["mean"] for row in stats])
+                ),
+                "mean_non_hallucination": float(
+                    np.mean([row[LABEL_REAL]["mean"] for row in stats])
+                ),
                 "mean_gap_h_minus_non": float(gaps.mean()),
                 "peak_abs_gap_layer": int(np.argmax(np.abs(gaps))),
                 "peak_abs_gap_h_minus_non": float(gaps[np.argmax(np.abs(gaps))]),
@@ -137,11 +149,11 @@ def _load_torch_rows() -> list[dict]:
 
 def _plot_by_label(stats_by_variant: dict[str, list[dict[int, dict[str, float]]]]) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
-    labels = {0: "Non-hallucination", 1: "Hallucination"}
+    labels = {LABEL_HALLUCINATED: "Hallucination", LABEL_REAL: "Non-hallucination"}
     for ax, (slug, display, _directory) in zip(axes, VARIANTS):
         stats = stats_by_variant[slug]
         layers = np.arange(len(stats))
-        for label, color in ((0, "#0072b2"), (1, "#d55e00")):
+        for label, color in ((LABEL_HALLUCINATED, "#d55e00"), (LABEL_REAL, "#0072b2")):
             means = np.array([row[label]["mean"] for row in stats])
             sems = np.array([row[label]["sem"] for row in stats])
             ax.plot(layers, means, color=color, label=labels[label])
@@ -162,7 +174,10 @@ def _plot_gap(stats_by_variant: dict[str, list[dict[int, dict[str, float]]]]) ->
     for slug, display, _directory in VARIANTS:
         stats = stats_by_variant[slug]
         layers = np.arange(len(stats))
-        gaps = np.array([row[1]["mean"] - row[0]["mean"] for row in stats])
+        gaps = np.array([
+            row[LABEL_HALLUCINATED]["mean"] - row[LABEL_REAL]["mean"]
+            for row in stats
+        ])
         ax.plot(layers, gaps, label=display)
     ax.axhline(0.0, color="black", linewidth=0.8)
     ax.set_xlabel("Layer")

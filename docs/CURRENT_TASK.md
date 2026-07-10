@@ -1,9 +1,41 @@
 # Current Task
 
+## 2026-07-10 COCO4000-all 主实验三 seed 与严格 8:1:1 准备
+- 用户要求在三模型 `COCO4000-all` 的 42 个主实验 feature set 上运行 torch MLP，seeds=`42/43/44`、batch size=`256`、positive class=`real`。
+- 检查发现原 `COCO4000-all/image_splits.json` 不是严格 8:1:1：train/val/test 数量为 `3600/400/400`，其中 val 与 test 是完全相同的 400 张图；该结果记为 9:1，并计划在各模型完成后归档到 `COCO4000-all/torchmlp-main-seed3-91/`。
+- 已准备严格 8:1:1 目录：
+  - `outputs/{model}/COCO4000-all/torchmlp-main-seed3-811/image_splits.json`
+  - `outputs/{model}/COCO4000-all/torchmlp-main-seed3-811/seed{42,43,44}/`
+  - 每个 seed 目录的 `features.pkl` 只读链接到 `COCO4000-all/features.pkl`，`image_splits.json` 链接到同实验目录的严格 split。
+- 严格 split 直接复用已验证的 `COCO4000-8-2/image_splits.json`：train/val/test=`3200/400/400`，三者互斥；三模型 split 内容 SHA-256 一致。
+- 新增 `scripts/summarize_torch_probe_seed_runs.py`：
+  - 严格检查每个模型的三 seed 结果文件、共同 feature set、指标完整性和 seed metadata。
+  - 按模型和 feature set 汇总 PR/RC/F1/Acc/AUC/AUPR 的 population mean+/-std。
+  - 输出 Markdown、CSV、JSON，并在 Markdown 中给出各模型 best-by-AUC 及完整排名。
+- 新增 `scripts/run_coco4000_all_main_811_torchmlp.sh`：传入单个模型名后，按已准备的严格 split 顺序运行 seeds 42/43/44 的 42 个主实验 feature set，并在完成后自动生成该模型三 seed 汇总。
+- 新增 `scripts/archive_coco4000_all_main_91_runs.sh`：只有确认旧 9:1 的三个 seed 均包含 42 个完整结果且 seed metadata 正确时，才移动到 `torchmlp-main-seed3-91/seed{42,43,44}`；移动后修正 features/split 链接并自动生成 9:1 汇总。
+- 验证命令：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile scripts/summarize_torch_probe_seed_runs.py`
+  - 使用临时三 seed JSON 端到端生成 `summary.md/.csv/.json`，检查通过。
+  - 读取三模型严格 split，确认均为 `3200/400/400`、无交集、union=4000，且内容哈希一致。
+  - `bash -n scripts/run_coco4000_all_main_811_torchmlp.sh scripts/archive_coco4000_all_main_91_runs.sh` 检查通过。
+- 当前运行状态：Qwen 原 9:1 主实验 seed 42 已完成，seed 43 在 2026-07-10 本轮检查时仍在运行；未移动活动目录。
+
 ## Goal
 比较 Qwen2.5-VL-7B 与 InternVL2.5-8B 在 DGST-T `support_scope=visual` 时，幻觉/非幻觉 object token 的逐层 transport risk 曲线。
 
 ## Last status
+- 2026-07-07 按用户要求新增并完成 Source vs Target(relative) 的 JS/KL 快速实验，覆盖 LLaVA-1.5-7B、InternVL2.5-8B、Qwen2.5-VL-7B 的 COCO500，VV 与 VP 都看，KL 两个方向都看：
+  - 新增配置 `configs/model_configs_kl_js.yaml`，使用 `dataset.num_images=500`、`seed=42`、`target_gate_mode=dual`、`relative_cost_mode=geo`、`dgst_t_dual_scope=true`，同一次 feature extraction 同时输出 VV/VP 的 JS、`KL(Target||Source)`、`KL(Source||Target)` 与 cosine。
+  - 新增 DGST-T 字段：`dgst_t_js_relative_vll_per_layer`、`dgst_t_kl_target_source_relative_vll_per_layer`、`dgst_t_kl_source_target_relative_vll_per_layer`、`dgst_t_js_visual_prompt_relative_vll_per_layer`、`dgst_t_kl_target_source_visual_prompt_relative_vll_per_layer`、`dgst_t_kl_source_target_visual_prompt_relative_vll_per_layer`。
+  - 更新 feature extraction 保存前缀、train aliases、plot aliases，使上述 divergence 字段可以直接用于曲线与 torch probe。
+  - 三模型 `COCO500-JS` 特征已完成并检查字段完整性：LLaVA 3311 token rows、InternVL 4301 rows、Qwen 1958 rows；六个 JS/KL 字段与两个 cosine 字段均存在且无非有限值。`COCO500-KL` 复用同一份 features 与 labeling/split。
+  - 曲线输出：
+    - JS：`outputs/{model}/COCO500-JS/results/{model}_coco500_js_vv_vp_by_label.{png,pdf,csv}`
+    - KL：`outputs/{model}/COCO500-KL/results/{model}_coco500_kl_vv_vp_by_label.{png,pdf,csv}`
+  - torch MLP/probe 已完成。JS best：LLaVA `js_relative_vll+visualcosine_raw` F1/AUC=0.930/0.907；InternVL `js_relative_vll` F1/AUC=0.943/0.720；Qwen `js_visual_prompt_relative_vll+VP cosine` F1/AUC=0.952/0.895。
+  - KL best：LLaVA `kl_source_target_relative_vll+visualcosine_raw` F1/AUC=0.933/0.903；InternVL 多组 F1 约 0.942，best AUC 为 `kl_source_target_visual_prompt_relative_vll+VP cosine` AUC=0.770；Qwen `kl_target_source_relative_vll` 与 `+visualcosine_raw` F1=0.952，AUC 分别为 0.834/0.867，最高 AUC 为 `kl_source_target_visual_prompt_relative_vll+VP cosine` AUC=0.883。
+  - 曲线粗结论：InternVL 的 VP-KL 两方向在 hall/non 均值差上最明显；Qwen 的 VP-KL 差异也大但符号反向；LLaVA 的 KL/JS 加 cosine 后通常更稳。COCO500 上类别不均衡较明显，很多结果 recall 接近/等于 1.0，因此本轮结论需要同时看 AUC。
 - 已实现 relative VLL target 构造，按用户最新公式使用无 bias raw target logit：`l_m^l = W_U^T v_m^l[w*]`，其中 `v_m^l` 为视觉 token 的 `h_mid`。
 - 新增配置项：`target_gate_mode: "legacy_prob" | "relative_vll" | "dual"` 与 `relative_vll_mad_epsilon`。当前 `configs/model_configs.yaml` 默认 `legacy_prob`，`configs/model_configs_visualonly.yaml` 设置为 `dual`。
 - relative VLL 新增字段包括：
@@ -456,3 +488,317 @@
   - 先把 `ffn_fad` 作为单特征强 baseline，`ffn_eifdose+risk_geo_raw+visualcosine_raw` 作为当前最强组合继续跟 `geo/tbar/sbar`、ADS/CGC baseline 对齐比较。
   - 补一张跨特征 summary 图或表，把 `ffn_fad`、`ffn_eifdose`、`risk_geo_raw`、`visualcosine_raw` 与组合的 AUC/F1 放在同一页，方便论文/汇报使用。
   - 若扩展到 Qwen/InternVL，优先复用本轮 config 和 scripts，只替换 model/output-dir；不要复用旧 features.pkl 直接训练 FFN injection 特征。
+
+## 2026-07-06 COCO-CHAIR object-word 标注与 risk/target_cosine 流程
+- 本轮目标：在 `test-cocochair/token-detector` 中接入 ZhangqiJiang07/middle_layers_indicating_hallucinations 的 CHAIR 口径，实现 generation -> COCO-CHAIR object-word labeling -> feature extraction -> `risk`/`target_cosine` 训练流程。
+- 依赖处理：
+  - `/opt/conda/bin/python` 无全局写权限且禁用 user site，已改用项目历史运行环境 `/opt/conda/private/envs/vicr/bin/python`。
+  - 已在 `vicr` 环境安装 `nltk==3.8.1` 与 `pycocotools==2.0.11`，并下载 NLTK 数据 `punkt`、`averaged_perceptron_tagger`、`wordnet`、`omw-1.4`。
+  - `requirements.txt` 已新增 `nltk==3.8.1` 和 `pycocotools`；`run.sh` 默认使用 `PYTHON_BIN=/opt/conda/private/envs/vicr/bin/python`，可用环境变量覆盖。
+- 主要代码变更：
+  - `coco-labeling/coco_chair.py` 替换为 NLTK/WordNet 版 CHAIR evaluator：使用 `synonyms_txt`、COCO double-word 合并、synonym canonicalization，并用 `instances` segmentation objects 与 GT captions 中抽取出的 objects 合并为每张图的 `gt_objects`。
+  - `compute_chair_token(image_id, caption)` 现在输出 `mscoco_hallucinated_words`/`hallucination_idxs` 以及新增的 `mscoco_real_words`/`real_idxs`、`object_mentions`、`word_labels`。
+  - 标签语义全链路改为：`label=0` 表示 hallucinated object，`label=1` 表示 real/non-hallucinated object，非 COCO object word 为 `-100`。
+  - `coco-labeling/label_coco.py` 不再按 canonical object 去重，所有 COCO object mention 都输出为 `object_token_spans`，包含 `surface_word`、`canonical_object`、`word_idx`、`char_start`、`char_end`、`token_indices`、`label`。
+  - 三个 wrapper 的 generation 上限统一为默认 `512`：`BaseLVLMWrapper.generation_max_new_tokens` 读取 `cfg["max_new_tokens"]`，缺省 512；LLaVA/Qwen 的 `model.generate` 和 InternVL 手写解码循环均接入该 helper。
+  - `scripts/train_feature_sets.py` 默认 feature sets 改为 `risk`、`target_cosine`、`risk+target_cosine`；新增 `target_cosine` alias，优先读 `dgst_t_target_visual_hidden_cosine_relative_vll_per_layer`，缺失时回退到 visual hidden cosine。
+  - `detection/train.py`、`detection/evaluate.py`、`scripts/train_torch_probe_feature_sets.py` 已按新标签语义报告 hallucination 正类；部分 COCO 诊断/绘图脚本也同步修正 hall/non 映射。
+- 验证命令：
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 验证 `nltk==3.8.1`、`pycocotools` 可导入，NLTK 四个资源可找到。
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile coco-labeling/coco_chair.py coco-labeling/label_coco.py detection/evaluate.py detection/train.py models/base_wrapper.py models/llava_wrapper.py models/internvl_wrapper.py models/qwen_wrapper.py scripts/train_feature_sets.py scripts/train_torch_probe_feature_sets.py scripts/evaluate_detection_only.py scripts/plot_layerwise_feature_comparison.py scripts/plot_llava_ffn_evidence_variants.py scripts/plot_llava_ffn_injection_diagnostic.py scripts/summarize_cost_state_variants.py scripts/summarize_llava_userprompt_vp.py scripts/diagnose_llava_target_distribution.py scripts/diagnose_vp_target_distribution.py`
+  - `bash -n run.sh`
+  - inline CHAIR smoke：临时 COCO fixture 中 segmentation `traffic light` 与 GT caption 的 `cell phone`/`bike` 合并进 `gt_objects`，生成 caption 中 `traffic light`、`cell phone` 标为 `1`，`dog` 标为 `0`，非 COCO word 标为 `-100`。
+  - inline training smoke：fake features 上 `risk+target_cosine` 可构建矩阵，`evaluate_classifier` 按 hallucination 正类报告 F1/AUC。
+
+## 2026-07-06 LLaVA-OneVision-1.5-8B-Instruct VP geo 接入
+- 本轮目标：支持本地新模型 `/home/apulis-dev/userdata/models/LLaVA-OneVision-1.5-8B-Instruct`，用于 token-detector 在 visual+prompt support、relative VLL、cost=geo 下跑 COCO-CHAIR object-token 检测。
+- 主要代码变更：
+  - 新增 `models/llava_onevision_wrapper.py`：使用 `AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)` 加载 OneVision remote-code 模型；processor 走 Qwen2.5-VL 风格 chat template；动态定位连续 `<|image_pad|>` visual token span；复用 DGST-T capture 与 `compute_dgst_t` 流程。
+  - `models/__init__.py` 注册 `llava_onevision_1_5_8b` 和 `llava_onevision_1_5_8b_instruct` 两个 model key。
+  - 新增专用配置 `configs/model_configs_llava_onevision_vp_relativevll_cost_geo.yaml`，默认 `experiment.mode: vp`，feature sets 为 `risk_visual_prompt_relative_vll_cost_geo`、`target_visual_prompt_hidden_cosine_visual_prompt_relative_vll` 及二者组合，`relative_cost_modes: ["geo"]`。
+  - 兼容性补充：`configs/model_configs_visualprompt_relativevll_cost_geo.yaml` 与 `configs/model_configs_clean_vv_vp_geo.yaml` 也加入 `llava_onevision_1_5_8b` 模型条目。
+- 建议运行命令：
+  - `MODEL=llava_onevision_1_5_8b CONFIG=configs/model_configs_llava_onevision_vp_relativevll_cost_geo.yaml OUTPUT=outputs/llava_onevision_1_5_8b/COCO500-vp-relativevll-cost-geo bash run.sh`
+- 已完成轻量校验：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile models/llava_onevision_wrapper.py models/__init__.py`
+  - inline config parse：确认 mode=`vp`、`dgst_t_support_scope=visual_prompt`、`relative_cost_modes=["geo"]`、registry 指向 `LLaVAOneVisionWrapper`。
+  - processor-only smoke：336x336 测试图得到 input_len=169，`<|image_pad|>` span=(15,159)，共 144 个 visual tokens；未加载完整 8B 模型。
+- 2026-07-06 备注：曾短暂尝试让 generation 使用 Transformers 默认 attention backend、不强制 eager；用户实测加速不明显，已回退。当前各 wrapper 仍显式使用 `attn_implementation="eager"`，保证 generation 与 feature extraction 使用同一加载路径。
+
+## 2026-07-06 配置文件整理草案
+- 本轮目标：先不删除 `configs/` 下已有实验配置，新增一个统一模板，方便后续把 VV/VP、relative VLL、geo/barrier/additive cost、state-update、source-delta、user-prompt、FFN diagnostic 等开关收敛到单个配置文件。
+- 新增文件：`configs/model_configs_unified.yaml`。
+  - 默认可直接跑当前重点实验：`experiment.mode: "vp"`，OneVision VP + relative VLL + `relative_cost_modes: ["geo"]`。
+  - 保留 `llava_1_5_7b`、`llava_onevision_1_5_8b`、`llava_onevision_1_5_8b_instruct`、`internvl_2_5_8b`、`qwen2_5_vl_7b` 五个 model key。
+  - 在文件头注释中集中列出可选开关和值：`mode`、`dgst_t_support_scope`、`dgst_t_dual_scope`、`target_gate_mode`、`relative_vll_logit_source`、`cost_mode`、`relative_cost_mode(s)`、`relative_cost_state_modes`、`relative_cost_update_lambdas`、`source_distribution_mode`、`source_modes`、`target_attention_gammas`、`dgst_t_prompt_support_mode`、`compute_ffn_injection_features`、cap085/topmass，以及常用 feature-set alias。
+  - `run.sh` 无需修改：它会继续按 `experiment.mode` 读取 `experiment.feature_sets[mode]`；如需临时训练 FFN 或其他组合，仍可用 shell 变量 `FEATURE_SETS="..." bash run.sh` 覆盖。
+- 已完成轻量校验：
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY`：确认 `configs/model_configs_unified.yaml` 可由 PyYAML 解析，模型 keys、默认 mode、默认 feature sets 与 DGST-T 参数可读取。
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY`：确认 `get_model_cfg(..., "llava_onevision_1_5_8b")` 会因 `experiment.mode: "vp"` 得到 `dgst_t_support_scope="visual_prompt"`，且 OneVision `image_size=336`。
+  - `bash -n run.sh`：通过。
+  - `git diff --no-index --check /dev/null configs/model_configs_unified.yaml`：无 whitespace warning（命令因 no-index 新文件 diff 本身返回 1）。
+
+## 2026-07-09 COCO500 mass-dist-topk 与 TGD ADS+CGC AUC 对比筛选
+- 本轮目标：在 `outputs/` 下筛选三模型 `COCO500-mass-dist-topk` 的单特征/组合特征，找出 AUC 超过 TGD `ADS+CGC` baseline 的结果。
+- 使用的 TGD COCO500 ADS+CGC baseline 来自 `token-grounding-detector/outputs/{model}/COCO500/results/torch_mlp_ads_cgc/ads__cgc/metrics.json` 的 `real_auc`。
+- 初始筛选只看主目录：
+  - 输入：`outputs/{model}/COCO500-mass-dist-topk/results/{model}_selected_feature_sets.json`
+  - 输出：`outputs/coco500_mass_dist_topk_vs_tgd_ads_cgc_auc_filter.md`
+  - 输出：`outputs/coco500_mass_dist_topk_vs_tgd_ads_cgc_auc_filter.csv`
+  - AUC-only 超过 ADS+CGC 的数量：LLaVA `241`（单特征 21、组合 220），Qwen `12`（组合 12），InternVL `33`（单特征 1、组合 32）。
+  - 主目录 best：LLaVA `vp_target_entropy+cosine16` AUC=`0.922`；Qwen `c_vp+cosine16` AUC=`0.938`；InternVL `c_vp+cosine16` AUC=`0.830`。
+- 用户提醒后补充检查 `risk-mass-entropy/` 子目录：
+  - 输入：`outputs/{model}/COCO500-mass-dist-topk/risk-mass-entropy/results/{model}_selected_feature_sets.json`
+  - 输出：`outputs/coco500_mass_dist_topk_risk_mass_entropy_vs_tgd_ads_cgc_auc_filter.md`
+  - 输出：`outputs/coco500_mass_dist_topk_risk_mass_entropy_vs_tgd_ads_cgc_auc_filter.csv`
+  - 每个模型该子目录均有 81 个 feature sets。
+  - 超过 ADS+CGC AUC 的数量：LLaVA `68`（单特征 3、组合 65），Qwen `3`（组合 3），InternVL `5`（单特征 1、组合 4）。
+  - `risk-mass-entropy` best：LLaVA `vp_hprev_cos_r_union_la+vp_evidence_entropy+t_p` AUC=`0.907`；Qwen `c_vp+vv_source_topk_entropy+m_p` AUC=`0.937`；InternVL `vv_source_topk_entropy` AUC=`0.828`。
+- 最终合并筛选只保留“超过 TGD ADS+CGC AUC”一个基线：
+  - 输出：`outputs/coco500_mass_dist_topk_vs_tgd_ads_cgc_auc_only.md`
+  - 输出：`outputs/coco500_mass_dist_topk_vs_tgd_ads_cgc_auc_only.csv`
+  - 合并来源：主目录 `results/` 与子目录 `risk-mass-entropy/results/`。
+  - 合并后超过 ADS+CGC AUC 的数量：LLaVA `309`（单特征 24、组合 285），Qwen `15`（组合 15），InternVL `38`（单特征 2、组合 36）。
+  - 合并 best：LLaVA `vp_target_entropy+cosine16` AUC=`0.922`；Qwen `c_vp+cosine16` AUC=`0.938`；InternVL `c_vp+cosine16` AUC=`0.830`。
+
+## 2026-07-09 COCO4000 token-detector torch MLP 3 seeds（原 9:1 split）
+- 本轮目标：在 `token-detector/outputs/{model}/COCO4000` 上跑三模型 torch MLP，seeds=`42/43/44`，并汇总 mean±std。
+- 重要口径：
+  - 当时 `image_splits.json` 为 train/val/test=`3600/400/400` images，且 `val` 与 `test` 是同一组 400 张图；因此这是 9:1 split，不是 8:2。
+  - 训练脚本当前默认 `batch_size=256`、`num_epochs=100`、`positive_class="real"`。
+  - 使用原 `COCO4000/results/{model}_selected_feature_sets.json` 中的 10 个 feature set。
+- token rows 统计：
+  - LLaVA：total=`25487`，train=`23008`，val/test=`2479`。
+  - Qwen：total=`14709`，train=`13270`，val/test=`1439`。
+  - InternVL：total=`33530`，train=`30224`，val/test=`3306`。
+- 输出：
+  - 总表：`outputs/coco4000_torch_mlp_3seeds_bs256_summary.md`
+  - CSV：`outputs/coco4000_torch_mlp_3seeds_bs256_summary.csv`
+  - JSON：`outputs/coco4000_torch_mlp_3seeds_bs256_summary.json`
+  - 单模型表：`outputs/{model}/COCO4000/results/{model}_torch_mlp_3seeds_bs256_summary.{md,csv}`
+  - artifacts：`outputs/{model}/COCO4000/results/torch_probe_3seeds_bs256/seed_{42,43,44}/...`
+- best by AUC：
+  - LLaVA：`risk_visual_prompt_relative_vll_cost_geo+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll`，PR/RC/F1/AUC/AUPR=`0.930/0.946/0.938/0.919±0.001/0.985`。
+  - Qwen：`risk_visual_prompt_relative_vll_cost_geo+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll`，PR/RC/F1/AUC/AUPR=`0.949/0.982/0.965/0.881±0.009/0.988`。
+  - InternVL：`risk_visual_prompt_relative_vll_cost_geo_stateupd_lu1+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll`，PR/RC/F1/AUC/AUPR=`0.946/0.989/0.967/0.872±0.005/0.986`。
+- 完整性检查：总表 30 行，三模型各 10 个 feature set，每行 3 seeds。
+- 注意事项：
+  - 曾中断过早期 batch=16 与 batch=64 的尝试，留下部分 artifacts：
+    - LLaVA `COCO4000/results/torch_probe_3seeds/`、`torch_probe_3seeds_bs64/`
+    - Qwen `COCO4000/results/torch_probe_3seeds_bs64/`
+  - 上述 partial 不作为最终汇总使用；最终 9:1 结果以 `*_bs256_summary` 为准。
+
+## 2026-07-09 TGD COCO4000 ADS/CGC 3 seeds baseline 汇总（跨项目记录）
+- 本轮也汇总了相邻项目 `token-grounding-detector/outputs` 的 COCO4000 ADS/CGC torch MLP 三 seed baseline，用于和 token-detector 结果对照。
+- 输入目录：
+  - `/home/apulis-dev/userdata/CODEX/test-cocochair/token-grounding-detector/outputs/{model}/COCO4000/results/torch_mlp_ads_cgc_seed{42,43,44}/`
+  - 每个 seed 下有 `ads/`、`cgc/`、`ads__cgc/` 的 `metrics.json`。
+- 输出：
+  - `/home/apulis-dev/userdata/CODEX/test-cocochair/token-grounding-detector/outputs/coco4000_tgd_ads_cgc_torch_mlp_3seeds_average.md`
+  - `.csv`、`.json`、`_latex.tex`
+- 主表使用 `real_*` 指标，mean±std。
+- best by AUC 均为 CGC：
+  - LLaVA CGC：PR/RC/F1/AUC=`0.928±0.003/0.952±0.002/0.940±0.001/0.921±0.001`
+  - Qwen CGC：PR/RC/F1/AUC=`0.939±0.001/0.995±0.002/0.966±0.001/0.877±0.004`
+  - InternVL CGC：PR/RC/F1/AUC=`0.938±0.003/0.993±0.001/0.965±0.001/0.866±0.003`
+
+## 2026-07-09 COCO4000-8-2 / 8:1:1 split 与 token-detector torch MLP 3 seeds
+- 用户要求将三模型 COCO4000 重新划分为 train/val/test=`8:1:1` 并跑 seeds=`42/43/44` 的 torch MLP。
+- 新建目录：
+  - `outputs/llava_1_5_7b/COCO4000-8-2/`
+  - `outputs/qwen2_5_vl_7b/COCO4000-8-2/`
+  - `outputs/internvl_2_5_8b/COCO4000-8-2/`
+- split 生成口径：
+  - 从原 `COCO4000/image_splits.json` 的 4000 张 image ids 中，用 `random.Random(42)` shuffle。
+  - `train=3200`，`val=400`，`test=400`，三者互斥。
+  - `features.pkl`、`labeling.json`、`generations.json`、`chair_summary.json`、`coco_ground_truth.jsonl` 通过 symlink 复用原 `COCO4000/` 文件，避免复制大文件。
+  - `split_metadata.json` 记录 `split_seed=42` 与 `train_val_test_ratio="8:1:1"`。
+- 实际 token rows：
+  - LLaVA：train=`20397`，val=`2538`，test=`2552`。
+  - Qwen：train=`11782`，val=`1432`，test=`1495`。
+  - InternVL：train=`26884`，val=`3330`，test=`3316`。
+- 训练口径：
+  - `scripts/train_torch_probe_feature_sets.py` 默认 `batch_size=256`、`num_epochs=100`、`positive_class="real"`。
+  - feature sets 仍取原 `COCO4000/results/{model}_selected_feature_sets.json` 的 10 个组合。
+  - artifacts 放在 `outputs/{model}/COCO4000-8-2/results/torch_probe_3seeds_811_bs256/seed_{42,43,44}/...`。
+- 输出：
+  - 总表：`outputs/coco4000_8_2_torch_mlp_3seeds_811_bs256_summary.md`
+  - CSV：`outputs/coco4000_8_2_torch_mlp_3seeds_811_bs256_summary.csv`
+  - JSON：`outputs/coco4000_8_2_torch_mlp_3seeds_811_bs256_summary.json`
+  - 单模型表：`outputs/{model}/COCO4000-8-2/results/{model}_torch_mlp_3seeds_811_bs256_summary.{md,csv}`
+- best by AUC：
+  - LLaVA：`risk_geo_raw+visualcosine_raw`，PR/RC/F1/AUC/AUPR=`0.922/0.952/0.937/0.921±0.002/0.984`。
+  - Qwen：`risk_geo_raw+visualcosine_raw`，PR/RC/F1/AUC/AUPR=`0.932/0.991/0.960/0.898±0.005/0.987`。
+  - InternVL：`risk_visual_prompt_relative_vll_cost_geo+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll`，PR/RC/F1/AUC/AUPR=`0.921/0.989/0.954/0.861±0.011/0.980`。
+- 完整性检查：总表 30 行，三模型各 10 个 feature set，每行 3 seeds；最后确认 GPU 0/1 均空闲。
+
+## 2026-07-09 COCO4000-all 特征提取准备
+- 用户要求在三模型上提取 `COCO4000-all`，先只提特征，不训练。
+- 新增配置：`configs/model_configs_coco4000_all.yaml`
+  - `dataset.num_images=4000`
+  - `target_gate_mode=relative`
+  - `relative_cost_modes=["geo"]`
+  - `dgst_t_dual_scope=true`
+  - `source_modes=["legacy_ffn","hmid_proj","hprev_cos","hprev_proj"]`
+  - `compute_capped_topmass_085=true`
+- 本轮代码新增 capped085 support 落盘：
+  - 每层保存局部 support 下标：`*_capped_topmass_085_support_indices_per_layer`
+  - 每层保存原始 token 位置：`*_capped_topmass_085_support_positions_per_layer`
+  - 覆盖 stem：`dgst_t`、`dgst_t_vv`、`dgst_t_vp`、`dgst_t_vv_source_{hmid_proj,hprev_cos,hprev_proj}`、`dgst_t_vp_source_{hmid_proj,hprev_cos,hprev_proj}`。
+- `features/extractor.py` 已保留这些变长 list-of-list 字段到 `features.pkl`。
+- 静态检查已通过：`python -m py_compile features/dgst_t.py features/extractor.py`。
+
+## 2026-07-09 relative VLL h_prev logits 配置
+- 用户询问 cosine 使用哪种 hidden state，并要求补一个用 `hpre` 计算 relative VLL logits 的对比配置。
+- 口径确认：
+  - `h_prev` / `hpre`：decoder block 输入，attention 之前。
+  - `h_mid`：`h_prev + o_attn`，即 pre-FFN residual state。
+  - `h_out`：`h_mid + o_ffn`，即当前代码中的 `layer_hidden`。
+  - 现有 `visualcosine_raw`、`cosine16`、`vp_target_cosine` 的 cosine 相似度仍使用 `h_out`：预测 token 的 `prediction_hidden_states` 与 support token 的 `support_output_states`。
+  - 本次新增的 `h_prev` 只改变 relative VLL target raw logits 的投影输入，即 support token 用 `h_prev` 过 unembedding 计算 `relative_vll_logits`；不改变 cosine hidden space。
+- 代码更新：
+  - `models/dgst_capture.py`：`relative_vll_logit_source` 新增 `"h_prev"`，并兼容别名 `"hpre"`、`"h_pre"`、`"prev"`、`"pre"`、`"raw_h_prev"`。
+  - `features/dgst_t.py`：直接计算路径同步支持 `"h_prev"`，避免不同调用路径行为不一致。
+  - `configs/model_configs_unified.yaml`：更新注释，明确 `h_prev/h_mid/final_norm_h_mid` 与 cosine 的 `h_out` 口径。
+- 新增配置：
+  - `configs/model_configs_dualscope_relativevll_cost_geo_updlu1_4000_hprevlogits.yaml`
+  - 该配置复用 COCO4000 dual-scope VP/VV、geo cost、`state_update` cost state、`update_lambda=1.0` 口径，仅把 `relative_vll_logit_source` 改为 `"h_prev"`。
+- 验证命令：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile models/dgst_capture.py features/dgst_t.py`
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 读取新增配置并验证 normalize 映射：`h_prev/hpre -> h_prev`，`h_mid -> h_mid`，`final_norm_h_mid -> final_norm_h_mid`。
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 用 tiny fake capture 验证 `h_prev` 与 `h_mid` 得到的 `relative_vll_logits` 不同，且 `support_output_states` 仍等于 `h_prev + o_attn + o_ffn`。
+- 中途有一次 tiny fake capture 验证命令参数误用为 batch 版本的 `prediction_positions`，报错 `TypeError: build_dgst_t_raw() got an unexpected keyword argument 'prediction_positions'`；已改为单样本参数 `prediction_position` 后通过。
+
+## 2026-07-09 COCO500 cosine 平移实验（pingyicos）
+- 用户希望验证：把当前 `h_out` cosine 曲线右移一层，近似作为下一层 `h_pre` cosine 后，与 risk 组合是否有效。
+- 实现口径：
+  - 在 `scripts/train_feature_sets.py` 新增 computed feature aliases：
+    - `pingyi_cosine` / `shifted_cosine` / `visualcosine_shift1` / `target_cosine_shift1`
+    - `vp_pingyi_cosine` / `vp_shifted_cosine` / `vp_target_cosine_shift1`
+  - 当前已训练的是 visual cosine 版本：`pingyi_cosine = [0, visualcosine_raw[0], ..., visualcosine_raw[L-2]]`。
+  - `vp_pingyi_cosine` 仅作为别名/计算能力保留，本轮未训练 VP 组合。
+- 数据与目录：
+  - 复用三模型 `outputs/{model}/COCO500-mass-dist-topk/{features.pkl,image_splits.json,labeling.json,generations.json}`。
+  - 新建 `outputs/{model}/COCO500-pingyicos/`，上述文件均用 symlink 指向 `COCO500-mass-dist-topk`，避免复制。
+- 训练命令口径：
+  - 脚本：`scripts/train_torch_probe_feature_sets.py`
+  - feature sets：`risk_geo_raw`、`visualcosine_raw`、`pingyi_cosine`、`risk_geo_raw+visualcosine_raw`、`risk_geo_raw+pingyi_cosine`
+  - 三模型：`llava_1_5_7b`、`qwen2_5_vl_7b`、`internvl_2_5_8b`
+  - seed=`42`，batch size=`256`，epochs=`100`，positive class=`real`。
+- 输出：
+  - 单模型结果：`outputs/{model}/COCO500-pingyicos/results/{model}_selected_feature_sets.json`
+  - 单模型表：`outputs/{model}/COCO500-pingyicos/results/{model}_selected_feature_sets_table.md`
+  - 总表：`outputs/coco500_pingyicos_torch_mlp_summary.md`
+  - CSV/JSON：`outputs/coco500_pingyicos_torch_mlp_summary.{csv,json}`
+- 主要结果（PR/RC/F1/AUC/AUPR）：
+  - LLaVA `risk+cosine`：`0.926/0.907/0.916/0.896/0.978`
+  - LLaVA `risk+pingyi_cosine`：`0.929/0.897/0.912/0.893/0.978`
+  - Qwen `risk+cosine`：`0.918/0.994/0.954/0.857/0.981`
+  - Qwen `risk+pingyi_cosine`：`0.922/0.989/0.954/0.860/0.981`
+  - InternVL `risk+cosine`：`0.899/0.990/0.942/0.765/0.962`
+  - InternVL `risk+pingyi_cosine`：`0.898/0.985/0.940/0.766/0.959`
+- Delta（`risk+pingyi_cosine` - `risk+cosine`）：
+  - LLaVA：F1 `-0.004`，AUC `-0.003`，AUPR `+0.000`
+  - Qwen：F1 `-0.000`，AUC `+0.003`，AUPR `-0.000`
+  - InternVL：F1 `-0.003`，AUC `+0.002`，AUPR `-0.003`
+- 初步结论：
+  - 平移 cosine 单特征在 Qwen/InternVL 的 AUC 上略高于原始 cosine，在 LLaVA 的 F1 上更高。
+  - 与 risk 组合后，平移没有带来稳定大幅提升；Qwen/InternVL 组合 AUC 小幅上升，LLaVA 小幅下降。
+- 验证命令：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile scripts/train_feature_sets.py scripts/train_torch_probe_feature_sets.py`
+  - inline smoke 验证 `pingyi_cosine` 满足 `new[0]=0` 且 `new[1:]=old[:-1]`，`risk_geo_raw+pingyi_cosine` 矩阵维度正确。
+  - 训练结束后 `nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits` 显示 GPU 0/1 均空闲。
+
+## 2026-07-09 新增真实 hpre cosine 特征提取
+- 用户指出第一层本身有 `hpre`，因此不应只用 `[0, h_out_cosine[:-1]]` 的平移近似；本轮按要求新增真实 `hpre cosine` 特征。
+- 实现口径：
+  - 预测 token：用当前层 block 输入 `h_prev`，由已有 raw 字段精确还原为 `prediction_hidden_states - source_attn_states - source_ffn_states`。
+  - support token：用同层 `support_h_prev_states`。
+  - target distribution 仍沿用 relative VLL evidence；也就是说只替换 cosine 的 hidden state 空间，不改变 risk/target 构造。
+  - 如果旧 raw/features 没有 `source_attn_states`，不会伪造第一层值；新抽取的 raw 会正常输出第一层 hpre cosine。
+- 新增 DGST-T 字段：
+  - `dgst_t_target_visual_hpre_cosine_relative_vll_per_layer`
+  - `dgst_t_target_visual_hpre_cosine16_relative_vll_per_layer`
+  - `dgst_t_target_visual_hpre_cosine_relative_vll_capped_topmass_085_per_layer`
+  - `dgst_t_target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_per_layer`
+  - `dgst_t_target_visual_prompt_hpre_cosine16_visual_prompt_relative_vll_per_layer`
+  - `dgst_t_target_visual_prompt_hpre_cosine_visual_prompt_relative_vll_capped_topmass_085_per_layer`
+- 更新文件：
+  - `features/dgst_t.py`：新增真实 hpre cosine 计算、layer stats、result 字段和 visual-scope merge。
+  - `features/extractor.py`：保存上述新字段到 `features.pkl`。
+  - `scripts/train_feature_sets.py`：新增训练别名 `hprecosine`、`hprecosine16`、`hprecosine_cap085`、`vp_hprecosine`、`vp_hprecosine16`、`vp_hprecosine_cap085`。
+  - `scripts/plot_layerwise_feature_comparison.py`：新增对应画图 alias。
+- 验证命令：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py features/extractor.py scripts/train_feature_sets.py scripts/train_torch_probe_feature_sets.py scripts/plot_layerwise_feature_comparison.py`
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 构造 2 层 tiny raw，验证 6 个 hpre cosine 字段均存在、长度为 2、有限，且第一层非 0；同时验证训练 alias 可解析。
+- 中途失败记录：
+  - 一次 inline sanity check 直接调用 `feature_block(feat, "hprecosine")`，报错 `KeyError: 'hprecosine'`；原因是 `feature_block` 设计上接收 canonical block，实际训练路径会先通过 `FEATURE_ALIASES` 解析。改为 `feature_block(feat, FEATURE_ALIASES["hprecosine"])` 后通过。
+
+## 2026-07-09 补齐 risk cost 变式提取配置
+- 用户指出还有一些 `risk cost` 变式没有保存。检查后确认：
+  - `features/extractor.py` 已经会通过通配规则保存所有 `dgst_t_transport_risk_*_per_layer` 和 `dgst_t_score_*` 字段。
+  - 之前缺失的主要原因是当前主线配置只设置了 `relative_cost_modes: ["geo"]`，因此 `tbar/sbar/tadd/sadd/tsadd` 没有被生成。
+- 已更新以下配置，把 `relative_cost_modes` 从单 `geo` 扩展为六种 cost sweep：
+  - `configs/model_configs_mass_dist_topk.yaml`
+  - `configs/model_configs_coco4000_all.yaml`
+  - `configs/model_configs_unified.yaml`
+- 当前会生成并保存的 risk cost 变式包括：
+  - `geo`
+  - `target_barrier_geo` -> 字段 slug `tbar`
+  - `symmetric_barrier_geo` -> `sbar`
+  - `target_additive_barrier_geo` -> `tadd`
+  - `source_additive_barrier_geo` -> `sadd`
+  - `two_end_additive_barrier_geo` -> `tsadd`
+- 每种 cost 会同时生成 VV/VP 和 raw/cap085 字段，例如：
+  - `dgst_t_transport_risk_relative_vll_cost_tbar_per_layer`
+  - `dgst_t_transport_risk_relative_vll_cost_tbar_capped_topmass_085_per_layer`
+  - `dgst_t_transport_risk_visual_prompt_relative_vll_cost_tbar_per_layer`
+  - `dgst_t_transport_risk_visual_prompt_relative_vll_cost_tbar_capped_topmass_085_per_layer`
+- 未改动 `configs/model_configs_dualscope_relativevll_cost_geo_updlu1_4000_hprevlogits.yaml`，因为该文件名和用途明确是 `cost_geo` 对照配置。
+- 验证命令：
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 解析三个 YAML，确认 `relative_cost_modes` 等于六种 cost 列表。
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 检查 `scripts.train_feature_sets.FEATURE_KEYS` 中 24 个 cost alias 均存在：6 cost × 2 scope(VV/VP) × 2 raw/cap085。
+
+### 2026-07-09 修正：cost 只保留 geo 和 updlu1
+- 用户进一步明确：cost 相关只需要保存 `geo` 和 `updlu1`，不需要保存 `tbar/sbar/tadd/sadd/tsadd`。
+- 已将以下配置收窄为：
+  - `relative_cost_modes: ["geo"]`
+  - `relative_cost_state_modes: ["state_update"]`
+  - `relative_cost_update_lambdas: [1.0]`
+- 更新文件：
+  - `configs/model_configs_mass_dist_topk.yaml`
+  - `configs/model_configs_coco4000_all.yaml`
+  - `configs/model_configs_unified.yaml`
+- 新提取时保留的 cost 字段口径：
+  - `dgst_t_transport_risk_relative_vll_cost_geo_per_layer`
+  - `dgst_t_transport_risk_relative_vll_cost_geo_capped_topmass_085_per_layer`
+  - `dgst_t_transport_risk_visual_prompt_relative_vll_cost_geo_per_layer`
+  - `dgst_t_transport_risk_visual_prompt_relative_vll_cost_geo_capped_topmass_085_per_layer`
+  - `dgst_t_transport_risk_relative_vll_cost_geo_stateupd_lu1_per_layer`
+  - `dgst_t_transport_risk_visual_prompt_relative_vll_cost_geo_stateupd_lu1_per_layer`
+- 验证命令：
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 解析三个 YAML，确认 `relative_cost_modes=["geo"]`、`relative_cost_state_modes=["state_update"]`、`relative_cost_update_lambdas=[1.0]`。
+
+### 2026-07-09 新增 qmatch cost
+- 用户要求新增 cost：`cost = d_ij^l + 1 - sqrt(q_i^l * q_j^l)`。
+- 实现口径：
+  - canonical mode：`semantic_match_geo`
+  - 保存/训练 slug：`qmatch`
+  - `q_i/q_j` 使用当前 relative VLL 的 `semantic_gate`，即 `_transport_risk_on_support` 里的 `semantic_probs`；实现中由 `source_penalty=1-q_i`、`target_penalty=1-q_j` 还原。
+  - cost matrix：`lambda_d * d_ij + 1 - sqrt(q_i*q_j)`；默认 `lambda_d=1.0` 时即用户公式。
+- 更新文件：
+  - `features/dgst_t.py`：新增 `semantic_match_geo/qmatch/qadd` mode 解析、slug 映射、cost matrix 公式。
+  - `scripts/train_feature_sets.py`：新增 `risk_relative_vll_cost_qmatch`、`risk_visual_prompt_relative_vll_cost_qmatch` 及 cap085 aliases。
+  - `scripts/plot_layerwise_feature_comparison.py`：新增 qmatch 画图 aliases。
+  - `configs/model_configs_coco4000_all.yaml`、`configs/model_configs_mass_dist_topk.yaml`、`configs/model_configs_unified.yaml`：`relative_cost_modes` 更新为 `["geo", "semantic_match_geo"]`。
+- 为避免额外保存 `qmatch_stateupd_lu1`，已将 `relative_cost_state_modes` 的 state-update 变式限制为 geo cost；因此仍只保存 `geo_stateupd_lu1`。
+- 新提取会保存：
+  - `dgst_t_transport_risk_relative_vll_cost_qmatch_per_layer`
+  - `dgst_t_transport_risk_visual_prompt_relative_vll_cost_qmatch_per_layer`
+  - 若 `compute_capped_topmass_085=true`，还会保存对应 `_capped_topmass_085_per_layer`。
+- 验证命令：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile features/dgst_t.py scripts/train_feature_sets.py scripts/plot_layerwise_feature_comparison.py features/extractor.py`
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 小张量验证 `qmatch/qadd/semantic_match_geo` 都满足 `d + 1 - sqrt(q_i*q_j)`，并验证 normalize/slug。
+  - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 解析三个 YAML，确认 `relative_cost_modes=["geo", "semantic_match_geo"]`，并确认 train/plot qmatch aliases 存在。
+- 中途失败记录：
+  - 第一次公式小测试直接调用 `_build_cost_matrix(..., cost_mode="qmatch")`，报错 `ValueError: DGST-T only keeps direct/decomposed transport costs.`；原因是 build 函数未兼容短名，只在配置 normalize 路径兼容。已补 `_build_cost_matrix` 对 `qmatch/qadd` 短名的识别后通过。

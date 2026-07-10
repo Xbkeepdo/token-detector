@@ -95,11 +95,15 @@ def resolve_decoder_final_norm(model: Any):
 
 def normalize_relative_vll_logit_source(value: str | None) -> str:
     source = str(value or "h_mid").strip().lower()
+    if source in {"h_prev", "hpre", "h_pre", "prev", "pre", "raw_h_prev"}:
+        return "h_prev"
     if source in {"h_mid", "mid", "raw_h_mid"}:
         return "h_mid"
     if source in {"final_norm_h_mid", "final_norm", "norm_h_mid", "finalnorm"}:
         return "final_norm_h_mid"
-    raise ValueError("relative_vll_logit_source must be 'h_mid' or 'final_norm_h_mid'.")
+    raise ValueError(
+        "relative_vll_logit_source must be 'h_prev', 'h_mid', or 'final_norm_h_mid'."
+    )
 
 
 def apply_decoder_final_norm(norm_layer: Any, states: torch.Tensor) -> torch.Tensor:
@@ -304,6 +308,7 @@ def build_dgst_t_raw_batch(
             "source_ffn_states": [],
             "source_attn_states": [],
             "prediction_hidden_states": [],
+            "support_h_prev_states": [],
             "support_h_mid_states": [],
             "support_output_states": [],
             "support_attentions": [],
@@ -318,6 +323,7 @@ def build_dgst_t_raw_batch(
     ]
 
     for layer_offset, capture in enumerate(captures):
+        h_prev = capture["h_prev"][0]
         h_mid = capture["h_mid"][0]
         o_attn = capture["o_attn"][0]
         o_ffn = capture["o_ffn"][0]
@@ -326,12 +332,14 @@ def build_dgst_t_raw_batch(
         support_index = torch.tensor(support_positions, dtype=torch.long, device=device)
         prompt_index = torch.tensor(prompt_positions, dtype=torch.long, device=device)
 
+        support_prev_states = h_prev.index_select(0, support_index)
         support_states = h_mid.index_select(0, support_index)
-        support_relative_states = (
-            apply_decoder_final_norm(final_norm_layer, support_states)
-            if final_norm_layer is not None
-            else support_states
-        )
+        if relative_source == "h_prev":
+            support_relative_states = support_prev_states
+        elif final_norm_layer is not None:
+            support_relative_states = apply_decoder_final_norm(final_norm_layer, support_states)
+        else:
+            support_relative_states = support_states
         support_output_states = layer_hidden.index_select(0, support_index)
         prompt_states = layer_hidden.index_select(0, prompt_index)
 
@@ -358,6 +366,10 @@ def build_dgst_t_raw_batch(
         prompt_max_conf_all = prompt_probs_all.float().max(dim=0).values
         prompt_last_state = _raw_tensor(prompt_states[-1], keep_on_device=keep_on_device)
         prompt_mean_state = _raw_tensor(prompt_states.mean(dim=0), keep_on_device=keep_on_device)
+        support_prev_states_raw = _raw_tensor(
+            support_prev_states,
+            keep_on_device=keep_on_device,
+        )
         support_states_raw = _raw_tensor(support_states, keep_on_device=keep_on_device)
         support_output_states_raw = _raw_tensor(
             support_output_states,
@@ -380,6 +392,7 @@ def build_dgst_t_raw_batch(
             part["prediction_hidden_states"].append(
                 _raw_tensor(layer_hidden[int(prediction_position), :], keep_on_device=keep_on_device)
             )
+            part["support_h_prev_states"].append(support_prev_states_raw)
             part["support_h_mid_states"].append(support_states_raw)
             part["support_output_states"].append(support_output_states_raw)
             part["support_attentions"].append(
@@ -418,6 +431,7 @@ def build_dgst_t_raw_batch(
                 "source_ffn_states": torch.stack(part["source_ffn_states"], dim=0),
                 "source_attn_states": torch.stack(part["source_attn_states"], dim=0),
                 "prediction_hidden_states": torch.stack(part["prediction_hidden_states"], dim=0),
+                "support_h_prev_states": torch.stack(part["support_h_prev_states"], dim=0),
                 "support_h_mid_states": torch.stack(part["support_h_mid_states"], dim=0),
                 "support_output_states": torch.stack(part["support_output_states"], dim=0),
                 "support_attentions": torch.stack(part["support_attentions"], dim=0),

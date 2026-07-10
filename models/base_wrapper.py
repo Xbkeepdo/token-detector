@@ -124,6 +124,11 @@ class BaseLVLMWrapper(ABC):
     def _ids_to_str(self, token_ids: List[int]) -> str:
         return self.tokenizer.decode(token_ids, skip_special_tokens=False)
 
+    @property
+    def generation_max_new_tokens(self) -> int:
+        """Default caption generation budget, overridable by model config."""
+        return int(self.cfg.get("max_new_tokens", 512))
+
     @torch.no_grad()
     def _safe_forward(self, **kwargs) -> dict:
         """Wrapper around model(**kwargs) that always disables gradients"""

@@ -1,0 +1,353 @@
+# Unified token-detector config template.
+#
+# Purpose:
+#   Keep one runnable config with switch-style parameters and a visible record of
+#   the method variants tried in the split yaml files. Old config files are kept
+#   untouched; this file is meant to replace them gradually after inspection.
+#
+# Typical commands:
+#   OneVision VP + relative VLL + geo:
+#     MODEL=llava_onevision_1_5_8b \
+#     CONFIG=configs/model_configs_unified.yaml \
+#     OUTPUT=outputs/llava_onevision_1_5_8b/COCO500-vp-relativevll-cost-geo \
+#     bash run.sh
+#
+#   VV run with the same file:
+#     Change experiment.mode to "vv", then choose an OUTPUT name containing vv.
+#
+#   Override training feature sets without editing this file:
+#     FEATURE_SETS="risk_geo_raw visualcosine_raw risk_geo_raw+visualcosine_raw" bash run.sh
+#
+# Switch map:
+#   experiment.mode:
+#     vv: visual-only support for DGST-T source/target.
+#     vp: visual+prompt support for DGST-T source/target.
+#   experiment.dgst_t_support_scope:
+#     Optional manual override. Valid values are "visual" or "visual_prompt".
+#     Leave unset to let utils/config_utils.py infer it from experiment.mode.
+#   feature_extraction.dgst_t.dgst_t_dual_scope:
+#     false: only emit fields for the active support scope.
+#     true: when the active support scope is VP, also emit VV fields in the same
+#           features.pkl. run.sh still trains only feature_sets[mode] unless
+#           FEATURE_SETS is passed from the shell.
+#   feature_extraction.dgst_t.target_gate_mode:
+#     legacy_prob: original softmax probability target.
+#     relative_vll / relative: relative VLL target.
+#     dual: emit both legacy and relative fields.
+#   feature_extraction.dgst_t.relative_vll_logit_source:
+#     h_prev: block input before attention.
+#     h_mid: pre-FFN residual state, h_prev + attention output.
+#     final_norm_h_mid: h_mid after the decoder final norm, if the wrapper can capture it.
+#     Cosine features still compare h_out states, where h_out = h_mid + FFN output.
+#   feature_extraction.dgst_t.cost_mode:
+#     direct, decomposed.
+#   feature_extraction.dgst_t.relative_cost_mode / relative_cost_modes:
+#     geo,
+#     target_barrier_geo / tbar,
+#     symmetric_barrier_geo / sbar,
+#     target_additive_barrier_geo / tadd,
+#     source_additive_barrier_geo / sadd,
+#     two_end_additive_barrier_geo / tsadd,
+#     direct,
+#     decomposed,
+#     inherit / cost_mode.
+#   feature_extraction.dgst_t.relative_cost_state_modes:
+#     mid, out, avg, state_update.
+#   feature_extraction.dgst_t.relative_cost_update_lambdas:
+#     Any non-negative floats. Tried values: [0.05, 0.10, 0.20, 1.0].
+#   feature_extraction.dgst_t.source_distribution_mode:
+#     softmax, relu_norm.
+#   feature_extraction.dgst_t.source_modes:
+#     legacy_ffn, delta_src.
+#   feature_extraction.dgst_t.target_attention_gammas:
+#     Any non-negative floats. Tried values: [0.0, 0.5, 1.0].
+#   feature_extraction.dgst_t.dgst_t_prompt_support_mode:
+#     full: use the full prompt as prompt support.
+#     user_text: use only dgst_t_user_prompt_text, usually "Describe this image."
+#   feature_extraction.dgst_t.compute_ffn_injection_features:
+#     false: skip FFN diagnostic features.
+#     true: emit ffn_fad, ffn_eifdose, ffn_logitlift, ffn_gate, ffn_fgr,
+#           ffn_eiffrac_svd, ffn_eifdose_svd, ffn_eiffrac_pca, ffn_eifdose_pca.
+#   feature_extraction.dgst_t.compute_capped_topmass_085:
+#     false: raw-only runs.
+#     true: also emit cap085 fields.
+#
+# Feature-set aliases commonly used by scripts/train_feature_sets.py:
+#   VV raw:
+#     risk_geo_raw
+#     visualcosine_raw
+#     risk_geo_raw+visualcosine_raw
+#   VP raw:
+#     risk_visual_prompt_relative_vll_cost_geo
+#     target_visual_prompt_hidden_cosine_visual_prompt_relative_vll
+#     risk_visual_prompt_relative_vll_cost_geo+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll
+#   Relative-cost variants:
+#     risk_relative_vll_cost_geo
+#     risk_relative_vll_cost_tbar
+#     risk_relative_vll_cost_sbar
+#     risk_relative_vll_cost_tadd
+#     risk_relative_vll_cost_sadd
+#     risk_relative_vll_cost_tsadd
+#     risk_relative_vll_cost_qmatch
+#     risk_visual_prompt_relative_vll_cost_geo
+#     risk_visual_prompt_relative_vll_cost_tbar
+#     risk_visual_prompt_relative_vll_cost_sbar
+#     risk_visual_prompt_relative_vll_cost_tadd
+#     risk_visual_prompt_relative_vll_cost_sadd
+#     risk_visual_prompt_relative_vll_cost_tsadd
+#     risk_visual_prompt_relative_vll_cost_qmatch
+#   Relative-cost state variants:
+#     risk_relative_vll_cost_geo_mid
+#     risk_relative_vll_cost_geo_out
+#     risk_relative_vll_cost_geo_avg
+#     risk_relative_vll_cost_geo_stateupd_lu005
+#     risk_relative_vll_cost_geo_stateupd_lu01
+#     risk_relative_vll_cost_geo_stateupd_lu02
+#     risk_relative_vll_cost_geo_stateupd_lu1
+#     risk_visual_prompt_relative_vll_cost_geo_mid
+#     risk_visual_prompt_relative_vll_cost_geo_out
+#     risk_visual_prompt_relative_vll_cost_geo_avg
+#     risk_visual_prompt_relative_vll_cost_geo_stateupd_lu005
+#     risk_visual_prompt_relative_vll_cost_geo_stateupd_lu01
+#     risk_visual_prompt_relative_vll_cost_geo_stateupd_lu02
+#     risk_visual_prompt_relative_vll_cost_geo_stateupd_lu1
+#   Delta-source variants:
+#     rvll_delta_g0, rvll_delta_g05, rvll_delta_g1
+#     rvll_delta_g0_cos, rvll_delta_g05_cos, rvll_delta_g1_cos
+#     vp_rvll_delta_g0, vp_rvll_delta_g05, vp_rvll_delta_g1
+#     vp_rvll_delta_g0_cos, vp_rvll_delta_g05_cos, vp_rvll_delta_g1_cos
+#     Each also has *_cap085 and *_cos_cap085 if cap085 is enabled.
+#   FFN variants:
+#     ffn_fad
+#     ffn_fad_x_risk_geo_raw
+#     ffn_eifdose
+#     ffn_logitlift
+#     ffn_gate
+#     ffn_fgr
+#     ffn_eiffrac_svd
+#     ffn_eifdose_svd
+#     ffn_eifdose_svd_x_risk_geo_raw
+#     ffn_eiffrac_pca
+#     ffn_eifdose_pca
+#   Other baseline aliases:
+#     risk
+#     target_cosine
+#     risk+target_cosine
+#     prompt_confidence_top3
+#     prompt_confidence_max
+#     context_confidence
+#     context_confidence_max_prompt
+#     prompt_last_cosine
+#     prompt_mean_cosine
+
+experiment:
+  # Choose one: "vv" or "vp".
+  mode: "vp"
+
+  # Optional hard override. Usually leave commented and let mode decide.
+  # dgst_t_support_scope: "visual_prompt"
+
+  # run.sh picks feature_sets[experiment.mode]. Shell FEATURE_SETS overrides this.
+  feature_sets:
+    vv:
+      - "risk_geo_raw"
+      - "visualcosine_raw"
+      - "risk_geo_raw+visualcosine_raw"
+    vp:
+      - "risk_visual_prompt_relative_vll_cost_geo"
+      - "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll"
+      - "risk_visual_prompt_relative_vll_cost_geo+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll"
+    # Catalog of FFN visual-only combinations. Keep experiment.mode="vv" and
+    # pass FEATURE_SETS from the shell when training these, or explicitly set
+    # experiment.dgst_t_support_scope="visual" if you make a custom mode.
+    ffn_visual:
+      - "risk_geo_raw"
+      - "visualcosine_raw"
+      - "risk_geo_raw+visualcosine_raw"
+      - "ffn_fad"
+      - "ffn_eifdose"
+      - "ffn_logitlift"
+      - "ffn_gate"
+      - "ffn_fgr"
+      - "ffn_gate+risk_geo_raw+visualcosine_raw"
+      - "ffn_fad+risk_geo_raw+visualcosine_raw"
+    default:
+      - "risk"
+      - "target_cosine"
+      - "risk+target_cosine"
+
+models:
+  llava_1_5_7b:
+    hf_name: "/home/apulis-dev/userdata/models/llava/llava-hf/llava-1___5-7b-hf"
+    architecture: "concatenation"
+    num_visual_tokens: 576
+    image_size: 336
+    patch_size: 14
+    num_layers: 32
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    prompt_template: "USER: <image>\nDescribe this image.\nASSISTANT:"
+
+  llava_onevision_1_5_8b:
+    hf_name: "/home/apulis-dev/userdata/models/LLaVA-OneVision-1.5-8B-Instruct"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    image_size: 336
+    patch_size: 14
+    num_layers: 36
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    image_token: "<|image_pad|>"
+    prompt_template: null
+
+  llava_onevision_1_5_8b_instruct:
+    hf_name: "/home/apulis-dev/userdata/models/LLaVA-OneVision-1.5-8B-Instruct"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    image_size: 336
+    patch_size: 14
+    num_layers: 36
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    image_token: "<|image_pad|>"
+    prompt_template: null
+
+  internvl_2_5_8b:
+    hf_name: "/home/apulis-dev/userdata/models/InternVL2_5-8B"
+    architecture: "concatenation"
+    num_visual_tokens: 256
+    image_size: 448
+    patch_size: 14
+    num_layers: 32
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    img_context_token: "<IMG_CONTEXT>"
+    prompt_template: "<|im_start|>user\n<image>\nDescribe this image.<|im_end|>\n<|im_start|>assistant\n"
+
+  qwen2_5_vl_7b:
+    hf_name: "/home/apulis-dev/userdata/models/Qwen2.5-VL-7B-Instruct"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    image_size: 448
+    patch_size: 14
+    num_layers: 28
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    prompt_template: null
+
+feature_extraction:
+  ads:
+    top_patch_pct: 0.10
+    connectivity: 8
+    min_blob_area: 3
+    top_k_layers: 10
+
+  cgc:
+    top_k_pct: 0.05
+    mid_layer_pct: [0.25, 0.75]
+    use_attn_weighting: false
+
+  dgst_t:
+    # Core settings. Tried tau values: 0.05, 0.07, 0.10.
+    tau: 0.07
+    transport_top_k: 64
+    cost_mode: "decomposed"
+    lambda_d: 1.0
+    lambda_s: 1.0
+    lambda_t: 1.0
+    lambda_int: 1.0
+    baseline_layers: 10
+    risk_start_layer: 15
+    alpha: 2.0
+    ot_solver: "emd"
+    atarget_visual_top_k: 32
+
+    # Raw vs cap085/topmass outputs.
+    compute_topmass_085: false
+    compute_capped_topmass_085: false
+    topmass_085_alpha: 0.85
+    capped_topmass_085_alpha: 0.85
+    capped_topmass_085_min_k: 32
+    capped_topmass_085_max_k: 64
+
+    # Target gate. Choose: legacy_prob, relative_vll dual.
+    target_gate_mode: "relative_vll"
+    relative_vll_mad_epsilon: 1.0e-6
+    relative_vll_logit_source: "h_mid"
+
+    # Cost variants. Keep primary geo, semantic-match geo, and geo state-update
+    # lu=1.0 variants by default.
+    relative_cost_mode: "geo"
+    relative_cost_modes: ["geo", "semantic_match_geo"]
+    relative_cost_state_modes: ["state_update"]
+    relative_cost_update_lambdas: [1.0]
+    relative_barrier_lambda: 1.0
+    relative_barrier_margin: 0.5
+    relative_barrier_max: 3.0
+
+    # State/update variants are disabled by default. Uncomment for sweeps.
+    # relative_cost_state_modes: ["mid", "out", "avg", "state_update"]
+    # relative_cost_update_lambdas: [0.05, 0.10, 0.20, 1.0]
+
+    # Source distribution and delta-source variants.
+    source_distribution_mode: "softmax"
+    # source_modes: ["legacy_ffn", "delta_src"]
+    # target_attention_gammas: [0.0, 0.5, 1.0]
+    target_attention_epsilon: 1.0e-12
+
+    # Prompt-support variants.
+    dgst_t_prompt_support_mode: "full"
+    dgst_t_user_prompt_text: "Describe this image."
+
+    # FFN diagnostic variants.
+    compute_ffn_injection_features: false
+    ffn_injection_evidence_top_k: 32
+    ffn_injection_evidence_rank: 8
+    ffn_injection_eps: 1.0e-8
+
+    # Dual-scope extraction. See switch map above.
+    dgst_t_dual_scope: true
+
+dataset:
+  coco_root: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco"
+  annotation_file: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco/annotations/instances_val2014.json"
+  captions_file: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco/annotations/captions_val2014.json"
+  num_images: 4000
+  train_ratio: 0.90
+  seed: 42
+
+classifiers:
+  xgb:
+    max_depth: [4, 6, 8]
+    learning_rate: [0.1, 0.05]
+    n_estimators: [100, 200, 500]
+  rf:
+    max_depth: [null, 10, 20]
+    n_estimators: [200, 400, 600]
+  mlp:
+    hidden_layer_sizes: [[64], [128], [256]]
+    learning_rate_init: [0.01, 0.001]
+    solver: ["adam", "sgd"]
+    max_iter: 500
+
+pope:
+  pope_dir: "data/pope"
+  splits: ["random", "popular", "adversarial"]
+  prompt_templates:
+    llava_1_5_7b: "USER: <image>\n{question}\nAnswer the question using a single word or phrase.\nASSISTANT:"
+    llava_onevision_1_5_8b: "{question}\nAnswer the question using a single word or phrase."
+    llava_onevision_1_5_8b_instruct: "{question}\nAnswer the question using a single word or phrase."
+    internvl_2_5_8b: "{question}\nAnswer the question using a single word or phrase."
+    qwen2_5_vl_7b: "{question}\nAnswer the question using a single word or phrase."
+    _default: "{question}\nAnswer the question using a single word or phrase."
