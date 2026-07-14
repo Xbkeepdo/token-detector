@@ -158,6 +158,15 @@ def _build_feature_record(
     cfg_dgst_t: dict,
 ) -> dict:
     dgst_t = _compute_dgst_t_result(model_out, cfg_dgst_t)
+    if cfg_dgst_t.get("feature_output_profile") == "costvariant_vv":
+        return _build_cost_variant_feature_record(
+            image_id=image_id,
+            span=span,
+            response_index=response_index,
+            target_token_id=target_token_id,
+            model_out=model_out,
+            dgst_t=dgst_t,
+        )
     alpha_img_per_layer, alpha_text_per_layer = compute_alpha_img_alpha_text(
         text_to_patch_attn=model_out.text_to_patch_attn,
         text_to_text_attn=model_out.text_to_text_attn,
@@ -367,6 +376,84 @@ def _build_feature_record(
             feat[key] = value.tolist() if hasattr(value, "tolist") else value
         elif key.startswith("dgst_t_score_"):
             feat[key] = float(value)
+    return feat
+
+
+def _build_cost_variant_feature_record(
+    *,
+    image_id: int,
+    span: dict,
+    response_index: int,
+    target_token_id: int,
+    model_out,
+    dgst_t: dict,
+) -> dict:
+    risk_names = (
+        "risk_geo",
+        "risk_cosine_hpre",
+        "risk_sqrt_hmid",
+        "risk_sqrt_hpre",
+        "risk_raw_attention_hmid",
+        "risk_raw_attention_hpre",
+        "gauss_risk_geo",
+        "gauss_risk_cosine_hpre",
+        "gauss_risk_sqrt_hmid",
+        "gauss_risk_sqrt_hpre",
+    )
+    required = [
+        *(f"dgst_t_{name}_per_layer" for name in risk_names),
+        "dgst_t_target_visual_hpre_cosine_relative_vll_per_layer",
+        "dgst_t_vv_support_attention_per_layer",
+        "dgst_t_vv_source_dist_per_layer",
+        "dgst_t_vv_semantic_gate_per_layer",
+        "dgst_t_vv_gauss_semantic_gate_per_layer",
+        "dgst_t_vv_support_positions",
+        "dgst_t_cost_variant_mad_scale",
+        "dgst_t_cost_variant_transport_top_k",
+        "dgst_t_cost_variant_hprecosine_top_k",
+    ]
+    missing = [key for key in required if key not in dgst_t]
+    if missing:
+        raise KeyError(f"Missing cost-variant DGST-T fields: {missing}")
+
+    feat = {
+        "image_id": int(image_id),
+        "token_str": span["word"],
+        "token_id": int(model_out.token_id),
+        "target_token_id": int(target_token_id),
+        "response_token_idx": int(response_index),
+        "label": int(span["label"]),
+        "dgst_t_relative_vll_logit_source": str(
+            dgst_t.get("dgst_t_relative_vll_logit_source", "h_mid")
+        ),
+        "dgst_t_source_distribution_mode": str(
+            dgst_t.get("dgst_t_source_distribution_mode", "softmax")
+        ),
+    }
+    for name in risk_names:
+        key = f"dgst_t_{name}_per_layer"
+        feat[key] = dgst_t[key].detach().cpu().tolist()
+    hpre_key = "dgst_t_target_visual_hpre_cosine_relative_vll_per_layer"
+    feat[hpre_key] = dgst_t[hpre_key].detach().cpu().tolist()
+    for key in (
+        "dgst_t_vv_support_attention_per_layer",
+        "dgst_t_vv_source_dist_per_layer",
+        "dgst_t_vv_semantic_gate_per_layer",
+        "dgst_t_vv_gauss_semantic_gate_per_layer",
+    ):
+        feat[key] = dgst_t[key].detach().cpu()
+    feat["dgst_t_vv_support_positions"] = [
+        int(position) for position in dgst_t["dgst_t_vv_support_positions"]
+    ]
+    feat["dgst_t_cost_variant_mad_scale"] = float(
+        dgst_t["dgst_t_cost_variant_mad_scale"]
+    )
+    feat["dgst_t_cost_variant_transport_top_k"] = int(
+        dgst_t["dgst_t_cost_variant_transport_top_k"]
+    )
+    feat["dgst_t_cost_variant_hprecosine_top_k"] = int(
+        dgst_t["dgst_t_cost_variant_hprecosine_top_k"]
+    )
     return feat
 
 

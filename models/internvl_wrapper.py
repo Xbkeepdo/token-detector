@@ -149,17 +149,18 @@ class InternVLWrapper(BaseLVLMWrapper):
         response_token_idx: int,
         target_token_id: Optional[int] = None,
         cfg_dgst_t: Optional[dict] = None,
+        prompt: Optional[str] = None,
     ) -> ModelOutput:
         """Build a full input sequence that mirrors what InternVL's chat"""
         pixel_values = self._preprocess_image(image)
 
         prompt_input_ids, _, _ = self._build_input_ids_with_image(
-            pixel_values, prefix_token_ids=[]
+            pixel_values, prefix_token_ids=[], user_prompt=prompt
         )
         prompt_tokenized_length = int(prompt_input_ids.shape[1])
 
         input_ids, img_start, img_end = self._build_input_ids_with_image(
-            pixel_values, prefix_token_ids
+            pixel_values, prefix_token_ids, user_prompt=prompt
         )
 
         attention_mask = torch.ones_like(input_ids)
@@ -209,6 +210,11 @@ class InternVLWrapper(BaseLVLMWrapper):
             target_token_id=dgst_target_id,
             prediction_position=seq_len - 1,
             support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+            semantic_chunk_size=(
+                int(cfg_dgst_t.get("semantic_chunk_size", 64))
+                if cfg_dgst_t is not None
+                else 64
+            ),
             relative_vll_logit_source=(
                 cfg_dgst_t.get("relative_vll_logit_source", "h_mid")
                 if cfg_dgst_t is not None
@@ -236,6 +242,7 @@ class InternVLWrapper(BaseLVLMWrapper):
         response_token_indices: Sequence[int],
         target_token_ids: Optional[Sequence[int]] = None,
         cfg_dgst_t: Optional[dict] = None,
+        prompt: Optional[str] = None,
     ) -> List[ModelOutput]:
         requested_indices = [int(index) for index in response_token_indices]
         if not requested_indices:
@@ -251,11 +258,13 @@ class InternVLWrapper(BaseLVLMWrapper):
         prompt_input_ids, _, _ = self._build_input_ids_with_image(
             pixel_values,
             prefix_token_ids=[],
+            user_prompt=prompt,
         )
         prompt_tokenized_length = int(prompt_input_ids.shape[1])
         input_ids, img_start, img_end = self._build_input_ids_with_image(
             pixel_values,
             prefix_token_ids=response_ids,
+            user_prompt=prompt,
         )
         attention_mask = torch.ones_like(input_ids)
         image_flags = torch.ones(
@@ -301,6 +310,18 @@ class InternVLWrapper(BaseLVLMWrapper):
             visual_token_count=int(img_end - img_start),
             prompt_positions=full_prompt_positions,
         )
+        compact_costvariant = bool(
+            cfg_dgst_t is not None
+            and cfg_dgst_t.get("feature_output_profile") == "costvariant_vv"
+        )
+        position_logits = [
+            out.logits[0, int(position)].float().cpu()
+            for position in prediction_positions
+        ]
+        if compact_costvariant:
+            del out
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         dgst_results = None
         dgst_raws = None
         if cfg_dgst_t is not None:
@@ -315,6 +336,7 @@ class InternVLWrapper(BaseLVLMWrapper):
                 target_token_ids=targets,
                 prediction_positions=prediction_positions,
                 support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+                semantic_chunk_size=int(cfg_dgst_t.get("semantic_chunk_size", 64)),
                 prompt_positions_override=support_prompt_positions,
                 tau=cfg_dgst_t.get("tau", 0.07),
                 source_distribution_mode=cfg_dgst_t.get("source_distribution_mode", "softmax"),
@@ -369,6 +391,7 @@ class InternVLWrapper(BaseLVLMWrapper):
                 target_token_ids=targets,
                 prediction_positions=prediction_positions,
                 support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+                semantic_chunk_size=64,
                 relative_vll_logit_source="h_mid",
                 prompt_positions_override=support_prompt_positions,
             )
@@ -378,20 +401,26 @@ class InternVLWrapper(BaseLVLMWrapper):
             requested_indices,
             prediction_positions,
         )):
-            text_to_patch_attn, text_to_text_attn = _extract_attention_features_at_position(
-                out.attentions,
-                img_start,
-                img_end,
-                seq_len,
-                int(prediction_position),
-            )
-            token_hidden_states, patch_hidden_states = hidden_states_from_captures(
-                captures,
-                token_position=int(prediction_position),
-                visual_start=img_start,
-                visual_end=img_end,
-            )
-            logits = out.logits[0, int(prediction_position)].float().cpu()
+            if compact_costvariant:
+                text_to_patch_attn = torch.empty(0)
+                text_to_text_attn = torch.empty(0)
+                token_hidden_states = torch.empty(0)
+                patch_hidden_states = torch.empty(0)
+            else:
+                text_to_patch_attn, text_to_text_attn = _extract_attention_features_at_position(
+                    out.attentions,
+                    img_start,
+                    img_end,
+                    seq_len,
+                    int(prediction_position),
+                )
+                token_hidden_states, patch_hidden_states = hidden_states_from_captures(
+                    captures,
+                    token_position=int(prediction_position),
+                    visual_start=img_start,
+                    visual_end=img_end,
+                )
+            logits = position_logits[offset]
             pred_token_id = int(logits.argmax().item())
             pred_token_str = self.tokenizer.decode([pred_token_id], skip_special_tokens=False)
             outputs.append(
@@ -412,7 +441,7 @@ class InternVLWrapper(BaseLVLMWrapper):
 
 
     def _preprocess_image(self, image: Image.Image) -> torch.Tensor:
-        """Use InternVL's dynamic resolution preprocessing."""
+        """Use the legacy single-tile InternVL preprocessing."""
         from torchvision import transforms
 
         transform = transforms.Compose([
@@ -434,7 +463,7 @@ class InternVLWrapper(BaseLVLMWrapper):
         prefix_token_ids: List[int],
         user_prompt: Optional[str] = None,
     ) -> Tuple[torch.Tensor, int, int]:
-        """Assemble the token id sequence that InternVL's LM backbone sees."""
+        """Assemble the legacy token sequence that InternVL's LM backbone sees."""
         num_tiles = pixel_values.shape[0]
         tokens_per_tile = self.cfg.get("num_visual_tokens", 256)
         num_img_tokens = num_tiles * tokens_per_tile

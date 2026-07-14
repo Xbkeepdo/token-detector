@@ -317,7 +317,10 @@ def _forward_llava(
     input_ids = inputs["input_ids"][0]
     input_ids_list = input_ids.tolist()
 
-    img_mask = (input_ids == IMAGE_TOKEN_INDEX)
+    image_token_id = int(
+        getattr(wrapper.model.config, "image_token_index", IMAGE_TOKEN_INDEX)
+    )
+    img_mask = (input_ids == image_token_id)
     if img_mask.any():
         img_placeholder_pos = img_mask.nonzero(as_tuple=True)[0][0].item()
         num_placeholders = int(img_mask.sum().item())

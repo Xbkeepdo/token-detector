@@ -1,10 +1,5 @@
 # AGENTS.md
 
-## Project context
-This project is developed on a temporary school server.
-The persistent root is ~/userdata/CODEX.
-Codex home is ~/userdata/CODEX/codex-home.
-Project directories are under ~/userdata/CODEX/test-cocochair/token-detector.
 
 ## Before starting
 - Read docs/CURRENT_TASK.md if it exists.

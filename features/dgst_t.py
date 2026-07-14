@@ -8,7 +8,10 @@ context-confidence features.
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import lru_cache
+import multiprocessing as mp
+import os
 from typing import Any, Sequence
 import warnings
 
@@ -21,6 +24,23 @@ CAPPED_TOPMASS_MIN_K = 32
 CAPPED_TOPMASS_MAX_K = 64
 RELATIVE_VLL_MAD_EPSILON = 1e-6
 COSINE16_TOP_K = 16
+GAUSSIAN_MAD_SCALE = 1.4826
+
+COST_VARIANT_RISK_KEYS = (
+    "risk_geo",
+    "risk_cosine_hpre",
+    "risk_sqrt_hmid",
+    "risk_sqrt_hpre",
+    "risk_raw_attention_hmid",
+    "risk_raw_attention_hpre",
+    "gauss_risk_geo",
+    "gauss_risk_cosine_hpre",
+    "gauss_risk_sqrt_hmid",
+    "gauss_risk_sqrt_hpre",
+)
+
+_EMD_PROCESS_POOL: ProcessPoolExecutor | None = None
+_EMD_PROCESS_POOL_WORKERS: int | None = None
 
 
 def compute_dgst_t(
@@ -321,6 +341,7 @@ def compute_dgst_t_batch_from_captures(
         }
         for _ in target_ids
     ]
+    cost_variant_mode = _normalize_target_gate_mode(target_gate_mode) == "cost_variants"
 
     for capture in captures:
         h_prev = capture["h_prev"][0]
@@ -343,24 +364,40 @@ def compute_dgst_t_batch_from_captures(
         support_output_states = layer_hidden.index_select(0, support_index)
         prompt_states = layer_hidden.index_select(0, prompt_index)
 
-        support_semantic_all = target_probabilities_multi(
-            output_layer=output_layer,
-            states=support_states,
-            target_token_ids=target_ids,
-            chunk_size=semantic_chunk_size,
-        )
+        if cost_variant_mode:
+            # Cost variants gate with relative logits and do not persist these
+            # legacy full-vocabulary semantic probabilities.
+            support_semantic_all = torch.ones(
+                (int(support_states.shape[0]), len(target_ids)),
+                dtype=torch.float32,
+                device=support_states.device,
+            )
+        else:
+            support_semantic_all = target_probabilities_multi(
+                output_layer=output_layer,
+                states=support_states,
+                target_token_ids=target_ids,
+                chunk_size=semantic_chunk_size,
+            )
         support_relative_logits_all = target_logits_multi(
             output_layer=output_layer,
             states=support_relative_states,
             target_token_ids=target_ids,
             chunk_size=semantic_chunk_size,
         )
-        prompt_probs_all = target_probabilities_multi(
-            output_layer=output_layer,
-            states=prompt_states,
-            target_token_ids=target_ids,
-            chunk_size=semantic_chunk_size,
-        )
+        if cost_variant_mode:
+            prompt_probs_all = torch.ones(
+                (int(prompt_states.shape[0]), len(target_ids)),
+                dtype=torch.float32,
+                device=prompt_states.device,
+            )
+        else:
+            prompt_probs_all = target_probabilities_multi(
+                output_layer=output_layer,
+                states=prompt_states,
+                target_token_ids=target_ids,
+                chunk_size=semantic_chunk_size,
+            )
         top_k = min(3, int(prompt_probs_all.shape[0]))
         prompt_conf_top3_all = torch.topk(prompt_probs_all.float(), k=top_k, dim=0).values.mean(dim=0)
         prompt_conf_max_all = prompt_probs_all.float().max(dim=0).values
@@ -590,7 +627,8 @@ def _compute_dgst_t_from_parts(
     compute_delta_src = "delta_src" in enabled_source_modes
     gamma_values = _normalize_target_attention_gammas(target_attention_gammas)
     source_distribution = _normalize_source_distribution_mode(source_distribution_mode)
-    compute_relative_vll = gate_mode in {"relative_vll", "dual"}
+    compute_cost_variants = gate_mode == "cost_variants"
+    compute_relative_vll = gate_mode in {"relative_vll", "dual", "cost_variants"}
     if compute_relative_vll and relative_vll_logits is None:
         raise ValueError("target_gate_mode requires relative_vll_logits, but they are missing.")
     for name, values in {
@@ -651,6 +689,7 @@ def _compute_dgst_t_from_parts(
     vv_support_attention_per_layer = []
     vv_source_dist_per_layer = []
     vv_semantic_gate_per_layer = []
+    vv_gauss_semantic_gate_per_layer = []
     vv_raw_evidence_strength_per_layer = []
     vv_source_entropy_per_layer = []
     vv_target_entropy_per_layer = []
@@ -701,6 +740,12 @@ def _compute_dgst_t_from_parts(
         mode: [] for mode in source_variant_modes
     }
     capped_support_series: dict[str, dict[str, list[list[int]]]] = {}
+    cost_variant_series: dict[str, list[float]] = {
+        key: [] for key in COST_VARIANT_RISK_KEYS
+    }
+    cost_variant_problem_series: dict[str, list[Any]] = {
+        key: [] for key in COST_VARIANT_RISK_KEYS
+    }
     relative_cost_series: dict[str, dict[str, list[float]]] = {}
     if compute_relative_vll and emit_relative_cost_fields:
         for mode in emit_relative_cost_modes:
@@ -804,6 +849,8 @@ def _compute_dgst_t_from_parts(
         relative_barrier_vll = None
         relative_vll_stats = None
         relative_vll_evidence_strength = None
+        gauss_relative_vll_evidence = None
+        gauss_semantic_gate_relative_vll = None
         visual_prompt_relative_vll_evidence = None
         semantic_gate_visual_prompt_relative_vll = None
         visual_prompt_relative_barrier_vll = None
@@ -834,6 +881,25 @@ def _compute_dgst_t_from_parts(
                     barrier_max=relative_barrier_max,
                 )
                 relative_vll_evidence_strength = relative_vll_evidence.sum()
+                if compute_cost_variants:
+                    (
+                        gauss_relative_vll_evidence,
+                        gauss_semantic_gate_relative_vll,
+                        _gauss_relative_barrier,
+                        _gauss_relative_stats,
+                    ) = _relative_vll_evidence_signal(
+                        attention_signal=layer_support_attentions,
+                        target_logits=layer_relative_logits,
+                        support_positions=support_positions,
+                        visual_start=visual_start,
+                        visual_end=visual_end,
+                        candidate_scope="visual",
+                        stat_prefix="gauss_relative_vll",
+                        epsilon=relative_vll_mad_epsilon,
+                        barrier_margin=relative_barrier_margin,
+                        barrier_max=relative_barrier_max,
+                        mad_scale=GAUSSIAN_MAD_SCALE,
+                    )
                 if not has_prompt_support:
                     vv_attention_dist_per_layer.append(attention_dist.detach().cpu())
                     vv_support_attention_per_layer.append(
@@ -847,6 +913,10 @@ def _compute_dgst_t_from_parts(
                     vv_semantic_gate_per_layer.append(
                         semantic_gate_relative_vll.detach().cpu()
                     )
+                    if gauss_semantic_gate_relative_vll is not None:
+                        vv_gauss_semantic_gate_per_layer.append(
+                            gauss_semantic_gate_relative_vll.detach().cpu()
+                        )
                     vv_raw_evidence_strength_per_layer.append(
                         float(relative_vll_evidence_strength.detach())
                     )
@@ -921,6 +991,24 @@ def _compute_dgst_t_from_parts(
                 vp_raw_evidence_strength_per_layer.append(
                     float(visual_prompt_relative_vll_evidence_strength.detach())
                 )
+
+        if compute_cost_variants:
+            if has_prompt_support:
+                raise ValueError("cost_variants mode requires visual-only (VV) support.")
+            if relative_vll_evidence is None or gauss_relative_vll_evidence is None:
+                raise ValueError("cost_variants mode requires both relative-VLL targets.")
+            layer_cost_variant_problems = _prepare_cost_variant_problems(
+                source_dist=source_dist,
+                relative_target=relative_vll_evidence,
+                gauss_target=gauss_relative_vll_evidence,
+                raw_attention_target=attention_dist,
+                hmid_states=layer_support_states,
+                hpre_states=layer_support_prev_states,
+                transport_top_k=transport_top_k,
+                ot_solver=ot_solver,
+            )
+            for key, problem in layer_cost_variant_problems.items():
+                cost_variant_problem_series[key].append(problem)
 
         ffn_injection = None
         ffn_gate_ratio = None
@@ -2096,6 +2184,12 @@ def _compute_dgst_t_from_parts(
             stats.update(delta_layer_stats)
         layer_stats.append(stats)
 
+    if compute_cost_variants:
+        cost_variant_series = _solve_cost_variant_problem_series(
+            cost_variant_problem_series,
+            ot_solver=ot_solver,
+        )
+
     risk_tensor = torch.tensor(risk_per_layer, dtype=torch.float32)
     final_score = _baseline_excess_score(
         risk_tensor,
@@ -2249,6 +2343,10 @@ def _compute_dgst_t_from_parts(
             result["dgst_t_vv_semantic_gate_per_layer"] = torch.stack(
                 vv_semantic_gate_per_layer
             ).to(dtype=torch.float32)
+            if vv_gauss_semantic_gate_per_layer:
+                result["dgst_t_vv_gauss_semantic_gate_per_layer"] = torch.stack(
+                    vv_gauss_semantic_gate_per_layer
+                ).to(dtype=torch.float32)
             result["dgst_t_vv_raw_evidence_strength_per_layer"] = torch.tensor(
                 vv_raw_evidence_strength_per_layer,
                 dtype=torch.float32,
@@ -2269,6 +2367,19 @@ def _compute_dgst_t_from_parts(
                 vv_source_topk_entropy_per_layer,
                 dtype=torch.float32,
             )
+        if compute_cost_variants:
+            for key, values in cost_variant_series.items():
+                if len(values) != layer_count:
+                    raise ValueError(
+                        f"Incomplete cost variant {key}: {len(values)} of {layer_count} layers."
+                    )
+                result[f"dgst_t_{key}_per_layer"] = torch.tensor(
+                    values,
+                    dtype=torch.float32,
+                )
+            result["dgst_t_cost_variant_mad_scale"] = float(GAUSSIAN_MAD_SCALE)
+            result["dgst_t_cost_variant_transport_top_k"] = int(transport_top_k)
+            result["dgst_t_cost_variant_hprecosine_top_k"] = int(atarget_visual_top_k)
         if js_relative_vll_per_layer:
             result["dgst_t_js_relative_vll_per_layer"] = torch.tensor(
                 js_relative_vll_per_layer,
@@ -2837,7 +2948,12 @@ def _normalize_target_gate_mode(value: str) -> str:
         return "relative_vll"
     if mode == "dual":
         return "dual"
-    raise ValueError("DGST-T target_gate_mode must be 'legacy_prob', 'relative_vll', or 'dual'.")
+    if mode in {"cost_variants", "costvariant", "coco500_costvariant"}:
+        return "cost_variants"
+    raise ValueError(
+        "DGST-T target_gate_mode must be 'legacy_prob', 'relative_vll', "
+        "'dual', or 'cost_variants'."
+    )
 
 
 def _normalize_relative_cost_mode(value: str | None, *, legacy_cost_mode: str) -> str:
@@ -3660,6 +3776,7 @@ def _relative_vll_evidence_signal(
     barrier_max: float,
     attention_gamma: float = 1.0,
     attention_epsilon: float = 0.0,
+    mad_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     logits = torch.nan_to_num(target_logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
     if logits.numel() != attention_signal.numel():
@@ -3683,7 +3800,12 @@ def _relative_vll_evidence_signal(
     candidate_logits = logits.index_select(0, candidate_index)
     median = candidate_logits.median()
     mad = torch.abs(candidate_logits - median).median()
-    z = (candidate_logits - median) / (mad + max(float(epsilon), EPS))
+    scale = float(mad_scale)
+    if scale <= 0.0:
+        raise ValueError("relative-VLL mad_scale must be positive.")
+    z = (candidate_logits - median) / (
+        scale * mad + max(float(epsilon), EPS)
+    )
     candidate_gate = torch.sigmoid(z)
     candidate_barrier = torch.relu(-(z + float(barrier_margin))).clamp_max(
         max(float(barrier_max), 0.0)
@@ -3710,8 +3832,364 @@ def _relative_vll_evidence_signal(
         f"{stat_prefix}_barrier_max": float(candidate_barrier.max().item()),
         f"{stat_prefix}_evidence_strength": float(evidence_strength.item()),
         f"{stat_prefix}_attention_gamma": float(gamma),
+        f"{stat_prefix}_mad_scale": float(scale),
     }
     return evidence, semantic_gate, relative_barrier, stats
+
+
+def _compute_cost_variant_risks(
+    *,
+    source_dist: torch.Tensor,
+    relative_target: torch.Tensor,
+    gauss_target: torch.Tensor,
+    raw_attention_target: torch.Tensor,
+    hmid_states: torch.Tensor,
+    hpre_states: torch.Tensor,
+    transport_top_k: int,
+    ot_solver: str,
+) -> dict[str, float]:
+    problems = _prepare_cost_variant_problems(
+        source_dist=source_dist,
+        relative_target=relative_target,
+        gauss_target=gauss_target,
+        raw_attention_target=raw_attention_target,
+        hmid_states=hmid_states,
+        hpre_states=hpre_states,
+        transport_top_k=transport_top_k,
+        ot_solver=ot_solver,
+    )
+    solved = _solve_cost_variant_problem_series(
+        {name: [problem] for name, problem in problems.items()},
+        ot_solver=ot_solver,
+    )
+    return {name: values[0] for name, values in solved.items()}
+
+
+def _prepare_cost_variant_problems(
+    *,
+    source_dist: torch.Tensor,
+    relative_target: torch.Tensor,
+    gauss_target: torch.Tensor,
+    raw_attention_target: torch.Tensor,
+    hmid_states: torch.Tensor,
+    hpre_states: torch.Tensor,
+    transport_top_k: int,
+    ot_solver: str = "emd",
+) -> dict[str, Any]:
+    targets = {
+        "relative": _renormalize(relative_target),
+        "gauss": _renormalize(gauss_target),
+        "raw_attention": _renormalize(raw_attention_target),
+    }
+    supports = {
+        name: _topk_union_indices(source_dist, target, transport_top_k)
+        for name, target in targets.items()
+    }
+
+    def problem(target_name: str, state_name: str, *, sqrt: bool = False):
+        states = hmid_states if state_name == "hmid" else hpre_states
+        return _prepare_transport_problem_for_state_cost(
+            source_dist=source_dist,
+            target_dist=targets[target_name],
+            states=states,
+            support=supports[target_name],
+            sqrt_cosine=sqrt,
+            keep_on_device=_effective_ot_solver(ot_solver) == "sinkhorn",
+        )
+
+    return {
+        "risk_geo": problem("relative", "hmid"),
+        "risk_cosine_hpre": problem("relative", "hpre"),
+        "risk_sqrt_hmid": problem("relative", "hmid", sqrt=True),
+        "risk_sqrt_hpre": problem("relative", "hpre", sqrt=True),
+        "risk_raw_attention_hmid": problem("raw_attention", "hmid"),
+        "risk_raw_attention_hpre": problem("raw_attention", "hpre"),
+        "gauss_risk_geo": problem("gauss", "hmid"),
+        "gauss_risk_cosine_hpre": problem("gauss", "hpre"),
+        "gauss_risk_sqrt_hmid": problem("gauss", "hmid", sqrt=True),
+        "gauss_risk_sqrt_hpre": problem("gauss", "hpre", sqrt=True),
+    }
+
+
+def _solve_cost_variant_problem_series(
+    problem_series: dict[str, list[Any]],
+    *,
+    ot_solver: str,
+) -> dict[str, list[float]]:
+    effective_solver = _effective_ot_solver(ot_solver)
+    if effective_solver == "sinkhorn":
+        return _solve_sinkhorn_problem_series(problem_series)
+    workers = _cost_variant_emd_workers(len(problem_series))
+    if workers == 1:
+        return {
+            name: [_solve_transport_problem(problem, effective_solver) for problem in problems]
+            for name, problems in problem_series.items()
+        }
+    backend = os.environ.get("DGST_COST_VARIANT_EMD_BACKEND", "thread").strip().lower()
+    if backend == "process":
+        executor = _get_emd_process_pool(workers)
+        futures = {
+            name: executor.submit(
+                _solve_transport_problem_batch,
+                problems,
+                effective_solver,
+            )
+            for name, problems in problem_series.items()
+        }
+        return {name: futures[name].result() for name in problem_series}
+    if backend != "thread":
+        raise ValueError(
+            "DGST_COST_VARIANT_EMD_BACKEND must be 'thread' or 'process'."
+        )
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dgst-emd") as executor:
+        futures = {
+            name: executor.submit(
+                _solve_transport_problem_batch,
+                problems,
+                effective_solver,
+            )
+            for name, problems in problem_series.items()
+        }
+        # Preserve the canonical field order even though solves finish out of order.
+        return {name: futures[name].result() for name in problem_series}
+
+
+def _get_emd_process_pool(workers: int) -> ProcessPoolExecutor:
+    global _EMD_PROCESS_POOL, _EMD_PROCESS_POOL_WORKERS
+    if _EMD_PROCESS_POOL is None:
+        _EMD_PROCESS_POOL = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp.get_context("spawn"),
+            initializer=_initialize_emd_worker,
+        )
+        _EMD_PROCESS_POOL_WORKERS = int(workers)
+    elif _EMD_PROCESS_POOL_WORKERS != int(workers):
+        raise RuntimeError(
+            "DGST_COST_VARIANT_EMD_WORKERS cannot change after the process pool starts."
+        )
+    return _EMD_PROCESS_POOL
+
+
+def _initialize_emd_worker() -> None:
+    # Prevent a process per EMD task from recursively spawning BLAS/OpenMP
+    # threads.  The outer process pool is the intended parallelism level.
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    torch.set_num_threads(1)
+
+
+def _cost_variant_emd_workers(problem_count: int) -> int:
+    raw = os.environ.get("DGST_COST_VARIANT_EMD_WORKERS", "1")
+    try:
+        requested = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "DGST_COST_VARIANT_EMD_WORKERS must be a positive integer."
+        ) from exc
+    if requested < 1:
+        raise ValueError("DGST_COST_VARIANT_EMD_WORKERS must be >= 1.")
+    return min(int(problem_count), requested)
+
+
+def _effective_ot_solver(configured_solver: str) -> str:
+    return os.environ.get("DGST_OT_SOLVER_OVERRIDE", configured_solver).strip().lower()
+
+
+def _solve_sinkhorn_problem_series(
+    problem_series: dict[str, list[Any]],
+) -> dict[str, list[float]]:
+    """Experimental batched log-domain Sinkhorn for cost-variant risks."""
+    reg = float(os.environ.get("DGST_SINKHORN_REG", "0.05"))
+    max_iter = int(os.environ.get("DGST_SINKHORN_MAX_ITER", "500"))
+    tol = float(os.environ.get("DGST_SINKHORN_TOL", "1e-6"))
+    max_marginal_error = float(
+        os.environ.get("DGST_SINKHORN_MAX_MARGINAL_ERROR", "1e-4")
+    )
+    batch_size = int(os.environ.get("DGST_SINKHORN_BATCH_SIZE", "512"))
+    if reg <= 0.0 or max_iter < 1 or tol <= 0.0 or batch_size < 1:
+        raise ValueError("Invalid experimental Sinkhorn configuration.")
+
+    output = {
+        name: [0.0] * len(problems)
+        for name, problems in problem_series.items()
+    }
+    grouped: dict[tuple[str, int, int], list[tuple[str, int, Any]]] = {}
+    for name, problems in problem_series.items():
+        for layer_index, problem in enumerate(problems):
+            if problem is None:
+                continue
+            source, target, cost = problem
+            if not torch.is_tensor(source):
+                source = torch.from_numpy(source)
+                target = torch.from_numpy(target)
+                cost = torch.from_numpy(cost)
+                problem = (source, target, cost)
+            grouped.setdefault(
+                (str(cost.device), int(cost.shape[0]), int(cost.shape[1])),
+                [],
+            ).append((name, layer_index, problem))
+
+    for entries in grouped.values():
+        for start in range(0, len(entries), batch_size):
+            chunk = entries[start : start + batch_size]
+            source = torch.stack([item[2][0] for item in chunk]).float()
+            target = torch.stack([item[2][1] for item in chunk]).float()
+            cost = torch.stack([item[2][2] for item in chunk]).float()
+            risks, marginal_error = _sinkhorn_linear_cost_batch(
+                source,
+                target,
+                cost,
+                reg=reg,
+                max_iter=max_iter,
+                tol=tol,
+            )
+            if marginal_error > max_marginal_error:
+                raise RuntimeError(
+                    "Experimental Sinkhorn did not converge: "
+                    f"marginal_error={marginal_error:.3e} > "
+                    f"{max_marginal_error:.3e}."
+                )
+            for (name, layer_index, _problem), risk in zip(chunk, risks.tolist()):
+                output[name][layer_index] = float(risk)
+    return output
+
+
+@torch.no_grad()
+def _sinkhorn_linear_cost_batch(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    cost: torch.Tensor,
+    *,
+    reg: float,
+    max_iter: int,
+    tol: float,
+) -> tuple[torch.Tensor, float]:
+    """Return linear cost <C, Pi_epsilon> and maximum marginal residual."""
+    source = _renormalize_batch(source.float())
+    target = _renormalize_batch(target.float())
+    cost = torch.nan_to_num(
+        cost.float(), nan=1e6, posinf=1e6, neginf=1e6
+    ).clamp_min(0.0)
+    log_source = source.clamp_min(EPS).log()
+    log_target = target.clamp_min(EPS).log()
+    f = torch.zeros_like(source)
+    g = torch.zeros_like(target)
+    marginal_error = float("inf")
+    plan = None
+    for iteration in range(max_iter):
+        f = reg * (
+            log_source
+            - torch.logsumexp((g.unsqueeze(1) - cost) / reg, dim=2)
+        )
+        g = reg * (
+            log_target
+            - torch.logsumexp((f.unsqueeze(2) - cost) / reg, dim=1)
+        )
+        if (iteration + 1) % 10 == 0 or iteration + 1 == max_iter:
+            plan = torch.exp((f.unsqueeze(2) + g.unsqueeze(1) - cost) / reg)
+            row_error = (plan.sum(dim=2) - source).abs().amax()
+            col_error = (plan.sum(dim=1) - target).abs().amax()
+            marginal_error = float(torch.maximum(row_error, col_error).item())
+            if marginal_error <= tol:
+                break
+    if plan is None:
+        plan = torch.exp((f.unsqueeze(2) + g.unsqueeze(1) - cost) / reg)
+        marginal_error = float(
+            torch.maximum(
+                (plan.sum(dim=2) - source).abs().amax(),
+                (plan.sum(dim=1) - target).abs().amax(),
+            ).item()
+        )
+    return (plan * cost).sum(dim=(1, 2)), marginal_error
+
+
+def _renormalize_batch(values: torch.Tensor) -> torch.Tensor:
+    values = torch.nan_to_num(
+        values, nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp_min(0.0)
+    totals = values.sum(dim=1, keepdim=True)
+    uniform = torch.full_like(values, 1.0 / max(int(values.shape[1]), 1))
+    return torch.where(totals > EPS, values / totals.clamp_min(EPS), uniform)
+
+
+def _solve_transport_problem(problem, ot_solver: str) -> float:
+    if problem is None:
+        return 0.0
+    local_source, local_target, distance = problem
+    if not torch.is_tensor(local_source):
+        local_source = torch.from_numpy(local_source)
+        local_target = torch.from_numpy(local_target)
+        distance = torch.from_numpy(distance)
+    transport_risk, _transport_plan = _wasserstein_1_exact(
+        local_source,
+        local_target,
+        distance,
+        solver=ot_solver,
+    )
+    return float(transport_risk)
+
+
+def _solve_transport_problem_batch(problems, ot_solver: str) -> list[float]:
+    return [_solve_transport_problem(problem, ot_solver) for problem in problems]
+
+
+def _prepare_transport_problem_for_state_cost(
+    *,
+    source_dist: torch.Tensor,
+    target_dist: torch.Tensor,
+    states: torch.Tensor,
+    support: torch.Tensor,
+    sqrt_cosine: bool,
+    keep_on_device: bool = False,
+):
+    """Build one OT problem on the caller thread, then move it to CPU.
+
+    Keeping CUDA indexing/cost construction out of worker threads avoids
+    concurrent CUDA stream access.  Only the independent POT EMD solves run in
+    parallel.
+    """
+    if support.numel() == 0:
+        return None
+    local_source = _renormalize(source_dist.index_select(0, support))
+    local_target = _renormalize(target_dist.index_select(0, support))
+    local_states = states.index_select(0, support)
+    distance = _cosine_distance_matrix(local_states)
+    if sqrt_cosine:
+        distance = torch.sqrt((distance / 2.0).clamp_min(0.0))
+    if keep_on_device:
+        return (
+            local_source.detach(),
+            local_target.detach(),
+            distance.detach(),
+        )
+    # NumPy copies use normal pickle payloads for ProcessPool IPC. Passing
+    # hundreds of CPU torch tensors would create one shared-memory file
+    # descriptor per storage and exhaust the worker's FD limit.
+    return (
+        local_source.detach().float().cpu().numpy().copy(),
+        local_target.detach().float().cpu().numpy().copy(),
+        distance.detach().float().cpu().numpy().copy(),
+    )
+
+
+def _transport_risk_for_state_cost(
+    *,
+    source_dist: torch.Tensor,
+    target_dist: torch.Tensor,
+    states: torch.Tensor,
+    support: torch.Tensor,
+    sqrt_cosine: bool,
+    ot_solver: str,
+) -> float:
+    problem = _prepare_transport_problem_for_state_cost(
+        source_dist=source_dist,
+        target_dist=target_dist,
+        states=states,
+        support=support,
+        sqrt_cosine=sqrt_cosine,
+    )
+    return _solve_transport_problem(problem, ot_solver)
 
 
 def _has_prompt_support_tokens(

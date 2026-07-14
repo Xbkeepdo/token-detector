@@ -99,9 +99,10 @@ class LLaVAWrapper(BaseLVLMWrapper):
         response_token_idx: int,
         target_token_id: Optional[int] = None,
         cfg_dgst_t: Optional[dict] = None,
+        prompt: Optional[str] = None,
     ) -> ModelOutput:
         """Runs a forward pass with prompt+partial_response and returns"""
-        prompt_text = self.cfg["prompt_template"]
+        prompt_text = prompt or self.cfg["prompt_template"]
         partial_text = self.tokenizer.decode(prefix_token_ids, skip_special_tokens=True)
         full_prompt = prompt_text + partial_text
 
@@ -203,6 +204,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
         response_token_indices: Sequence[int],
         target_token_ids: Optional[Sequence[int]] = None,
         cfg_dgst_t: Optional[dict] = None,
+        prompt: Optional[str] = None,
     ) -> List[ModelOutput]:
         requested_indices = [int(index) for index in response_token_indices]
         if not requested_indices:
@@ -214,7 +216,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
             else [response_ids[index] for index in requested_indices]
         )
 
-        prompt_text = self.cfg["prompt_template"]
+        prompt_text = prompt or self.cfg["prompt_template"]
         prefix_inputs = self.processor(
             text=prompt_text,
             images=image,
