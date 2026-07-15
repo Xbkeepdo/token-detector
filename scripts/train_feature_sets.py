@@ -73,6 +73,18 @@ FEATURE_ALIASES = {
     "risk_geo_raw": "risk_relative_vll_cost_geo",
     "risk_geo_cap085": "risk_relative_vll_cost_geo_capped_topmass_085",
     "risk_geo_capped_topmass_085": "risk_relative_vll_cost_geo_capped_topmass_085",
+    "risk_geo": "risk_geo",
+    "risk_cosine_hpre": "risk_cosine_hpre",
+    "risk_sqrt_hmid": "risk_sqrt_hmid",
+    "risk_sqrt_hpre": "risk_sqrt_hpre",
+    "risk_rawattention_hmid": "risk_raw_attention_hmid",
+    "risk_raw_attention_hmid": "risk_raw_attention_hmid",
+    "risk_rawattention_hpre": "risk_raw_attention_hpre",
+    "risk_raw_attention_hpre": "risk_raw_attention_hpre",
+    "gauss_risk_geo": "gauss_risk_geo",
+    "gauss_risk_cosine_hpre": "gauss_risk_cosine_hpre",
+    "gauss_risk_sqrt_hmid": "gauss_risk_sqrt_hmid",
+    "gauss_risk_sqrt_hpre": "gauss_risk_sqrt_hpre",
     "risk_hmid_proj": "risk_relative_vll_source_hmid_proj",
     "hmid_proj": "risk_relative_vll_source_hmid_proj",
     "risk_hprev_cos": "risk_relative_vll_source_hprev_cos",
@@ -273,6 +285,16 @@ FEATURE_KEYS = {
     "risk_visual_prompt_relative_vll_capped_topmass_085": (
         "dgst_t_transport_risk_visual_prompt_relative_vll_capped_topmass_085_per_layer"
     ),
+    "risk_geo": "dgst_t_risk_geo_per_layer",
+    "risk_cosine_hpre": "dgst_t_risk_cosine_hpre_per_layer",
+    "risk_sqrt_hmid": "dgst_t_risk_sqrt_hmid_per_layer",
+    "risk_sqrt_hpre": "dgst_t_risk_sqrt_hpre_per_layer",
+    "risk_raw_attention_hmid": "dgst_t_risk_raw_attention_hmid_per_layer",
+    "risk_raw_attention_hpre": "dgst_t_risk_raw_attention_hpre_per_layer",
+    "gauss_risk_geo": "dgst_t_gauss_risk_geo_per_layer",
+    "gauss_risk_cosine_hpre": "dgst_t_gauss_risk_cosine_hpre_per_layer",
+    "gauss_risk_sqrt_hmid": "dgst_t_gauss_risk_sqrt_hmid_per_layer",
+    "gauss_risk_sqrt_hpre": "dgst_t_gauss_risk_sqrt_hpre_per_layer",
     "risk_relative_vll_source_hmid_proj": (
         "dgst_t_transport_risk_relative_vll_source_hmid_proj_per_layer"
     ),
@@ -668,17 +690,40 @@ def main() -> None:
 def parse_feature_set(value: str) -> list[str]:
     blocks = []
     for raw in value.split("+"):
-        key = raw.strip().lower().replace("（", "(").replace("）", ")").replace(" ", "")
-        if key not in FEATURE_ALIASES:
-            key = key.replace("-", "_")
+        key = _normalise_feature_key(raw)
         if not key:
             continue
-        if key not in FEATURE_ALIASES:
-            raise ValueError(f"Unknown feature block {raw!r}. Choices: {sorted(FEATURE_ALIASES)}")
-        blocks.append(FEATURE_ALIASES[key])
+        if key in FEATURE_ALIASES:
+            blocks.append(FEATURE_ALIASES[key])
+            continue
+        factors = key.split("*")
+        if len(factors) == 2:
+            left = _resolve_feature_alias(factors[0])
+            right = _resolve_feature_alias(factors[1])
+            blocks.append(f"__product__:{left}:{right}")
+            continue
+        raise ValueError(
+            f"Unknown feature block {raw!r}. Choices: {sorted(FEATURE_ALIASES)}"
+        )
     if not blocks:
         raise ValueError(f"Empty feature set {value!r}.")
     return blocks
+
+
+def _normalise_feature_key(value: str) -> str:
+    key = value.strip().lower().replace("（", "(").replace("）", ")").replace(" ", "")
+    if key not in FEATURE_ALIASES:
+        key = key.replace("-", "_")
+    return key
+
+
+def _resolve_feature_alias(value: str) -> str:
+    key = _normalise_feature_key(value)
+    if key not in FEATURE_ALIASES:
+        raise ValueError(
+            f"Unknown product factor {value!r}. Choices: {sorted(FEATURE_ALIASES)}"
+        )
+    return FEATURE_ALIASES[key]
 
 
 def build_selected_matrix(features: Sequence[dict], blocks: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
@@ -700,6 +745,17 @@ def build_selected_matrix(features: Sequence[dict], blocks: Sequence[str]) -> tu
 def feature_block(feat: dict, block: str) -> np.ndarray:
     if block in ATTENTION_TOPK_DIVERGENCE_BLOCKS:
         return _attention_topk_source_divergence_block(feat, block)
+
+    if block.startswith("__product__:"):
+        _, left_block, right_block = block.split(":", 2)
+        left = feature_block(feat, left_block)
+        right = feature_block(feat, right_block)
+        if left.shape != right.shape:
+            raise ValueError(
+                f"Product feature blocks {left_block!r} and {right_block!r} must "
+                f"have the same shape, got {left.shape} and {right.shape}."
+            )
+        return (left * right).astype(np.float32)
 
     if block == "target_visual_hidden_cosine_relative_vll_shift1":
         return _shift_right_one_layer(feature_block(feat, "target_visual_hidden_cosine_relative_vll"))

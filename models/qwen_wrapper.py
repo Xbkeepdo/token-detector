@@ -114,13 +114,14 @@ class QwenVLWrapper(BaseLVLMWrapper):
         response_token_idx: int,
         target_token_id: Optional[int] = None,
         cfg_dgst_t: Optional[dict] = None,
+        prompt: Optional[str] = None,
     ) -> ModelOutput:
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": image},
-                    {"type": "text", "text": "Describe this image."},
+                    {"type": "text", "text": prompt or "Describe this image."},
                 ],
             }
         ]
@@ -256,6 +257,7 @@ class QwenVLWrapper(BaseLVLMWrapper):
         response_token_indices: Sequence[int],
         target_token_ids: Optional[Sequence[int]] = None,
         cfg_dgst_t: Optional[dict] = None,
+        prompt: Optional[str] = None,
     ) -> List[ModelOutput]:
         """Qwen uses one prefix forward per object token to avoid long-sequence OOM.
 
@@ -285,6 +287,7 @@ class QwenVLWrapper(BaseLVLMWrapper):
                     response_token_idx=int(response_index),
                     target_token_id=int(target_token_id),
                     cfg_dgst_t=cfg_dgst_t,
+                    prompt=prompt,
                 )
             )
             if torch.cuda.is_available():

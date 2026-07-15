@@ -76,6 +76,7 @@ class BaseLVLMWrapper(ABC):
         response_token_idx: int,
         target_token_id: Optional[int] = None,
         cfg_dgst_t: Optional[dict[str, Any]] = None,
+        prompt: Optional[str] = None,
     ) -> ModelOutput:
         """Run ONE forward pass using `prefix_token_ids` as input and"""
         ...
@@ -87,6 +88,7 @@ class BaseLVLMWrapper(ABC):
         response_token_indices: Sequence[int],
         target_token_ids: Optional[Sequence[int]] = None,
         cfg_dgst_t: Optional[dict[str, Any]] = None,
+        prompt: Optional[str] = None,
     ) -> List[ModelOutput]:
         """Fallback batch API; wrappers can override to reuse one image forward."""
         targets = (
@@ -104,6 +106,7 @@ class BaseLVLMWrapper(ABC):
                     response_token_idx=index,
                     target_token_id=int(target_token_id),
                     cfg_dgst_t=cfg_dgst_t,
+                    prompt=prompt,
                 )
             )
         return outputs

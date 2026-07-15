@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import math
+import os
+import sys
+import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+
+from features.dgst_t import (
+    COST_VARIANT_RISK_KEYS,
+    GAUSSIAN_MAD_SCALE,
+    _compute_cost_variant_risks,
+    _cosine_distance_matrix,
+    _relative_vll_evidence_signal,
+    _sinkhorn_linear_cost_batch,
+    _topk_union_indices,
+    _transport_risk_on_support,
+)
+from features.extractor import _build_cost_variant_feature_record
+from train_feature_sets import build_selected_matrix, parse_feature_set
+
+
+class CostVariantTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.states = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], dtype=torch.float32
+        )
+
+    def test_cosine_and_sqrt_costs(self) -> None:
+        distance = _cosine_distance_matrix(self.states)
+        expected = torch.tensor(
+            [[0.0, 1.0, 2.0], [1.0, 0.0, 1.0], [2.0, 1.0, 0.0]]
+        )
+        self.assertTrue(torch.allclose(distance, expected, atol=1e-6))
+        sqrt_distance = torch.sqrt((distance / 2.0).clamp_min(0.0))
+        self.assertTrue(torch.allclose(sqrt_distance, sqrt_distance.T))
+        self.assertTrue(torch.allclose(torch.diag(sqrt_distance), torch.zeros(3)))
+        self.assertTrue(torch.isfinite(sqrt_distance).all())
+
+    def test_gaussian_mad_gate_and_zero_mad_are_finite(self) -> None:
+        kwargs = dict(
+            attention_signal=torch.tensor([0.2, 0.3, 0.5]),
+            support_positions=[0, 1, 2],
+            visual_start=0,
+            visual_end=3,
+            candidate_scope="visual",
+            epsilon=1e-6,
+            barrier_margin=0.5,
+            barrier_max=3.0,
+        )
+        evidence, gate, _, stats = _relative_vll_evidence_signal(
+            target_logits=torch.tensor([0.0, 1.0, 4.0]),
+            stat_prefix="gauss",
+            mad_scale=GAUSSIAN_MAD_SCALE,
+            **kwargs,
+        )
+        expected_z = torch.tensor([-1.0, 0.0, 3.0]) / (
+            GAUSSIAN_MAD_SCALE + 1e-6
+        )
+        self.assertTrue(torch.allclose(gate, torch.sigmoid(expected_z), atol=1e-6))
+        self.assertTrue(torch.allclose(evidence, kwargs["attention_signal"] * gate))
+        self.assertEqual(stats["gauss_mad_scale"], GAUSSIAN_MAD_SCALE)
+
+        evidence, gate, _, _ = _relative_vll_evidence_signal(
+            target_logits=torch.ones(3),
+            stat_prefix="zero_mad",
+            mad_scale=GAUSSIAN_MAD_SCALE,
+            **kwargs,
+        )
+        self.assertTrue(torch.isfinite(evidence).all())
+        self.assertTrue(torch.isfinite(gate).all())
+        self.assertTrue(torch.allclose(gate, torch.full((3,), 0.5)))
+
+    def test_all_risks_are_finite_and_raw_attention_is_direct(self) -> None:
+        source = torch.tensor([0.7, 0.2, 0.1])
+        relative = torch.tensor([0.1, 0.3, 0.6])
+        gauss = torch.tensor([0.2, 0.4, 0.4])
+        raw_attention = torch.tensor([2.0, 3.0, 5.0])
+        risks = _compute_cost_variant_risks(
+            source_dist=source,
+            relative_target=relative,
+            gauss_target=gauss,
+            raw_attention_target=raw_attention,
+            hmid_states=self.states,
+            hpre_states=self.states.roll(1, dims=0),
+            transport_top_k=3,
+            ot_solver="linprog",
+        )
+        self.assertEqual(set(risks), set(COST_VARIANT_RISK_KEYS))
+        self.assertTrue(all(math.isfinite(value) for value in risks.values()))
+        support = _topk_union_indices(source, relative, 3)
+        legacy_geo = _transport_risk_on_support(
+            source_dist=source,
+            target_dist=relative,
+            support_states=self.states,
+            semantic_probs=torch.ones(3),
+            support=support,
+            cost_mode="geo",
+            lambda_d=1.0,
+            lambda_s=1.0,
+            lambda_t=1.0,
+            lambda_int=1.0,
+            ot_solver="linprog",
+        )
+        self.assertAlmostEqual(risks["risk_geo"], legacy_geo, places=6)
+
+        scaled = _compute_cost_variant_risks(
+            source_dist=source,
+            relative_target=relative,
+            gauss_target=gauss,
+            raw_attention_target=raw_attention * 17.0,
+            hmid_states=self.states,
+            hpre_states=self.states.roll(1, dims=0),
+            transport_top_k=3,
+            ot_solver="linprog",
+        )
+        self.assertAlmostEqual(
+            risks["risk_raw_attention_hmid"],
+            scaled["risk_raw_attention_hmid"],
+            places=6,
+        )
+
+    def test_parallel_emd_matches_serial_exactly(self) -> None:
+        kwargs = dict(
+            source_dist=torch.tensor([0.7, 0.2, 0.1]),
+            relative_target=torch.tensor([0.1, 0.3, 0.6]),
+            gauss_target=torch.tensor([0.2, 0.4, 0.4]),
+            raw_attention_target=torch.tensor([2.0, 3.0, 5.0]),
+            hmid_states=self.states,
+            hpre_states=self.states.roll(1, dims=0),
+            transport_top_k=3,
+            ot_solver="emd",
+        )
+        with patch.dict(os.environ, {"DGST_COST_VARIANT_EMD_WORKERS": "1"}):
+            serial = _compute_cost_variant_risks(**kwargs)
+        with patch.dict(os.environ, {"DGST_COST_VARIANT_EMD_WORKERS": "10"}):
+            parallel = _compute_cost_variant_risks(**kwargs)
+        self.assertEqual(list(serial), list(parallel))
+        for key in serial:
+            self.assertAlmostEqual(serial[key], parallel[key], places=12)
+
+    def test_sinkhorn_returns_valid_but_regularized_transport_cost(self) -> None:
+        source = torch.tensor([[0.5, 0.5]])
+        target = torch.tensor([[0.5, 0.5]])
+        cost = torch.tensor([[[0.0, 1.0], [1.0, 0.0]]])
+        risk, marginal_error = _sinkhorn_linear_cost_batch(
+            source,
+            target,
+            cost,
+            reg=0.5,
+            max_iter=500,
+            tol=1e-7,
+        )
+        self.assertLessEqual(marginal_error, 1e-6)
+        self.assertGreater(float(risk[0]), 0.0)
+        self.assertLess(float(risk[0]), 0.5)
+
+    def test_training_aliases_cover_21_feature_sets(self) -> None:
+        risk_names = [name.replace("_", "-") for name in COST_VARIANT_RISK_KEYS]
+        risk_names[4] = "risk-rawAttention-hmid"
+        risk_names[5] = "risk-rawAttention-hpre"
+        feature_sets = ["hprecosine", *risk_names]
+        feature_sets.extend(f"{name}+hprecosine" for name in risk_names)
+        self.assertEqual(len(feature_sets), 21)
+        for feature_set in feature_sets:
+            self.assertTrue(parse_feature_set(feature_set))
+
+    def test_risk_hprecosine_product_is_layerwise(self) -> None:
+        row = {
+            "label": 1,
+            "dgst_t_risk_geo_per_layer": [0.2, 0.5, 0.8],
+            "dgst_t_target_visual_hpre_cosine_relative_vll_per_layer": [0.3, 0.4, 0.9],
+        }
+        blocks = parse_feature_set("risk-geo*hprecosine")
+        matrix, labels = build_selected_matrix([row], blocks)
+        self.assertEqual(matrix.shape, (1, 3))
+        self.assertTrue(
+            np.allclose(matrix[0], np.asarray([0.06, 0.20, 0.72], dtype=np.float32))
+        )
+        self.assertTrue(np.array_equal(labels, np.asarray([1], dtype=np.int32)))
+        self.assertEqual(
+            parse_feature_set("ffn_fad*risk_geo_raw"),
+            ["ffn_fad_x_risk_geo_raw"],
+        )
+
+    def test_compact_feature_record_has_exact_profile(self) -> None:
+        layers, support = 2, 3
+        dgst_t = {
+            f"dgst_t_{name}_per_layer": torch.ones(layers)
+            for name in COST_VARIANT_RISK_KEYS
+        }
+        dgst_t.update(
+            {
+                "dgst_t_target_visual_hpre_cosine_relative_vll_per_layer": torch.ones(layers),
+                "dgst_t_vv_support_attention_per_layer": torch.ones(layers, support),
+                "dgst_t_vv_source_dist_per_layer": torch.ones(layers, support),
+                "dgst_t_vv_semantic_gate_per_layer": torch.ones(layers, support),
+                "dgst_t_vv_gauss_semantic_gate_per_layer": torch.ones(layers, support),
+                "dgst_t_vv_support_positions": [10, 11, 12],
+                "dgst_t_cost_variant_mad_scale": GAUSSIAN_MAD_SCALE,
+                "dgst_t_cost_variant_transport_top_k": 64,
+                "dgst_t_cost_variant_hprecosine_top_k": 32,
+                "dgst_t_relative_vll_logit_source": "h_mid",
+                "dgst_t_source_distribution_mode": "softmax",
+            }
+        )
+        record = _build_cost_variant_feature_record(
+            image_id=1,
+            span={"word": "car", "label": 1},
+            response_index=2,
+            target_token_id=3,
+            model_out=SimpleNamespace(token_id=3),
+            dgst_t=dgst_t,
+        )
+        self.assertEqual(len(record), 27)
+        self.assertNotIn("dgst_t_layer_stats", record)
+        self.assertEqual(tuple(record["dgst_t_vv_source_dist_per_layer"].shape), (2, 3))
+
+
+if __name__ == "__main__":
+    unittest.main()

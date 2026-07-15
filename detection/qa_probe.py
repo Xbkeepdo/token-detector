@@ -1,0 +1,371 @@
+"""Torch MLP probes and metrics for the unified yes/no QA feature records."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import random
+import re
+import tempfile
+from pathlib import Path
+from typing import Sequence
+
+import numpy as np
+import torch
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    f1_score,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from features.dgst_t import COST_VARIANT_RISK_KEYS
+
+
+class QAProbe(nn.Module):
+    def __init__(self, input_dim: int, hidden_sizes=(128, 64, 32), dropout=0.3):
+        super().__init__()
+        layers = []
+        previous = input_dim
+        for hidden in hidden_sizes:
+            layers.extend((nn.Linear(previous, hidden), nn.ReLU(), nn.Dropout(dropout)))
+            previous = hidden
+        layers.append(nn.Linear(previous, 1))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, inputs):
+        return self.network(inputs).squeeze(-1)
+
+
+def default_feature_sets(dataset: str) -> list[str]:
+    names = ["ads", "cgc", "ads+cgc", "token_uncertainty", "svar", "legacy_all"]
+    targets = ("answer", "object") if dataset == "pope" else ("answer",)
+    for target in targets:
+        names.append(f"hprecosine@{target}")
+        for risk in COST_VARIANT_RISK_KEYS:
+            names.append(f"{risk}@{target}")
+            names.append(f"{risk}+hprecosine@{target}")
+    return names
+
+
+def feature_vector(row: dict, feature_set: str) -> np.ndarray:
+    if feature_set == "ads":
+        return _concat(row["ads_score"], row["ads_per_layer"])
+    if feature_set == "cgc":
+        return _concat(row["answer_cgc_score"], row["answer_cgc_per_layer"])
+    if feature_set == "ads+cgc":
+        return np.concatenate((feature_vector(row, "ads"), feature_vector(row, "cgc")))
+    if feature_set == "token_uncertainty":
+        return _concat(row["token_log_probability"], row["token_entropy"], row["token_nll"])
+    if feature_set == "svar":
+        return _concat(row["svar_score"])
+    if feature_set == "legacy_all":
+        return np.concatenate((
+            feature_vector(row, "ads+cgc"),
+            feature_vector(row, "token_uncertainty"),
+            feature_vector(row, "svar"),
+            _concat(row["attention_per_head_mid"]),
+        ))
+    if feature_set.startswith("best_dgst_legacy:"):
+        selected = feature_set.split(":", 1)[1]
+        return np.concatenate((feature_vector(row, selected), feature_vector(row, "legacy_all")))
+
+    block, target = _parse_target_feature(feature_set)
+    target_data = row["targets"][target]
+    if block == "hprecosine":
+        return _concat(target_data["hprecosine"])
+    if block.endswith("+hprecosine"):
+        risk = block[: -len("+hprecosine")]
+        return np.concatenate((_concat(target_data[risk]), _concat(target_data["hprecosine"])))
+    return _concat(target_data[block])
+
+
+def build_matrix(rows: Sequence[dict], feature_set: str):
+    vectors, labels, kept = [], [], []
+    for row in rows:
+        try:
+            vector = feature_vector(row, feature_set)
+        except (KeyError, TypeError):
+            continue
+        if vector.size == 0 or not np.isfinite(vector).all():
+            continue
+        vectors.append(vector.astype(np.float32))
+        labels.append(int(row["label"]))
+        kept.append(row)
+    if not vectors:
+        return np.empty((0, 0), np.float32), np.empty(0, np.int64), []
+    widths = {vector.shape[0] for vector in vectors}
+    if len(widths) != 1:
+        raise ValueError(f"Inconsistent feature widths for {feature_set}: {sorted(widths)}")
+    return np.stack(vectors), np.asarray(labels, np.int64), kept
+
+
+def train_one_seed(
+    rows: Sequence[dict],
+    feature_set: str,
+    seed: int,
+    output_dir: str,
+    cfg: dict,
+    device: str | None = None,
+) -> dict:
+    split_rows = {split: [row for row in rows if row["probe_split"] == split] for split in ("train", "val", "test")}
+    X_train, y_train, _ = build_matrix(split_rows["train"], feature_set)
+    X_val, y_val, val_rows = build_matrix(split_rows["val"], feature_set)
+    X_test, y_test, test_rows = build_matrix(split_rows["test"], feature_set)
+    for split, X, y in (("train", X_train, y_train), ("val", X_val, y_val), ("test", X_test, y_test)):
+        if len(X) == 0 or len(np.unique(y)) < 2:
+            raise ValueError(f"{feature_set} seed={seed}: {split} must contain both classes, got {np.bincount(y, minlength=2).tolist()}")
+
+    _seed_everything(seed)
+    mean = X_train.mean(axis=0)
+    std = X_train.std(axis=0)
+    std[std < 1e-6] = 1.0
+    X_train = (X_train - mean) / std
+    X_val = (X_val - mean) / std
+    X_test = (X_test - mean) / std
+
+    chosen_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = QAProbe(
+        X_train.shape[1],
+        tuple(cfg.get("hidden_sizes", [128, 64, 32])),
+        float(cfg.get("dropout", 0.3)),
+    ).to(chosen_device)
+    negatives = int((y_train == 0).sum())
+    positives = int((y_train == 1).sum())
+    pos_weight = torch.tensor([negatives / max(positives, 1)], dtype=torch.float32, device=chosen_device)
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(cfg.get("learning_rate", 1e-3)),
+        weight_decay=float(cfg.get("weight_decay", 1e-4)),
+    )
+    generator = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train.astype(np.float32))),
+        batch_size=int(cfg.get("batch_size", 256)),
+        shuffle=True,
+        generator=generator,
+    )
+    val_x = torch.from_numpy(X_val).to(chosen_device)
+    val_y = torch.from_numpy(y_val.astype(np.float32)).to(chosen_device)
+    best_loss = math.inf
+    best_state = None
+    history = []
+    for epoch in range(int(cfg.get("epochs", 100))):
+        model.train()
+        train_losses = []
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(chosen_device), batch_y.to(chosen_device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model(batch_x), batch_y)
+            loss.backward()
+            optimizer.step()
+            train_losses.append(float(loss.item()))
+        model.eval()
+        with torch.no_grad():
+            val_loss = float(loss_fn(model(val_x), val_y).item())
+        history.append({"epoch": epoch + 1, "train_loss": float(np.mean(train_losses)), "val_loss": val_loss})
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+    if best_state is None:
+        raise RuntimeError("No probe checkpoint selected")
+    model.load_state_dict(best_state)
+    val_probability = _predict(model, X_val, chosen_device)
+    threshold, val_macro_f1 = choose_macro_f1_threshold(y_val, val_probability)
+    test_probability = _predict(model, X_test, chosen_device)
+
+    checkpoint_dir = Path(output_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / "checkpoint.pt"
+    _atomic_torch_save(checkpoint_path, {
+        "state_dict": best_state,
+        "feature_set": feature_set,
+        "seed": seed,
+        "mean": mean,
+        "std": std,
+        "threshold": threshold,
+        "input_dim": int(X_train.shape[1]),
+    })
+    result = {
+        "feature_set": feature_set,
+        "seed": seed,
+        "positive_class": "real",
+        "counts": {split: len(split_rows[split]) for split in split_rows},
+        "class_counts": {
+            "train": np.bincount(y_train, minlength=2).tolist(),
+            "val": np.bincount(y_val, minlength=2).tolist(),
+            "test": np.bincount(y_test, minlength=2).tolist(),
+        },
+        "input_dim": int(X_train.shape[1]),
+        "pos_weight": float(pos_weight.item()),
+        "best_val_loss": best_loss,
+        "threshold": threshold,
+        "val_metrics": classification_metrics(y_val, val_probability, threshold),
+        "test_metrics": classification_metrics(y_test, test_probability, threshold),
+        "test_groups": grouped_metrics(test_rows, y_test, test_probability, threshold),
+        "history": history,
+    }
+    result["val_metrics"]["macro_f1_at_selected_threshold"] = val_macro_f1
+    _atomic_json(checkpoint_dir / "result.json", result)
+    return result
+
+
+def choose_macro_f1_threshold(y_true, probability) -> tuple[float, float]:
+    candidates = np.unique(np.concatenate(([0.0], probability, [1.0])))
+    best = (-1.0, 0.5)
+    for threshold in candidates:
+        score = f1_score(y_true, probability >= threshold, average="macro", zero_division=0)
+        if score > best[0] or (score == best[0] and abs(threshold - 0.5) < abs(best[1] - 0.5)):
+            best = (float(score), float(threshold))
+    return best[1], best[0]
+
+
+def classification_metrics(y_true, probability, threshold: float) -> dict:
+    y_true = np.asarray(y_true, dtype=np.int64)
+    probability = np.asarray(probability, dtype=np.float64)
+    predicted = (probability >= threshold).astype(np.int64)
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true, predicted, labels=[0, 1], zero_division=0
+    )
+    return {
+        "auroc": _safe_binary_metric(roc_auc_score, y_true, probability),
+        "real_aupr": _safe_binary_metric(average_precision_score, y_true, probability),
+        "hallucination_aupr": _safe_binary_metric(average_precision_score, 1 - y_true, 1 - probability),
+        "accuracy": float(accuracy_score(y_true, predicted)),
+        "balanced_accuracy": (
+            float(balanced_accuracy_score(y_true, predicted))
+            if len(np.unique(y_true)) == 2 else None
+        ),
+        "macro_f1": float(f1_score(y_true, predicted, average="macro", zero_division=0)),
+        "hallucination": _class_metrics(precision, recall, f1, support, 0),
+        "real": _class_metrics(precision, recall, f1, support, 1),
+    }
+
+
+def grouped_metrics(rows, y_true, probability, threshold) -> dict:
+    if not rows:
+        return {}
+    definitions = {
+        "source_split": lambda row: row.get("source_split"),
+        "question_family_index": lambda row: row.get("question_family_index"),
+        "gt_answer": lambda row: row.get("report_gt_answer"),
+        "error_type": lambda row: row.get("error_type"),
+    }
+    result = {}
+    for name, getter in definitions.items():
+        groups = {}
+        values = sorted({str(getter(row)) for row in rows if getter(row) is not None})
+        for value in values:
+            indices = [index for index, row in enumerate(rows) if str(getter(row)) == value]
+            groups[value] = classification_metrics(
+                np.asarray(y_true)[indices], np.asarray(probability)[indices], threshold
+            )
+        if groups:
+            result[name] = groups
+    return result
+
+
+def aggregate_seed_results(results: Sequence[dict]) -> dict:
+    paths = (
+        "auroc", "real_aupr", "hallucination_aupr", "accuracy",
+        "balanced_accuracy", "macro_f1",
+        "hallucination.precision", "hallucination.recall", "hallucination.f1",
+        "real.precision", "real.recall", "real.f1",
+    )
+    summary = {"seeds": [int(result["seed"]) for result in results]}
+    for path in paths:
+        values = [_nested(result["test_metrics"], path) for result in results]
+        summary[path] = {"mean": float(np.mean(values)), "std": float(np.std(values, ddof=0))}
+    return summary
+
+
+def _parse_target_feature(feature_set: str) -> tuple[str, str]:
+    if "@" not in feature_set:
+        raise ValueError(f"Target feature must end in @answer or @object: {feature_set}")
+    block, target = feature_set.rsplit("@", 1)
+    if target not in ("answer", "object"):
+        raise ValueError(target)
+    return block, target
+
+
+def _concat(*values) -> np.ndarray:
+    arrays = [np.asarray(value, dtype=np.float32).reshape(-1) for value in values]
+    return np.concatenate(arrays) if arrays else np.empty(0, np.float32)
+
+
+def _predict(model, features, device):
+    model.eval()
+    with torch.no_grad():
+        logits = model(torch.from_numpy(features).to(device))
+        return torch.sigmoid(logits).cpu().numpy()
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def _safe_binary_metric(function, y_true, score):
+    return float(function(y_true, score)) if len(np.unique(y_true)) == 2 else None
+
+
+def _class_metrics(precision, recall, f1, support, index):
+    return {
+        "precision": float(precision[index]),
+        "recall": float(recall[index]),
+        "f1": float(f1[index]),
+        "support": int(support[index]),
+    }
+
+
+def _nested(value: dict, path: str):
+    for key in path.split("."):
+        value = value[key]
+    return float(value)
+
+
+def safe_name(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "__", value)
+
+
+def _atomic_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _atomic_torch_save(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    try:
+        torch.save(value, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise

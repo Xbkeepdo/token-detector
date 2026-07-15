@@ -1,5 +1,14 @@
 # Current Task
 
+## 2026-07-15 合并 `-zccocochair` 到 `cocochair`
+- 合并前先将当前 Qwen3 caption、Attention-TK32 JS/KL 与空间热力图工作提交为 `475e647` 并确认已推送到远端 `cocochair`；随后合并远端 `-zccocochair` 的 `ba9b74c`。
+- 合并仅在 `docs/CURRENT_TASK.md` 与 `scripts/train_feature_sets.py` 出现内容冲突；交接文档两侧章节全部保留。
+- `scripts/train_feature_sets.py` 同时保留两套新增能力：本地的 VV/VP Attention-TK32 JS、`KL(attention||source)`、`KL(source||attention)` 动态特征，以及远端十种 cost-variant aliases 和通用 `risk*hprecosine` 逐层 Hadamard product 语法。
+- Qwen3 独立 wrapper、`qwen3_vl_8b` 注册/配置和 7 个可视化脚本均保留；远端新增的 COCO cost-variant、exact EMD 并行/Sinkhorn 实验、POPE/CLEVR QA pipeline、probe、服务器配置和测试也全部纳入。
+- 依赖约束按合并后的实际能力整合：保留远端新增 POT/timm/einops 等依赖，但将 PyTorch/Torchvision 上限放宽以兼容当前 RTX 5090 环境，并将 Transformers 下限提高到 Qwen3-VL 所需且已验证的 `4.57.0`；当前环境为 torch 2.8.0、torchvision 0.23.0、Transformers 4.57.6。
+- 验证：所有合并后新增/修改 Python 文件通过 `py_compile`；联合 smoke 验证三项 Attention-TK32 divergence、十种 risk alias、`risk-geo*hprecosine` 数值和 shape 均正确。
+- 测试环境说明：`/opt/conda/private/envs/vicr/bin/python -m pytest -q tests` 因当前环境没有安装 pytest，报 `No module named pytest`；未擅自修改环境。改用 `unittest discover` 跑完 8 个 unittest，并以临时目录模拟 `tmp_path` 执行其余 11 个 pytest 风格测试函数，总计 19 项全部通过。
+
 ## 2026-07-10 COCO4000-all Qwen/InternVL VV 与 VP geo risk 曲线
 - 用户要求绘制 Qwen2.5-VL-7B 与 InternVL2.5-8B 的 `risk_geo_raw`（V source / V target）和 `risk_visual_prompt_relative_vll_cost_geo`（VP source / VP target），按 hallucination/non-hallucination 分组。
 - 数据来自各模型 `COCO4000-all/features.part{0,1}.pkl`；使用分片流式累计 mean、sample SEM，避免一次性展开 15.9/29.5GB 的合并 pickle。
@@ -14,6 +23,123 @@
   - InternVL VP：`0.527449/0.520299`，H-N avg `+0.007150`，峰值 L4 `+0.030312`。
 - 验证：三个 CSV 均检查为非空且所有统计值 finite；合并 PNG 以及 InternVL 单模型上下两排图已目视检查，无空白、裁切或图例重叠。
 - 中途失败记录：首次直接运行 `scripts/plot_layerwise_feature_comparison.py` 读取 Qwen `COCO4000-all/features.pkl` 时，进程在整文件反序列化阶段被终止且未生成文件；原因是该脚本会一次性展开大 pickle。随后改为读取 part 文件的流式统计，Qwen/InternVL 均成功完成。
+
+## 2026-07-13 COCO4000 risk * hprecosine 逐层乘积实验
+- `scripts/train_feature_sets.py` 新增通用 `*` feature-set 语义：两个别名对应的逐层向量做 Hadamard product，输入维度保持 LLaVA/InternVL 32、Qwen 28；`+` 仍表示向量拼接。已有显式乘积别名优先解析，保持历史行为。
+- 新增单元测试验证 `risk-geo*hprecosine` 的逐层数值、输出维度和 label，且历史 `ffn_fad*risk_geo_raw` 别名不变；`tests.test_cost_variants` 共 6 项通过。
+- 直接复用 COCO4000 严格 8:1:1 features/split，在原 seed 结果中追加 10 个 product feature sets；三模型 seeds=`42/43/44` 均完整，每个结果 JSON 现含 31 个 feature sets。
+- LLaVA product best 为 `risk-rawAttention-hpre*hprecosine`：AUC/F1=`0.9094+/-0.0003 / 0.9308+/-0.0009`。它相对 `hprecosine` AUC 仅 `+0.0002`，比对应 concat 低 `0.0142`；其余 8 个非 raw product 低于 hprecosine `0.0081~0.0097`。
+- InternVL product best 为 `risk-rawAttention-hpre*hprecosine`：AUC/F1=`0.8074+/-0.0025 / 0.9503+/-0.0009`，相对 hprecosine AUC `+0.0064`，但比 concat 低 `0.0325`。raw-attention product 略有互补，其他乘积大多持平或下降。
+- Qwen product best 为 `risk-sqrt-hpre*hprecosine`：AUC/F1=`0.8644+/-0.0037 / 0.9560+/-0.0006`，相对 hprecosine AUC `-0.0170`，比 concat 低 `0.0374`；所有 10 个 product 都低于 hprecosine 与对应 concat。
+- 总结：逐层乘积会把 risk 与 hprecosine 压成单一通道，无法让 MLP 分别学习两者的权重与交互，整体明显弱于 `risk+hprecosine` 拼接。后续主结果保留 concat；product 仅作为负向 ablation。
+
+## 2026-07-13 COCO4000 risk + hprecosine 组合训练结果
+- 基于严格共享 8:1:1 split 与 Torch MLP seeds=`42/43/44`，汇总 10 个 `risk+hprecosine` feature sets，并与 `hprecosine` 及对应 risk-only 比较。
+- 三模型所有 10 个组合的 mean AUC 都高于 `hprecosine` 单特征；相对提升范围：LLaVA `+0.0109~+0.0154`，InternVL `+0.0355~+0.0433`，Qwen `+0.0150~+0.0206`。F1 提升较小，主要因为 real 类占比高且单特征 recall 已接近饱和。
+- LLaVA best-by-AUC 为 `risk-rawAttention-hmid+hprecosine`：PR/RC/F1/Acc/AUC/AUPR=`0.9271/0.9464/0.9367/0.8926/0.9246/0.9846`，AUC 相对 `hprecosine=0.9092` 提升 `+0.0154`，相对 risk-only 提升 `+0.0420`。best-by-F1 为 `gauss-risk-geo+hprecosine`，F1=`0.9373`。
+- InternVL best 为 `risk-sqrt-hmid+hprecosine`：PR/RC/F1/Acc/AUC/AUPR=`0.9142/0.9926/0.9518/0.9090/0.8443/0.9787`，AUC 相对 `hprecosine=0.8010` 提升 `+0.0433`，相对 risk-only 提升 `+0.0820`。InternVL 的单条 risk 曲线最弱，但与 hprecosine 的互补收益最大。
+- Qwen best-by-AUC 为 `risk-sqrt-hmid+hprecosine`：PR/RC/F1/Acc/AUC/AUPR=`0.9274/0.9932/0.9592/0.9226/0.9019/0.9884`，AUC 相对 `hprecosine=0.8813` 提升 `+0.0206`，相对 risk-only 提升 `+0.0505`。best-by-F1 为 `risk-rawAttention-hmid+hprecosine`，F1=`0.9605`。
+- Gaussian 组合没有形成稳定优势：三个模型的 best-by-AUC 均为非 Gaussian 组合。hmid/hpre 组合差异普遍较小，但 LLaVA 更偏 raw-attention，InternVL/Qwen 更偏 sqrt-hmid。
+
+## 2026-07-13 COCO4000 cost-variant 三模型逐层曲线
+- 三模型 `coco4000-costvariant/features.pkl` 与严格 8:1:1 三 seed 训练均已完成；当前无提取或训练进程。object-token 行数按曲线 label 统计为：LLaVA hall/non=`3721/21766`，InternVL=`2612/30918`，Qwen=`1107/13602`。
+- `scripts/plot_coco500_costvariant.py` 新增兼容参数 `--dataset-label`，默认仍为 `COCO500`；本轮使用 `--dataset-label COCO4000`，生成正确的 COCO4000 标题和文件名。
+- 曲线输出：`outputs/{model}/coco4000-costvariant/results/{model}_coco4000_costvariant_layerwise_by_label.{csv,png,pdf}`。
+- LLaVA 分离最强：10 条 risk 的 mean absolute hall/non gap 约 `0.0272~0.0427`，geo/cosine-hpre 峰值在第 30 层约 `+0.109`，raw-attention 峰值在第 22 层约 `+0.096`；hall risk 整体高于 non-hall。`hprecosine` 全层方向一致，signed/absolute average gap=`-0.0588`，峰值第 27 层 `-0.1038`。
+- Qwen 分离居中：risk mean absolute gap 约 `0.0190~0.0223`，主要峰值在第 15 层约 `+0.049~+0.056`，但部分层发生交叉；`hprecosine` 全层方向一致，average gap=`-0.0384`，峰值第 9 层 `-0.0639`。
+- InternVL 仍最弱：risk mean absolute gap 仅 `0.0080~0.0098`，主要峰值在第 13 层约 `+0.022~+0.026`，标准差带高度重叠且多条曲线换向；`hprecosine` 相对更稳定，average gap=`-0.0270`，峰值第 8 层 `-0.0455`。
+- Gaussian 校准与普通 relative-VLL 风险曲线几乎重合；hmid/hpre cost 的差异也很小。sqrt 主要压缩数值尺度，没有明显增强标准化分离。模型间总体排序为 LLaVA > Qwen > InternVL。
+- 3-seed risk-only best AUC：LLaVA `gauss-risk-sqrt-hpre=0.8847+/-0.0036`，Qwen `risk-rawAttention-hpre=0.8685+/-0.0022`，InternVL `gauss-risk-sqrt-hmid=0.7747+/-0.0016`；三模型 `hprecosine` AUC 分别为 `0.9092/0.8010/0.8813`。
+
+## 2026-07-12 恢复 InternVL legacy 单块模式
+- 按用户要求将 `outputs/internvl_2_5_8b/coco500-costvariant-legacy-single-tile` 恢复为当前 `outputs/internvl_2_5_8b/coco500-costvariant`；动态切图全量结果完整保留在 `outputs/internvl_2_5_8b/coco500-costvariant-dynamic-tiles2`。
+- `models/internvl_wrapper.py` 恢复 legacy 行为：所有图片缩放为单张 `448x448`、固定 256 个 `<IMG_CONTEXT>` tokens，并恢复手工英文 system/user prompt 拼接。保留与数值结果无关的 compact cost-variant 显存优化。
+- `configs/model_configs_coco500_costvariant.yaml` 移除动态切图参数；后续该实验默认继续走 legacy 单块路径。动态切图实现与结果已归档，不再作为当前三模型 summary 的 InternVL 数据。
+- legacy restore smoke 使用同一张宽图 `153976` 成功生成 8 条记录，support 固定为 256，四类 raw VV tensor shape 均为 `(32, 256)`；输出位于 `outputs/smoke-internvl-legacy-restore/features.pkl`。
+- 动态切图较慢的原因：InternVL 每增加一个 tile 都会额外执行一次完整 `448x448` ViT 编码，并把 decoder visual span 从 256 增加到 512；当前 DGST capture 必须使用 eager attention，decoder 的 attention/capture 显存与计算量随序列长度近似二次增长。Qwen 使用原生 processor 的 patch grid 和 spatial merge 生成可变视觉 token，不是复制若干完整 448 方块，且 decoder 只有 28 层而 InternVL 为 32 层，因此两者的动态分辨率代价不能直接等同。
+
+## 2026-07-12 InternVL wrapper 动态切图与原生模板修复
+- 修复 `models/internvl_wrapper.py`：不再把所有图片强制缩放成单张 `448x448`；改为按 InternVL 官方动态宽高比分块逻辑预处理，并从实际连续 `<IMG_CONTEXT>` token 定位 visual span。
+- prompt 改为复用模型自身的 `internvl2_5` conversation template、system message 和 role，而不再手工拼接与模型原生模板不同的英文 system prompt。
+- `configs/model_configs_coco500_costvariant.yaml` 的 InternVL 配置启用 dynamic image size，并在当前 RTX 4090 + eager attention 环境限制为最多 2 个 local tiles、关闭额外 thumbnail；wrapper 本身仍支持配置 thumbnail。该限制将宽图 support 从旧实现固定的 256 tokens 扩展到 512 tokens，同时避免 3 tiles 的显存溢出。
+- cost-variant 专用路径跳过最终不会保存、也不参与 relative-logit gate 的 legacy full-vocabulary support/prompt probability 计算；普通 DGST-T 模式保持原行为。这样消除了动态切图 smoke 中的额外 full-vocabulary GEMM 显存峰值。
+- 新增 `tests/test_internvl_wrapper.py`，验证宽图动态分块和方图单块行为；与 cost-variant 数值测试合计 7 项通过。
+- 真实 smoke：COCO image `153976`（`640x223`，宽高比约 `2.87`）成功提取 8 条 object-token records；support positions 为 512，support-attention/source-dist/普通 gate/Gaussian gate shape 均为 `(32, 512)`，所有数值有限，记录仅含 27 个白名单字段。输出位于 `outputs/smoke-internvl-dynamic-costvariant/features.pkl`。
+- 旧的固定单块全量结果已完整归档到 `outputs/internvl_2_5_8b/coco500-costvariant-legacy-single-tile`，不再作为三模型最终汇总中的 InternVL 结果。
+
+## 2026-07-12 InternVL 动态切图 COCO500 全量重跑
+- 使用两张 RTX 4090 完成 500 张图的动态切图特征提取，耗时约 32.5 分钟；输出 `outputs/internvl_2_5_8b/coco500-costvariant/features.pkl` 共 4338 rows、约 778 MiB，label 分布为 real/hall=`3999/339`，覆盖 496 张有 object-token row 的图片。
+- 动态 support 分布：按图片计 312 张为 256 tokens、184 张为 512 tokens；按 object-token row 计分别为 2649/1689。旧 wrapper 的 496 张图片全部固定为 256 tokens。
+- full validator 通过 27 字段白名单、32 层 shape、有限值和共享严格 split 检查；split SHA-256 仍为 `fb9d1ef92873396444ab186d0c3c8c0c7ecb8718b0016cd145e7ca44bc8e0e2d`。提取过程未发生 OOM，退出时仍有一次 multiprocessing leaked semaphore warning，但主进程退出码为 0 且合并文件完整。
+- 全新完成 Torch MLP seeds=`42/43/44` × 21 feature sets，并重新生成 InternVL CSV/PNG/PDF 曲线及三模型统一 summary。
+- 修复后 InternVL 最佳 AUC 为 `gauss-risk-sqrt-hpre+hprecosine`：AUC=`0.8916+/-0.0123`、F1=`0.9612+/-0.0026`；旧单块结果为 AUC=`0.8736+/-0.0071`、F1=`0.9626+/-0.0013`，即 AUC `+0.0180`，F1 基本持平。
+- `hprecosine` 单特征 AUC 从约 `0.8450` 升至 `0.8630+/-0.0034`。修复后 risk-only 最好为 `gauss-risk-cosine-hpre`，AUC=`0.7596+/-0.0167`；旧结果的 risk-only 最好为 `risk-rawAttention-hmid`，AUC=`0.7379+/-0.0308`。
+- 逐层均值曲线仍未明显拉开：10 条 risk 的修复后 mean absolute hall/non gap 约为 `0.0072~0.0079`，旧结果约为 `0.0081~0.0087`；`hprecosine` 为 `0.02246`，旧结果为 `0.02346`。因此改进主要来自 MLP 对完整 32 层联合形状的利用，而不是某个单层均值差显著增大。
+- 新结果 10 条 risk 的逐值相关性仍很高：pairwise correlation median=`0.9725`、max=`0.9977`。这解释了 risk 变体曲线仍相似；wrapper 修复改善了输入和多层联合 AUC，但没有消除这些 cost/target 变体之间的冗余。
+- 最终输出：InternVL 曲线位于 `outputs/internvl_2_5_8b/coco500-costvariant/results/`；三模型汇总已恢复为 `outputs/coco500-costvariant-summary/three_model_seed3_summary.{md,csv,json}`。
+
+## 2026-07-12 COCO500 VV cost-variant 三模型实验
+- 新增专用模式 `target_gate_mode: cost_variants`，仅在 VV/visual support 下启用；普通 relative-VLL、dual 和历史配置保持原行为。
+- 同一次 feature extraction 同时计算 10 条 risk：
+  - 普通 relative-VLL target：`risk-geo`、`risk-cosine-hpre`、`risk-sqrt-hmid`、`risk-sqrt-hpre`。
+  - raw support-attention target：`risk-rawAttention-hmid`、`risk-rawAttention-hpre`。
+  - Gaussian-consistent MAD target：`gauss-risk-geo`、`gauss-risk-cosine-hpre`、`gauss-risk-sqrt-hmid`、`gauss-risk-sqrt-hpre`。
+- Gaussian 分支使用 `z=(logit-median)/(1.4826*MAD+eps)`、`gate=sigmoid(z)`、`target=normalize(attention*gate)`；raw-attention 分支只对 support attention 做非负归一化。
+- cost 定义：hmid/hpre 分别使用对应 support state 的 `1-cosine(i,j)`；sqrt 版本使用 `sqrt(clamp((1-cosine(i,j))/2,min=0))`。所有分支沿用 source/target top-k union，`K=64`，source 固定为 legacy FFN distribution。
+- 新增精简保存 profile `costvariant_vv`：每条记录严格保存 27 个字段，包括必要 identity/label、10 条 risk、非 Gaussian `hprecosine`、support positions、support-attention、source-dist、普通/Gaussian semantic gate 和公式参数；不保存 VP、capped、entropy、source ablation 或 FFN injection 字段。
+- 新增文件：
+  - 配置：`configs/model_configs_coco500_costvariant.yaml`。
+  - 一键流程：`scripts/run_coco500_costvariant.py`，覆盖 prepare/label/extract/validate/train/plot/summarize，三个 seed 在两张 GPU 上并行。
+  - 曲线：`scripts/plot_coco500_costvariant.py`。
+  - 单元测试：`tests/test_cost_variants.py`。
+- `requirements.txt` 新增 `matplotlib>=3.7.0`，并已安装到 Conda 环境 `/opt/conda/envs/td`；`pip check` 无冲突。
+- 三模型共享严格互斥的 COCO500 split：train/val/test=`400/50/50`，三个 `image_splits.json` SHA-256 均为 `fb9d1ef92873396444ab186d0c3c8c0c7ecb8718b0016cd145e7ca44bc8e0e2d`。
+- full feature extraction 已完成并通过字段白名单、层数、shape、有限值检查：
+  - LLaVA：3311 rows，32 层，`features.pkl` 约 952 MiB。
+  - InternVL：4338 rows，32 层，`features.pkl` 约 565 MiB。
+  - Qwen：1958 rows，28 层，`features.pkl` 约 301 MiB。
+  - 路径统一为 `outputs/{model}/coco500-costvariant/`。
+- 21 个 feature sets 均完成 Torch MLP seeds=`42/43/44`：hprecosine 单特征、10 个 risk 单特征、10 个 `risk+hprecosine` 组合；batch=256、epochs=100、hidden=`128/64/32`、positive class=`real`。
+- 三 seed mean+/-std 的 best AUC：
+  - LLaVA overall：`hprecosine`，F1=`0.9351+/-0.0023`，AUC=`0.8949+/-0.0079`；risk-only best 为 `risk-rawAttention-hpre`，AUC=`0.8191+/-0.0082`。
+  - InternVL overall：`gauss-risk-sqrt-hpre+hprecosine`，F1=`0.9626+/-0.0013`，AUC=`0.8736+/-0.0071`；risk-only best 为 `risk-rawAttention-hmid`，AUC=`0.7379+/-0.0308`。
+  - Qwen overall：`risk-rawAttention-hpre+hprecosine`，F1=`0.9613+/-0.0014`，AUC=`0.8980+/-0.0293`；risk-only best 为 `risk-cosine-hpre`，AUC=`0.8740+/-0.0206`。
+- 汇总输出：`outputs/coco500-costvariant-summary/three_model_seed3_summary.{md,csv,json}`；每模型曲线输出位于各自 `coco500-costvariant/results/*_layerwise_by_label.{csv,png,pdf}`。
+- 验证：`python -m unittest -v tests.test_cost_variants` 共 5 项通过；三模型 1-image smoke 分别验证 LLaVA `32x576`、InternVL `32x256`、Qwen `28x299` 的四类 raw VV tensor shape；三模型 full 结果均确认 `3 seeds x 21 feature sets` 完整。
+
+## 2026-07-11 fj01 服务器数据、模型、环境与三模型 smoke test
+- 已将 COCO 2014 解压到当前服务器持久化目录：
+  - 图片：`/root/rivermind-data/dataset/coco/val2014`，共 40504 张 JPG。
+  - 标注：`/root/rivermind-data/dataset/coco/annotations/instances_val2014.json`。
+  - captions：`/root/rivermind-data/dataset/coco/annotations/captions_val2014.json`。
+- 当前三模型实际目录：
+  - LLaVA-1.5-7B：`/root/rivermind-fs/xiongbo/models/llava-1.5-7b-hf`，约 14G。
+  - Qwen2.5-VL-7B-Instruct：`/root/rivermind-fs/xiongbo/models/Qwen2.5-VL-7B-Instruct`，约 16G。
+  - InternVL2.5-8B：`/root/rivermind-fs/xiongbo/models/InternVL2_5-8B`，约 16G；本轮通过 Hugging Face 镜像新下载。
+  - 原有 `InternVL3-8B` 保留，未覆盖；当前项目 wrapper 与主实验仍使用 InternVL2.5-8B。
+- 新增当前服务器专用配置 `configs/model_configs_server_fj01.yaml`：
+  - 从 `model_configs_coco4000_all.yaml` 派生，不修改历史实验 YAML。
+  - 模型路径统一指向 `/root/rivermind-fs/xiongbo/models`。
+  - COCO 路径统一指向 `/root/rivermind-data/dataset/coco`。
+- 新建运行环境 `/root/rivermind-data/envs/token-detector`，验证版本为 PyTorch 2.5.1+cu124、Transformers 4.51.3，CUDA 可用。
+- 补齐并写回 `requirements.txt` 的实际依赖：
+  - 限定 PyTorch 2.5 / torchvision 0.20 和 Transformers 4.51.x~4.x，避免宽松依赖安装到不兼容的新主版本。
+  - 新增 POT（EMD solver）、sentencepiece、timm、einops。
+- NLTK CHAIR 资源安装到 `/root/nltk_data`：punkt、averaged_perceptron_tagger、wordnet、omw-1.4。
+- 三模型各用 1 张 COCO 图片完成生成、CHAIR 标注和 DGST-T 特征抽取：
+  - LLaVA：`outputs/smoke-fj01/llava_1_5_7b/features.pkl`，9 个 object token。
+  - Qwen：`outputs/smoke-fj01/qwen2_5_vl_7b/features.pkl`，7 个 object token。
+  - InternVL：`outputs/smoke-fj01/internvl_2_5_8b/features.pkl`，5 个 object token。
+- 本轮失败与修复：
+  - CHAIR 首次运行缺 NLTK 数据；服务器访问 NLTK/GitHub raw 超时，改为本机下载后上传。
+  - 初始宽松 requirements 安装到 PyTorch 2.13/Transformers 5.13，LLaVA 生成触发 Triton 编译失败；收敛到 PyTorch 2.5.1/Transformers 4.51.3 后通过。
+  - Transformers 4.45.2 不包含 Qwen2.5-VL 类；升级到 4.51.3 后通过。
+  - DGST-T EMD 首次抽取缺 POT；安装 POT 后通过。
+  - InternVL 首次加载缺 sentencepiece；补齐 sentencepiece/timm/einops 后通过。
+- 验证命令：
+  - `find /root/rivermind-data/dataset/coco/val2014 -maxdepth 1 -type f -name '*.jpg' | awk 'END {print NR}'` -> 40504。
+  - 三模型分别运行 `coco-labeling/label_coco.py --num-images 1`。
+  - 三模型分别运行 `scripts/extract_features.py --num-images 1`。
 
 ## 2026-07-10 COCO4000-all 主实验三 seed 与严格 8:1:1 准备
 - 用户要求在三模型 `COCO4000-all` 的 42 个主实验 feature set 上运行 torch MLP，seeds=`42/43/44`、batch size=`256`、positive class=`real`。
@@ -1042,3 +1168,100 @@
 - generation 使用模型原生 `Qwen3VLProcessor.apply_chat_template`、greedy decoding 和 SDPA attention；输出继续复用项目 `GenerationOutput`，保存 caption、response token IDs 与逐 token 文本。
 - 真实单图 smoke 已通过：模型完整加载到 RTX 5090，识别 36 个文本 decoder layers，图片输入、caption 解码和 response token IDs 均有效。
 - COCO caption 使用 `coco-labeling/label_coco.py --model qwen3_vl_8b --num-images 4000 --generation-devices cuda:0 cuda:1 --resume`；并行 worker 会持续写入 `generation_shards/`，支持中断恢复。
+
+## 2026-07-13 POPE / CLEVR-Exist 问答式幻觉检测
+
+- 新增独立服务器配置 `configs/qa_benchmarks_server_fj01.yaml`，没有覆盖历史实验 YAML。
+- 固定数据协议已生成到 `/root/rivermind-data/dataset/qa_benchmarks/`：
+  - POPE：官方 random/popular/adversarial 共 9000 问；seed=42 按 500 张共享图片严格切为 400/50/50，对应 7200/900/900。
+  - CLEVR：只使用官方 program 末操作为 `exist` 且有 yes/no GT 的问题；官方 train 抽 4000，官方 val 先切互斥 image pool 再各抽 val/test 500，共 5000。
+  - POPE questions SHA-256：`d8adf50411c7e4521f1b70e52b1e2965b4bfb0f8d2381528bb423a082264663f`。
+  - CLEVR questions SHA-256：`dd14278a586c986b50bfaac607f00e1e11bab59335848657a194ea070d7e7a0a`。
+- 新增统一 `Generate -> Label -> Extract -> Probe` 实现：
+  - `data/qa_benchmark.py`、`scripts/prepare_qa_benchmarks.py`：统一 schema、答案规范化、标签/error_type、原子 JSONL、严格 split、哈希与图片泄漏检查。
+  - `features/qa_extractor.py`、`scripts/qa_pipeline.py`：greedy/8 tokens、断点续跑、原子分片、answer-target 十条 risk+hprecosine、POPE object-target、ADS/CGC/uncertainty/SVAR/中层逐头 attention；`features.pkl` 不保存 full logits 和 GT。
+  - 三个 wrapper 的特征接口新增可选 `prompt` 参数，默认 caption 行为保持不变；保证二次 forward 使用原 QA 问题而非硬编码 `Describe this image.`。
+  - `detection/qa_probe.py`、`scripts/train_qa_probes.py`：Torch MLP 128/64/32、dropout=0.3、batch=256、100 epochs、class-weighted BCE、val loss checkpoint、val macro-F1 阈值、seeds=42/43/44、完整双类指标和 mean±std。
+  - `scripts/validate_qa_artifacts.py`、`scripts/summarize_qa_generations.py`：完整性/有限值/无 GT 泄漏检查和原模型分组指标。
+- 根据 `token-CVPR26.pdf` 另增不混入主结果的论文兼容轨道：
+  - `detection/pope_paper_protocol.py`、`scripts/train_pope_paper_protocol.py`。
+  - 只保留模型回答 Yes 的样本，hallucination 为正类，ADS 使用 answer-position，CGC 使用 question object-position，5-fold，报告 hallucination-F1/AUC；ADS、CGC、ADS+CGC 与 MLP/RF/XGB 分开保存。
+- smoke test：三模型 × POPE 10 问 × CLEVR 10 问全部完成；generation/label/features 均为 10 条且 key 集一致。
+  - LLaVA/InternVL 每个 answer/object DGST 均 32 层；Qwen 均 28 层。
+  - POPE 三模型 object-position CGC 均非空；所有逐层特征有限；`features.pkl` 无 `gt_*` 字段。
+  - Qwen 的 label 阶段重复运行后仍为 10 条，验证去重 resume。
+- 测试：`/opt/conda/envs/td/bin/python -m pytest -q tests` -> `16 passed`；包含 split/标签、特征集合、加权 Torch probe、paper protocol 和语义 token 定位。
+- 中途失败记录：
+  - 两个运行环境最初均缺少 pytest，`python -m pytest` 报 `No module named pytest`；已在 `/opt/conda/envs/td` 安装 pytest 9.1.1。
+  - 首次 LLaVA POPE object-CGC smoke 10/10 报 `Object position 1162 out of bounds (seq_len=604)`；旧代码硬编码 image token `-200`，与当前 processor/model config 不一致。已改为读取 `model.config.image_token_index`，重跑 10/10 通过。
+  - 一次只读内联统计命令因 SSH here-doc 引号丢失报 `NameError: name 'pope' is not defined`；数据准备本身未失败，随后由 manifest 和验证脚本确认计数。
+  - 首次后台 smoke 启动命令的嵌套 `bash -lc` 引号被 SSH 展开，跳过 LLaVA-CLEVR/InternVL worker；随后改为独立脚本/显式命令补跑，六组 smoke 均完成。
+- 全量执行已启动：
+  - 当前并行任务：GPU0 `llava_1_5_7b/pope`，GPU1 `qwen2_5_vl_7b/pope`；输出根目录 `outputs/qa_benchmarks/`。
+  - `scripts/run_qa_full_worker.sh` 提供单模型/单数据集可恢复执行入口。
+  - 后台 `scripts/run_qa_full_coordinator.sh` 会等待两项初始 POPE 完成并严格验证 9000 条，再依次执行 InternVL POPE、三模型 CLEVR、原模型汇总、六组三 seed probe，最后运行 LLaVA 的论文兼容 5-fold ADS+CGC。
+  - 调度日志：`outputs/qa_benchmarks/logs/coordinator.log`；仅当全部上游验证通过才会出现 `[coordinator] ALL COMPLETE`。
+
+## 2026-07-13 cost-variant exact EMD 并行加速
+
+- 用户要求将每层十种 cost-variant EMD 并行，利用服务器多核 CPU。
+- 实现位于 `features/dgst_t.py`：
+  - 默认仍为串行，历史实验行为不变。
+  - `DGST_COST_VARIANT_EMD_WORKERS=10` 开启十路并行。
+  - `DGST_COST_VARIANT_EMD_BACKEND=process` 使用 spawn 的持久进程池，避免 CUDA fork。
+  - 先在主进程完成 CUDA 上的 support/cost 构造并转为 NumPy；再把 32 层按十种 risk 组成十个批任务，每个 CPU worker 顺序求解一种 risk 的全部层，显著降低 IPC/线程池调度开销。
+  - worker 内限制 BLAS/OpenMP 单线程，外层十个进程是唯一并行层级。
+- `scripts/run_qa_full_worker.sh` 默认启用 `10 workers + process backend`。
+- 数值验证：
+  - 单元测试串行/并行 exact EMD 逐 risk 一致，当前 `pytest -q tests` 为 `18 passed`。
+  - LLaVA POPE 真实 10 题串行与最终 process-batch 输出比较：answer/object 两个 target、十条 risk、32 层的 `max_abs_delta=0.0`。
+  - 最终并行产物 10/10 generation/labels/features 完整、object-CGC 非空、层数正确且全部有限。
+- 性能验证：
+  - 纯 CPU 合成 32 层×10 EMD：串行 `1.0717s`，初版线程并行 `0.4177s`，EMD 子阶段约 `2.57x`。
+  - LLaVA POPE 真实端到端稳态：串行约 `2.82s/题`，最终 10-process layer-batch 约 `2.47s/题`，约提升 `12%`；模型 forward、object-CGC 和非 EMD DGST 仍占主要剩余时间。
+- 中途失败与修复：
+  - 首次基准尝试 `/usr/bin/time`，系统不存在该路径，报 `env: '/usr/bin/time': No such file or directory`；改用 shell `time`/tqdm 计时。
+  - 初版“每层创建十线程”虽然纯 EMD 快，但真实端到端 10 workers 为 `3.09s/题`，慢于串行 `2.82s/题`；改为跨 32 层批处理。
+  - 首版 process-batch 直接传数百个 CPU torch storage，触发 `OSError: [Errno 24] Too many open files`，该次 10/10 均进入 extraction failures、未写 feature shard；改为 NumPy 普通 pickle payload 后重跑 10/10 通过。
+  - 并行改造前已向两个 qa_pipeline 和旧 coordinator 发送 TERM；原子分片未损坏，恢复时会从现有 key 继续。
+  - 首次恢复时发现 `labels.jsonl` 的已有行会被逐批重复原子重写；结果不重复但恢复 I/O 浪费。`JSONLCheckpointStore.add` 已改为内容相同直接 no-op，并新增 mtime/dirty 单测。
+- 全量任务已用最终配置恢复：GPU0 LLaVA、GPU1 Qwen，各自持久化 10 个 EMD worker（共 20 个 spawn worker）；恢复起点分别为 18/3 个 feature shards，旧串行分片与新并行分片因数值完全一致可安全混合。
+
+## 2026-07-13 Sinkhorn 小批量配对实验
+
+- 为回答 Sinkhorn 是否影响结果，暂停 exact 主任务并建立独立实验目录 `outputs/qa_sinkhorn_comparison/`；主实验分片未修改。
+- 固定样本：从已完成的 LLaVA POPE exact shards 中 seed=42 抽取 100 条，严格 50 real / 50 hallucination；复用相同 generation、labels、问题和图片，只替换 OT solver。
+- 新增仅通过环境变量启用的实验路径：
+  - `DGST_OT_SOLVER_OVERRIDE=sinkhorn`
+  - GPU batched log-domain Sinkhorn，最终 risk 仍为 `<C, Pi_epsilon>`。
+  - exact EMD 仍是默认路径，历史/主实验配置不变。
+- 验证：`pytest -q tests` -> `19 passed`；100 条 `reg=0.10/0.05` 产物的 key、标签、object-CGC、层数和有限值通过。
+- 配对结果（十条 risk 的 target 内平均；小样本 probe 为固定 5-fold class-weighted logistic，仅用于配对趋势）：
+  - `reg=0.10`，100 条：
+    - answer：MAE `0.04815`，Pearson/Spearman `0.99395/0.99310`，AUC exact/sinkhorn `0.75700/0.77332`，F1 `0.68946/0.71730`。
+    - object：MAE `0.04492`，Pearson/Spearman `0.99420/0.99422`，AUC `0.68012/0.68612`，F1 `0.62892/0.63369`。
+  - `reg=0.05`，100 条：
+    - answer：MAE `0.01719`，Pearson/Spearman `0.99931/0.99916`，AUC `0.75700/0.75368`，F1 `0.68946/0.69384`。
+    - object：MAE `0.01493`，Pearson/Spearman `0.99935/0.99926`，AUC `0.68012/0.68164`，F1 `0.62892/0.62276`。
+  - `reg=0.02`：500 iterations 下即使 marginal tolerance 放宽到 `5e-4`，仍有 14/100 未收敛；86 条共同样本 MAE answer/object `0.00632/0.00537`，Pearson 均约 `0.9999`，probe 变化很小，但不能作为完整可靠数据。
+  - hprecosine 不依赖 OT，三档与 exact 的最大差异均为 `0.0`。
+- 速度结论：
+  - 当前 exact 10-process layer-batch 稳态约 `2.47s/题`。
+  - Sinkhorn `reg=0.10` 约 `2.56s/题`；`reg=0.05` 约 `3.3s/题`；`reg=0.02` 补跑约 `4.0s/题`。
+  - 较小正则需要更多 log-domain 迭代，越接近 exact 越慢；整体还受模型 forward 和额外 object-CGC forward 主导。
+- 决策：不把主实验切换到 Sinkhorn。保留 Sinkhorn 为独立可复现实验开关；主实验继续 exact EMD，避免定义变化和收敛缺失。
+- 中途失败记录：
+  - `reg=0.05` 在严格 `1e-4` marginal error 下有 1 条略超（`1.099e-4`）；放宽到 `5e-4` 后补齐。
+  - `reg=0.02` 严格阈值时 99/100 失败；放宽到 `5e-4` 后仍有 14 条超过阈值，未伪装为有效结果。
+  - 一次批量验证命令错误转义 shell 变量，使用了字面路径 `$reg`，报 `FileNotFoundError`；随后改用两个显式目录完成验证。
+  - Sinkhorn 实验后 exact 主任务已从原子分片恢复：恢复时 LLaVA/Qwen 分别已有约 40/20 个 shards；默认 worker 没有 `DGST_OT_SOLVER_OVERRIDE`，继续使用 exact EMD。
+  - 多次 TERM 暂停父进程后发现 20 个旧 ProcessPool worker 被 reparent 到 PID 1；第一次 awk 清理命令因远程引号丢失报语法错误，随后用 `pkill -TERM -P 1 -f spawn_main` 仅清除孤儿 worker。当前保留的 20 个 spawn worker 均分别属于正在运行的两个 qa_pipeline。
+
+## 2026-07-14 QA benchmark results summary
+
+- 三模型 POPE/CLEVR generation、label、feature extraction、严格 8:1:1 probe 与 LLaVA POPE ADS/CGC 五折实验均已完成，coordinator 标记为 `[coordinator] ALL COMPLETE`。
+- 新增统一汇总：`outputs/qa_benchmarks/QA_RESULTS_SUMMARY.md`。
+- 汇总包含原模型准确率、六组最佳 probe、九组 ADS/CGC 五折结果、协议解释、互补性诊断和限制。
+- 按用户要求将同一 Markdown 扩展为完整结果文档：新增原模型 GT/source/error/question-family 分组表，并列出六个模型/数据集下全部 231 个 feature-set 聚合结果。每项包含 seeds 42/43/44 的 Accuracy、Balanced Accuracy、Macro-F1、AUROC、hallucination/real Precision、Recall、F1 与 AUPR 的 mean +/- std。
+- 五折诊断确认：3850 个 LLaVA Yes-response 中 298 个 hallucination（7.74%）；ADS/CGC 层均值相关系数为 -0.023，跨 block 层对绝对相关均值为 0.041。
+- 重要限制：当前论文式五折按问题行划分而非按 image 分组；各折 99.5%-100% 的测试图片也存在于训练折，因此 0.703 的 ADS+CGC MLP Hall-F1 不能视为严格 image-disjoint 结果。
