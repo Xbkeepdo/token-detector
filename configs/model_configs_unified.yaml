@@ -246,6 +246,20 @@ models:
     vision_end_token: "<|vision_end|>"
     prompt_template: null
 
+  qwen3_vl_8b:
+    hf_name: "/home/apulis-dev/userdata/models/Qwen3-VL-8B-Instruct"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    image_size: 448
+    patch_size: 16
+    num_layers: 36
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    prompt_template: null
+
 feature_extraction:
   ads:
     top_patch_pct: 0.10

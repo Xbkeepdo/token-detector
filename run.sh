@@ -2,7 +2,7 @@
 # Full pipeline for one model. Replace MODEL and paths as needed.
 set -euo pipefail
 
-MODEL="${MODEL:-internvl_2_5_8b}"          # or: internvl_2_5_8b, qwen2_5_vl_7b, llava_1_5_7b，llava_onevision_1_5_8b
+MODEL="${MODEL:-internvl_2_5_8b}"          # or: internvl_2_5_8b, qwen2_5_vl_7b, qwen3_vl_8b, llava_1_5_7b, llava_onevision_1_5_8b
 CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"
 OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO500-vp}"
 CHAIR_CACHE="${CHAIR_CACHE:-outputs/chair_cache/coco_val2014_chair.pkl}"

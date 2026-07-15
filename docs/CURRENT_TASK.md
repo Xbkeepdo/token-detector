@@ -1,5 +1,20 @@
 # Current Task
 
+## 2026-07-10 COCO4000-all Qwen/InternVL VV 与 VP geo risk 曲线
+- 用户要求绘制 Qwen2.5-VL-7B 与 InternVL2.5-8B 的 `risk_geo_raw`（V source / V target）和 `risk_visual_prompt_relative_vll_cost_geo`（VP source / VP target），按 hallucination/non-hallucination 分组。
+- 数据来自各模型 `COCO4000-all/features.part{0,1}.pkl`；使用分片流式累计 mean、sample SEM，避免一次性展开 15.9/29.5GB 的合并 pickle。
+- 输出：
+  - `outputs/qwen2_5_vl_7b/COCO4000-all/results/qwen2_5_vl_7b_coco4000_all_vv_vs_vp_geo_risk_by_label.{png,pdf,csv}`
+  - `outputs/internvl_2_5_8b/COCO4000-all/results/internvl_2_5_8b_coco4000_all_vv_vs_vp_geo_risk_by_label.{png,pdf,csv}`
+  - 合并图与摘要：`outputs/coco4000_all_vv_vp_geo_risk_comparison/qwen_internvl_coco4000_all_vv_vs_vp_geo_risk_by_label.{png,pdf,csv,md,json}`
+- 曲线摘要（H-N 为 hallucination mean - non-hallucination mean）：
+  - Qwen VV：hall/non 全层均值 `0.260230/0.243665`，H-N avg `+0.016565`，峰值 L15 `+0.055825`。
+  - Qwen VP：`0.342379/0.348071`，H-N avg `-0.005692`，峰值 L1 `-0.050949`。
+  - InternVL VV：`0.257980/0.252527`，H-N avg `+0.005453`，峰值 L13 `+0.023806`。
+  - InternVL VP：`0.527449/0.520299`，H-N avg `+0.007150`，峰值 L4 `+0.030312`。
+- 验证：三个 CSV 均检查为非空且所有统计值 finite；合并 PNG 以及 InternVL 单模型上下两排图已目视检查，无空白、裁切或图例重叠。
+- 中途失败记录：首次直接运行 `scripts/plot_layerwise_feature_comparison.py` 读取 Qwen `COCO4000-all/features.pkl` 时，进程在整文件反序列化阶段被终止且未生成文件；原因是该脚本会一次性展开大 pickle。随后改为读取 part 文件的流式统计，Qwen/InternVL 均成功完成。
+
 ## 2026-07-10 COCO4000-all 主实验三 seed 与严格 8:1:1 准备
 - 用户要求在三模型 `COCO4000-all` 的 42 个主实验 feature set 上运行 torch MLP，seeds=`42/43/44`、batch size=`256`、positive class=`real`。
 - 检查发现原 `COCO4000-all/image_splits.json` 不是严格 8:1:1：train/val/test 数量为 `3600/400/400`，其中 val 与 test 是完全相同的 400 张图；该结果记为 9:1，并计划在各模型完成后归档到 `COCO4000-all/torchmlp-main-seed3-91/`。
@@ -802,3 +817,228 @@
   - `/opt/conda/private/envs/vicr/bin/python - <<'PY' ... PY` 解析三个 YAML，确认 `relative_cost_modes=["geo", "semantic_match_geo"]`，并确认 train/plot qmatch aliases 存在。
 - 中途失败记录：
   - 第一次公式小测试直接调用 `_build_cost_matrix(..., cost_mode="qmatch")`，报错 `ValueError: DGST-T only keeps direct/decomposed transport costs.`；原因是 build 函数未兼容短名，只在配置 normalize 路径兼容。已补 `_build_cost_matrix` 对 `qmatch/qadd` 短名的识别后通过。
+
+## 2026-07-10 COCO4000-all 共享样本 GLSim 风格空间热力图
+- 用户要求参考 GLSim 的 object-grounding 图格式，展示图像空间区域而不是此前的“layer × token index”矩阵；并要求三模型使用同一组 10 张 COCO 图。
+- 新增可复用脚本：`scripts/plot_attention_gate_source_heatmaps.py` 与 `scripts/plot_spatial_attention_gate_source_heatmaps.py`。
+- 最终空间图脚本的口径：
+  - 仅展示 VV visual scope，因此每个 visual support token 可恢复为图像 patch；层固定为 `5/15/20/25`。
+  - 三行分别为 raw attention `A`、未重新归一化的 gate-weighted attention `A * g`、source distribution。
+  - 同一层中 raw 和 `A*g` 共用 raw attention 的最大值，避免将 gate 后绝对质量重新拉回 1；gate 行标注 `retained mass = sum(A*g)/sum(A)`。
+  - source distribution 仅为定位目的按自身最大值映射颜色；所有图叠加在 COCO 原图上，使用 `turbo` 温度色。非幻觉词若有匹配的 COCO GT 类别则以红框显示；幻觉词通常没有对应 GT 框。
+  - LLaVA 使用其 center-square 可见 crop；Qwen 根据 token 数与图像比例恢复动态 patch grid；InternVL 使用 16x16 grid。
+- 共享图像：
+  - 幻觉：`56433, 136722, 333772, 178156, 305159`
+  - 非幻觉：`169361, 160726, 273083, 222118, 356800`
+  - 共同候选来自三个 `labeling.json` 的交集（幻觉 340 张、非幻觉 3,586 张）；在固定 seed=42 的候选池中，以三模型 gate 前后 TV 变化的平均 rank 选择最终共享图。
+- 输出目录：`outputs/coco4000_all_glsim_style_spatial_maps_shared10/`
+  - 共 30 张 PNG 和 30 张 PDF：3 模型 ×（5 幻觉 + 5 非幻觉）。
+  - 总览及同图各模型 target word 对照：`summary.md`；图像 id：`shared_image_ids.json`；完整元数据：`selected_samples.{json,csv}`。
+- 验证：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile scripts/plot_spatial_attention_gate_source_heatmaps.py scripts/plot_attention_gate_source_heatmaps.py`
+  - 小张量检查确认 `A*g` 未重新归一化（raw sum=`1.0`，gated sum=`0.3`）且 LLaVA/Qwen/InternVL 的 24x24、15x23、16x16 grid 推断正确。
+  - 输出检查确认 30 个 PNG、30 个 PDF，三模型的每个 label image id 均与 `shared_image_ids.json` 一致；抽查 image `169361` 的三模型图，原图一致且 Qwen/InternVL `dog` 红框对齐。
+
+## 2026-07-10 共享样本 Top-32 空间热力图与 gate 数值分析
+- 用户进一步要求解释 gate 后注意力变淡，并只查看 TopK=`32` 的 Raw attention、gate attention 和 source 区域。
+- 新增脚本：`scripts/plot_spatial_topk_attention_gate_source_heatmaps.py`。
+- TopK 口径：
+  - 精确复用上一轮 `selected_samples.json` 中三模型同一组 10 张图、30 个 target token。
+  - Raw、`A * gate`、Source 三个信号分别选择自己的 Top-32 visual patches；其余 patch 严格置 0。
+  - 每个信号在自己的 Top-32 内做 L1 归一化，再按该 Top-32 图最大值映射温度色；因此该版用于看 Top-32 的空间位置和相对结构，不用于比较三个信号的绝对总质量。
+  - 图内同时标注 Top-32 对原始信号的 mass coverage；gate 行还保留 `attention_weighted_gate = sum(A*gate)/sum(A)`，用于解释上一版绝对色阶下的变淡程度。
+- gate 数值输出：
+  - `gate_values.csv/json` 共 120 行：30 token × 4 layers。
+  - 每行包含 gate mean/median/std/min/max、`gate>=0.5` 比例、attention-weighted gate、Raw/Gated Top-32 上的 gate 均值、三种 Top-32 mass coverage 和 Raw/Gated Top-32 overlap。
+- 主要解释：
+  - 三模型跨样本/层普通 gate mean 分别约为 LLaVA `0.516`、Qwen `0.491`、InternVL `0.507`，符合 sigmoid gate 以中位数为中心的构造。
+  - attention-weighted gate 仅为 LLaVA `0.271`、Qwen `0.334`、InternVL `0.460`；高 attention patch 的 gate 低于普通均值，所以共用 Raw 色阶时 `A*gate` 必然更淡，LLaVA 最明显。
+  - 当前打开的 LLaVA image `169361`/`frisbee`：L5/15/20/25 的 attention-weighted gate 为 `0.128/0.221/0.384/0.376`；L5 虽然 gate mean=`0.530`，但 Raw Top-32 上 gate mean 仅 `0.168`，Raw/Gated Top-32 overlap 仅 `0.250`，说明 raw 高注意力区域被 gate 强烈重排。
+- 输出目录：`outputs/coco4000_all_glsim_style_spatial_topk32_shared10/`
+  - 30 PNG、30 PDF、`summary.md`、`gate_values.{csv,json}`、`selected_samples.json`。
+- 验证：
+  - `python -m py_compile scripts/plot_spatial_topk_attention_gate_source_heatmaps.py`。
+  - 小张量验证 TopK mask、Top-2 coverage=`0.6`、TopK 内 L1 sum=`1.0`。
+  - 输出检查确认 30 PNG、30 PDF、120 gate rows；抽查 image `169361` 的三模型 Top-32 图，非 TopK 区域无热度且三行空间分布可辨。
+
+## 2026-07-10 COCO500 softmax-gate / attention / source 独立 Top-32 GLSim 热力图
+- 用户要求在 COCO500 中选择 5 个幻觉与 5 个非幻觉小物体 token，对 LLaVA-1.5-7B、Qwen2.5-VL-7B、InternVL2.5-8B 画层 `5/15/20/25` 的 GLSim 风格空间热力图；三行分别为 `softmax(gate)`、attention、source distribution，各自取自己的 Top-32 并使用独立色阶。
+- 新增独立脚本：`scripts/plot_coco500_glsim_softmax_gate_topk_heatmaps.py`，保留此前 COCO4000 的未提交 spatial-map 脚本不变。
+- 输入统一使用三模型 `outputs/{model}/COCO500-mass-dist-topk/features.pkl` 的 VV 字段：
+  - gate：`dgst_t_vv_semantic_gate_per_layer`，先沿 visual-token 维做 softmax；
+  - attention：`dgst_t_vv_support_attention_per_layer`，逐层归一化；
+  - source：`dgst_t_vv_source_dist_per_layer`，逐层归一化。
+- TopK/色阶口径：
+  - 三个信号分别选择自己的 Top-32，非 TopK patch 严格置 0，不在 TopK 内二次归一化；图中 `Top-32 mass` 因此保留对完整分布的 coverage 含义。
+  - 同一张图中，每个信号使用一个独立的数值色阶，该色阶仅在本信号的 L5/L15/L20/L25 四列间共享；三个信号之间不共享 scale。
+  - 三行均用 `turbo` overlay；非幻觉目标叠加匹配的 COCO GT 红框。
+- 小物体样本选择：
+  - 三模型使用相同 10 张图片；要求每个模型在该图均有合格同标签 token。
+  - 非幻觉使用该图中最小匹配 GT 框面积占比，限制为 `0.1% <= area/image <= 2%`，避免目标太大或小到不可见；幻觉因无匹配 GT 框，使用该 COCO 类别全局 median box/image fraction，并限制 `<=2%`。
+  - 排除 person/bus/train/truck/dining table 等语义上偏大的类别；优先选择三模型目标类别 signature 不重复的图片。
+  - 幻觉图片：`153445, 469609, 123213, 110601, 183204`；目标包括 remote/book、car、bottle/sports ball、toothbrush、handbag/skis。
+  - 非幻觉图片：`460461, 64889, 19484, 436183, 208748`；目标依次为 skateboard、frisbee、knife、sports ball、chair，实际最小 GT 框占比约 `0.10%-0.13%`。
+- 输出目录：`outputs/coco500_glsim_softmax_gate_attention_source_topk32_small_shared10/`
+  - 30 PNG + 30 PDF：3 模型 × 10 图片；
+  - `summary.md`、`selected_samples.json`、`shared_image_ids.json`；
+  - `topk_values.{json,csv}` 共 360 行：30 token × 4 layers × 3 signals，包含 TopK indices、mass coverage、独立色阶上限和样本信息。
+- 验证：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile scripts/plot_coco500_glsim_softmax_gate_topk_heatmaps.py` 通过。
+  - 小张量验证三种信号逐层和为 1、TopK mask 数量正确，softmax(gate) 结果符合预期。
+  - 输出确认 PNG/PDF 均为 30 个、统计 360 行、每行 TopK indices=32、layers=`5/15/20/25`、所有 mass/scale 均 finite、无零字节文件。
+  - 三信号 Top-32 mass 范围分别为 gate softmax `0.072-0.217`、attention `0.381-0.902`、source `0.073-0.490`；色阶上限范围明显不同，确认三行没有误共享 scale。
+  - 目视检查 LLaVA hallucinated remote、Qwen hallucinated toothbrush、InternVL non-hallucinated frisbee：布局、三条独立 colorbar、TopK mask、标题与 GT 框均正常。
+- 中途检查说明：第一次 `view_image` 使用相对输出路径时被解析到 `/home/apulis-dev/outputs/...`，报文件不存在；改用绝对路径后完成三张图的目视检查，生成结果本身无错误。
+
+## 2026-07-10 COCO500 support-attention Top-32 与 source 的 JS/KL 曲线
+- 用户要求以 `support_attention` 的 Top-K 作为 TK 区域，比较该区域内 attention distribution 与 source distribution 的 JS/KL，并查看三模型幻觉/非幻觉逐层曲线。
+- 新增脚本：`scripts/plot_attention_topk_source_divergence.py`。
+- 计算口径：
+  - 每个 object-token row、每层由原始 `dgst_t_{vv/vp}_support_attention_per_layer` 选择 Top-32，不使用 semantic gate 或 relative-VLL target。
+  - Attention 与 `dgst_t_{vv/vp}_source_dist_per_layer` 截取同一组 attention Top-32 位置后，各自在 TK 区域内做 L1 归一化。
+  - 同时计算 JS、`KL(attention||source)`、`KL(source||attention)`；使用自然对数和 `eps=1e-12` 平滑。
+  - VV（visual support）与 VP（visual+prompt support）都统计；按 object-token row 的 `label=0/1` 分别求 mean 和 SEM。
+- 输入均为 `outputs/{model}/COCO500-mass-dist-topk/features.pkl`。实际样本数：LLaVA hall/non=`462/2849`，Qwen=`126/1832`，InternVL=`358/3943`。
+- 输出目录：`outputs/coco500_attention_topk32_source_divergence/`：
+  - VV/VP 三模型对比图：`{vv,vp}_attention_topk32_source_js_kl_by_label.{png,pdf}`；
+  - 完整逐层统计：`attention_topk32_source_js_kl_layerwise.csv`；
+  - 汇总：`attention_topk32_source_js_kl_summary.{csv,json}`、`summary.md`。
+- 主要结果（全层 H-N 平均差）：
+  - VV：LLaVA JS/forward-KL/reverse-KL=`+0.0185/+0.0841/+0.0948`；Qwen=`+0.0177/+0.0909/+0.0769`；InternVL=`+0.0055/+0.0274/+0.0228`。三模型总体均为幻觉 divergence 更高，LLaVA/Qwen 分离强于 InternVL。
+  - VP：JS 三模型仍为小幅正差，LLaVA/Qwen/InternVL=`+0.0086/+0.0095/+0.0103`；`KL(source||attention)` 分离更稳定且更大，分别为 `+0.1720/+0.0726/+0.1437`；`KL(attention||source)` 分别为 `-0.0068/+0.0356/-0.0096`，LLaVA/InternVL 平均接近 0 且层间交叉明显。
+  - 峰值示例：VV LLaVA reverse-KL 在 L27 的 H-N gap=`+0.2468`；VV Qwen forward-KL 在 L15=`+0.2401`；VP InternVL reverse-KL 在 L7=`+0.2839`。
+- 验证：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile scripts/plot_attention_topk_source_divergence.py` 通过。
+  - 小张量检查确认相同分布的三种 divergence 为 0，非同分布时均有限非负，JS 不超过 `ln(2)`。
+  - 完整输出检查：逐层 CSV 1104 行、summary 18 行；所有 mean/std/SEM finite，标签计数与 features 一致；PNG/PDF 均非空。
+  - 已目视检查 VV/VP 两张 PNG，无空白、裁切或图例遮挡。
+
+## 2026-07-10 Attention-TK32 JS/KL torch probe（严格 8:1:1）
+- 用户要求用上一节的 JS/KL 逐层散度训练 torch probe，比较三模型效果。
+- `scripts/train_feature_sets.py` 新增六个动态训练 block：
+  - `vv_attention_tk32_js`、`vv_attention_tk32_kl_attention_source`、`vv_attention_tk32_kl_source_attention`；
+  - `vp_attention_tk32_js`、`vp_attention_tk32_kl_attention_source`、`vp_attention_tk32_kl_source_attention`。
+- 动态计算完全复用曲线口径：raw support-attention Top-32、attention/source 在同一区域分别 L1 normalize、自然对数、`eps=1e-12`。每条 feature row 首次计算后在内存缓存 VV/VP 三指标，组合训练不重复计算；没有修改或复制原始大 pickle。
+- 原 `COCO500-mass-dist-topk/image_splits.json` 的 val=test（50 张完全重合），因此没有沿用。新建：
+  - `outputs/{model}/COCO500-attention-topk32-js-kl-probe/`；
+  - `features.pkl` 只读软链接原 `COCO500-mass-dist-topk/features.pkl`；
+  - 三模型共享严格 train/val/test=`400/50/50`、seed=`42` split，三组互斥。
+- 训练设置：torch probe seed=`42`、batch size=`256`、epochs=`100`、positive class=`real`。共 12 个散度 feature sets：6 单特征、VV/VP 各自 all-3、三种同指标跨 scope 组合、全部六特征组合；另在同 split 补跑 `risk_geo_raw+visualcosine_raw` 与 `VP risk+VP cosine` 作为匹配 baseline。
+- 主要结果（严格 test AUC）：
+  - LLaVA：最好散度为 `VV+VP all 6`，AUC/F1/AUPR=`0.900920/0.945185/0.985271`；最好单散度为 `VP KL(A||S)` AUC=`0.856907`。最好匹配 baseline 为 VP risk+cosine AUC=`0.899341`，六散度高 `+0.001579`。
+  - Qwen：最好散度也是最好单特征 `VP JS`，AUC/F1/AUPR=`0.924064/0.971429/0.994561`；匹配 VP risk+cosine baseline AUC=`0.922460`，高 `+0.001604`。VV-only 散度较弱，单特征 AUC=`0.742-0.784`。
+  - InternVL：最好散度为 `VV+VP JS`，AUC/F1/AUPR=`0.834537/0.952830/0.977938`；最好单散度为 `VP KL(S||A)` AUC=`0.808155`。最好匹配 baseline 为 VV risk+cosine AUC=`0.861905`，散度低 `-0.027367`。
+- 结论：Attention-TK32 divergence 对 Qwen 的 VP-JS 最有效；LLaVA 需要 VV+VP 六条逐层曲线联合后才能达到/略超主线 baseline；InternVL 有中等信号但不能替代 risk+cosine。类别不均衡使 F1 普遍很高，因此本轮以 AUC 为主。
+- 汇总输出：
+  - `outputs/coco500_attention_topk32_source_divergence/torch_probe_strict811_summary.md`；
+  - `torch_probe_strict811_all_results.{csv,json}`；
+  - 各模型完整 checkpoint/history/config 位于 `outputs/{model}/COCO500-attention-topk32-js-kl-probe/results/torch_probe/`。
+- 验证：
+  - `/opt/conda/private/envs/vicr/bin/python -m py_compile scripts/train_feature_sets.py scripts/train_torch_probe_feature_sets.py` 通过。
+  - Qwen 首条 row 的六个动态 block 与绘图函数逐层对齐，最大绝对误差约 `1e-7`（float32 保存误差），所有值 finite。
+  - 三模型各 14 个结果，共 42 条；所有 PR/RC/F1/Acc/AUC/AUPR finite，42 组 model/history/config artifacts 完整。
+
+## 2026-07-11 TGD COCO500 ADS/CGC 严格 8:1:1 三 seed
+- 用户要求检查相邻项目 `token-grounding-detector/outputs` 的 COCO500 严格 8:1:1 三 seed 结果；检查确认原先只有 val=test 的单 seed `torch_mlp_ads_cgc`，因此补跑严格实验。
+- TGD 新目录：`token-grounding-detector/outputs/{model}/COCO500-8-1-1/`。`features.pkl` 软链接原 `COCO500/features.pkl`；split 精确复用上一节 token-detector Attention-TK32 probe 的 400/50/50、seed=42 严格 split，三模型 SHA-256 均为 `661d86777e73a11f264973324b8ad1d35e6c7256c65d6aa83cda2595867388ab`，val/test overlap=0。
+- 训练：TGD `scripts/train_torch_ads_cgc.py`，feature sets=`ads/cgc/ads+cgc`，probe seeds=`42/43/44`，batch size=`256`，epochs=`100`，trained positive class=`real`。
+- 三 seed real-positive mean±population-std：
+  - LLaVA best `cgc`：PR/RC/F1/AUC/AUPR=`0.929±0.006/0.947±0.004/0.938±0.002/0.896±0.004/0.985±0.001`；`ads+cgc` AUC=`0.875±0.001`，`ads`=`0.701±0.016`。
+  - Qwen best mean `cgc`：`0.944±0.000/1.000±0.000/0.971±0.000/0.912±0.019/0.994±0.002`；`ads+cgc` AUC=`0.902±0.004`，均值略低但更稳定；`ads`=`0.799±0.011`。
+  - InternVL best `cgc`：`0.903±0.001/0.998±0.001/0.949±0.000/0.826±0.007/0.975±0.001`；`ads+cgc` AUC=`0.816±0.035`，`ads`=`0.704±0.016`。
+- 严格 test object-token rows：LLaVA 370（H/R=45/325），Qwen 181（11/170），InternVL 451（45/406）。Qwen hallucination test rows 很少，F1/PR/RC 受类别不均衡影响明显，因此仍以 AUC 为主；三 seed 只测初始化波动，不覆盖 split 波动。
+- TGD 汇总输出：
+  - `token-grounding-detector/outputs/ads_cgc_coco500_8_1_1_torch_mlp_3seeds_811_bs256_summary.{md,csv,json}`；
+  - seed 明细：`..._details.csv`；每模型每 seed 的 checkpoint/history/config/metrics 位于 `COCO500-8-1-1/results/torch_mlp_ads_cgc_seed{42,43,44}/`。
+- 与 token-detector 同 split、同 seed42 的直接比较：TGD best AUC 为 LLaVA CGC=`0.896684`、Qwen ADS+CGC=`0.901070`、InternVL CGC=`0.826273`；Attention-TK32 divergence best 分别为 `0.900920/0.924064/0.834537`，差值 `+0.004236/+0.022995/+0.008265`；risk+cosine best 为 `0.899341/0.922460/0.861905`。
+- 对比文件：`token-grounding-detector/outputs/ads_cgc_coco500_strict811_seed42_vs_token_detector.{md,csv,json}`。
+- 完整性检查：3 models × 3 seeds × 3 feature sets=`27` 份 metrics，全部 summary 的 `val_test_same_images=false`，所有指标 finite，27 组 model/history/config/metrics artifacts 完整。
+
+## 2026-07-10 COCO500 Top-32 区域内局部 softmax GLSim 热力图
+- 用户指出原 softmax-gate / attention / source Top-32 图中 attention/source 偏浅，希望对各自选中的 Top-32 数值再做一次 softmax。
+- 更新 `scripts/plot_coco500_glsim_softmax_gate_topk_heatmaps.py`：
+  - 新增 `--softmax-within-topk`；先按原分布选择 Top-32，再只对这 32 个保留值做 softmax，并 scatter 回原 visual grid；非 TopK 仍严格为 0。
+  - 新增 `--topk-softmax-temperature`，默认 `T=1.0`；本轮按用户要求使用默认温度。
+  - TopK indices 和原始 mass coverage 均在局部 softmax 前计算并保留；图内标注改为 `Pre-softmax Top-32 mass`，避免把可视化用的局部 softmax 误读为原始分布。
+  - `topk_values.{json,csv}` 新增 `softmax_within_topk`、temperature 和 `display_topk_sum`。
+- 新输出目录：`outputs/coco500_glsim_softmax_gate_attention_source_topk32_localsoftmax_small_shared10/`；保留上一版原始 mass 图不覆盖。
+  - 仍为三模型 × 10 张共享图片，共 30 PNG + 30 PDF、360 条 signal/layer stats。
+  - 样本、TopK indices、softmax 前 coverage 与上一版逐条一致。
+- 结果口径：局部 softmax 后每层 32 个显示值之和为 1；attention 的显示峰值范围约 `0.0338-0.0453`，source 约 `0.0313-0.0337`。因此图明显更亮，但尤其 source 的 32 个位置会接近等权，适合看 TopK 空间位置，不适合比较原始强弱。
+- 验证：
+  - py_compile 与小张量测试通过；示例 `[0.4,0.3]` 的局部 softmax 为 `[0.5250,0.4750]`，原 coverage=`0.7` 保持不变。
+  - 完整输出检查确认 30 PNG、30 PDF、360 rows；所有 `display_topk_sum` 在浮点误差内等于 1，无零字节文件。
+  - 与旧版逐条比较，TopK indices 和 pre-softmax coverage 完全相同。
+  - 已目视检查 Qwen hallucinated toothbrush 与 InternVL non-hallucinated frisbee，新版 attention/source 橙红区域明显增多，布局、独立 colorbar、GT 框与标注正常。
+
+## 2026-07-10 COCO500 Raw relative-VLL logits 与三信号四行 Top-32 对比
+- 用户进一步要求查看 visual-token raw logits Top-32 热力图，并与 gate、attention、source 三行比较，覆盖三模型。
+- 原 `features.pkl` 没有直接保存 VV raw-logit tensor，但可从同一条记录精确/近似反解：
+  - VP semantic gate 覆盖 visual+prompt 全 support，顶层 `dgst_t_layer_stats` 保存每层 `visual_prompt_relative_vll_logit_median/MAD`；
+  - 使用 `raw = median + (MAD + 1e-6) * logit(vp_gate)` 恢复全 support raw logits，再按 VP/VV support positions 映射并截取 visual tokens；
+  - 只有精确饱和为 0/1 的 float32 gate 极端值无法恢复无限精度，本轮三模型最大饱和比例约 `0.7%`，这些点使用相邻浮点边界；median 误差为 0，MAD 最大绝对误差约 `1e-6`。
+- 新增脚本：`scripts/plot_coco500_glsim_raw_logits_fourway_topk_heatmaps.py`。
+- 四行口径：
+  1. Raw relative-VLL logits：直接选最大的 Top-32，保留有符号 raw 数值，使用独立 `coolwarm` 数值色阶，不做 softmax；
+  2. `softmax(gate)`：自己的 Top-32 后局部 softmax `T=1`；
+  3. attention：自己的 Top-32 后局部 softmax `T=1`；
+  4. source distribution：自己的 Top-32 后局部 softmax `T=1`。
+- 每行色阶仅在该图的 L5/L15/L20/L25 共享，四行之间独立。沿用上一轮相同 10 张共享小物体图片、target token 和 GT 红框。
+- Raw logits 与 VV gate 是逐层单调关系，因此理论 Top-32 位置应一致；实际 30 token × 4 layers 的 Raw/Gate Top-32 overlap 全部为 `1.0`。
+- 输出目录：`outputs/coco500_glsim_raw_logits_gate_attention_source_topk32_localsoftmax_small_shared10/`：
+  - 30 PNG + 30 PDF；
+  - `summary.md`、`selected_samples.json`、`shared_image_ids.json`；
+  - `topk_values.{json,csv}` 共 480 行；
+  - `raw_logit_reconstruction.{json,csv}` 共 920 行，记录三模型所有 decoder layer 的 median/MAD 恢复误差与饱和比例。
+- 选定四层的 Raw-logit Top-32 数值总范围：LLaVA 约 `0.23-10.49`，Qwen 约 `-32.75-32.50`，InternVL 约 `-0.64-9.44`；每张图使用自身 raw 四层范围，避免跨模型量纲直接混用。
+- 验证：
+  - py_compile 与合成 raw→gate→raw 反解测试通过，示例 visual 子集 `[1,3,5]` 精确恢复；
+  - 输出检查确认 30 PNG、30 PDF、480 Top-K rows、920 reconstruction rows、无零字节文件；
+  - 所有 Top-K indices 长度为 32，层为 `5/15/20/25`，Raw/Gate overlap 全为 1；
+  - 已目视检查 LLaVA hallucinated remote、Qwen hallucinated toothbrush、InternVL non-hallucinated frisbee，四行布局、Raw 数值色条、局部-softmax三行、GT 框和标注均正常。
+
+## 2026-07-11 VV Attention-TK32 JS/KL、risk、cosine 严格 8:1:1 三 seed
+- 用户要求只做 VV scope，对 JS、双向 KL、risk、cosine 训练单特征，并分别比较散度/risk 加 cosine 的组合；不包含 VP。
+- 9 个 feature sets：`vv_attention_tk32_{js,kl_attention_source,kl_source_attention}`、`risk_geo_raw`、`visualcosine_raw`、三种 `VV divergence+visualcosine_raw`、`risk_geo_raw+visualcosine_raw`。
+- 输出目录：
+  - 每模型每 seed：`outputs/{model}/COCO500-vv-attention-topk32-js-kl-risk-cosine-3seeds/seed{42,43,44}/`；
+  - 总汇总：`outputs/coco500_vv_attention_topk32_js_kl_risk_cosine_3seeds_strict811/{summary.md,three_seed_summary.csv,three_seed_summary.json,all_seed_results.csv}`。
+- 训练口径：严格共享 train/val/test=`400/50/50`、split seed=`42`，probe seeds=`42/43/44`，batch size=`256`、epochs=`100`、positive class=`real`；三模型共 81 个 probe runs。
+- 三 seed mean±population-std：
+  - LLaVA best `VV JS + cosine`：PR/RC/F1/AUC/AUPR=`0.940±0.006/0.943±0.002/0.941±0.002/0.902±0.004/0.985±0.001`。其后为 `KL(S||A)+cosine` AUC=`0.891±0.001`、`KL(A||S)+cosine`=`0.887±0.002`；cosine 单特征=`0.884±0.006`，risk+cosine=`0.866±0.008`。
+  - Qwen best `VV JS + cosine`：`0.948±0.003/0.992±0.003/0.969±0.003/0.884±0.023/0.990±0.003`。risk+cosine=`0.870±0.041`，cosine 单特征=`0.860±0.015`；Qwen seed 波动较明显。
+  - InternVL best `VV risk + cosine`：`0.908±0.001/0.988±0.003/0.946±0.001/0.842±0.024/0.976±0.005`。`JS+cosine` 排第二 AUC=`0.816±0.012`，`KL(S||A)+cosine`=`0.813±0.013`，cosine 单特征=`0.783±0.006`。
+- 单散度都弱于同模型 cosine；最佳单散度分别为 LLaVA `KL(S||A)=0.833±0.005`、Qwen `JS=0.790±0.020`、InternVL `KL(S||A)=0.725±0.012`。
+- cosine 对所有 base feature 均提升 mean AUC：
+  - LLaVA：JS/KL(A||S)/KL(S||A)/risk 分别 `+0.072/+0.061/+0.058/+0.079`；
+  - Qwen：`+0.094/+0.066/+0.069/+0.022`；
+  - InternVL：`+0.105/+0.085/+0.088/+0.113`。
+- 结论：VV divergence 主要作为 cosine 的互补信号，而不是独立替代项。LLaVA/Qwen 中 JS+cosine 最强；InternVL 仍以 risk+cosine 最稳，JS+cosine 有增益但未超过它。
+- 验证：3 models × 3 seeds × 9 sets=`81` 条结果均存在，全部 PR/RC/F1/Acc/AUC/AUPR finite，model/history/config artifacts 完整；严格 split 三组互斥。
+- 中途修正：首次创建 seed 目录时相对软链接多写了一层 `..`，在任何训练启动前已改为正确的 `../../...` 并逐一用 `test -f` 与 `readlink -f` 验证，没有产生错误训练结果。
+
+## 2026-07-11 COCO500 GateAttention 与模型最后层五行空间对比
+- 用户要求在 Raw logits / gate / attention / source 对比中增加 GateAttention，并进一步追加每个模型的真正最后一个 decoder layer。
+- 更新 `scripts/plot_coco500_glsim_raw_logits_fourway_topk_heatmaps.py`：
+  - 新增 `--include-gated-attention`：第五个信号使用原 DGST-T 定义 `norm(A * g)`，其中 `A` 为 VV support attention、`g` 为保存的 raw sigmoid semantic gate；没有误用 `softmax(gate)` 与 attention 相乘。
+  - GateAttention 自己选择 Top-32，并只为显示在这 32 个值内做局部 softmax；图内同时标注归一化前的 `A×g retained = sum(A*g)/sum(A)`。
+  - `topk_values.{csv,json}` 新增 attention/GateAttention 与 gate/GateAttention 的 Top-32 overlap，以及 GateAttention retained mass。
+  - 新增 `--include-last-layer`：在用户指定的 L5/15/20/25 后自动去重追加当前模型实际最后层；LLaVA/InternVL 为 L32，Qwen 为 L28，不硬编码同一个层号。
+- 第一版五行、四层输出：`outputs/coco500_glsim_raw_logits_gate_attention_gatedattention_source_topk32_localsoftmax_small_shared10/`：
+  - 30 PNG + 30 PDF，600 Top-K rows，920 reconstruction rows，无零字节文件。
+  - 跨 4 层与 10 个样本，Attention/GateAttention Top-32 mean overlap：LLaVA `0.706`、Qwen `0.762`、InternVL `0.784`；Gate/GateAttention 仅为 `0.224/0.188/0.292`。GateAttention 因而主要是在原 attention 上门控重排，并非复制纯 gate 热区。
+  - `A×g retained` 均值分别为 `0.479/0.496/0.580`；幻觉/非幻觉总体均值 `0.521/0.515`，这 10 张可视化样本中没有明显 label 差异。
+- 追加最后层的新输出：`outputs/coco500_glsim_raw_logits_gate_attention_gatedattention_source_topk32_localsoftmax_small_shared10_lastlayer/`：
+  - 仍为 30 PNG + 30 PDF；5 signals × 5 layers × 30 tokens=`750` Top-K rows，reconstruction 仍为 920 rows。
+  - 最后层 Attention/GateAttention mean overlap：LLaVA L32=`0.650`、Qwen L28=`0.769`、InternVL L32=`0.684`；最后层 retained mass 均值为 `0.504/0.536/0.545`。
+- 验证：
+  - py_compile、`git diff --check` 通过；Top-K row 信号/层数、每行 32 indices、有限值、Raw/Gate overlap=`1.0`、PNG/PDF 计数和非空性均通过断言。
+  - 已目视检查 LLaVA hallucinated bottle、Qwen hallucinated toothbrush、InternVL non-hallucinated frisbee 的五行五列图；模型最后层号、布局、独立行色条、标注与 GT 框正常。
+  - 中途 GateAttention 小张量测试第一次使用了乘积并列的输入，却错误断言唯一 argmax，故测试预期失败；改成无并列输入后验证 `A*g=[0.1,0.1,0,0.2]`、retained=`0.4`、归一化=`[0.25,0.25,0,0.5]` 通过，实现本身无需修正。
+
+## 2026-07-14 Qwen3-VL-8B-Instruct COCO caption 接入
+- 新增独立 `models/qwen3_vl_wrapper.py`，没有复用或修改 Qwen2.5 的 `models/qwen_wrapper.py`；当前只支持图片 caption generation，特征提取会显式抛出 `NotImplementedError`，避免误走未经验证的 Qwen2.5 内部结构。
+- `models/__init__.py` 注册新 model key `qwen3_vl_8b`；`configs/model_configs_unified.yaml` 新增本地模型 `/home/apulis-dev/userdata/models/Qwen3-VL-8B-Instruct`，文本层数 36、patch size 16、`max_new_tokens=512`。
+- generation 使用模型原生 `Qwen3VLProcessor.apply_chat_template`、greedy decoding 和 SDPA attention；输出继续复用项目 `GenerationOutput`，保存 caption、response token IDs 与逐 token 文本。
+- 真实单图 smoke 已通过：模型完整加载到 RTX 5090，识别 36 个文本 decoder layers，图片输入、caption 解码和 response token IDs 均有效。
+- COCO caption 使用 `coco-labeling/label_coco.py --model qwen3_vl_8b --num-images 4000 --generation-devices cuda:0 cuda:1 --resume`；并行 worker 会持续写入 `generation_shards/`，支持中断恢复。

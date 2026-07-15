@@ -12,6 +12,7 @@ _REGISTRY = {
     ),
     "internvl_2_5_8b": ("models.internvl_wrapper", "InternVLWrapper"),
     "qwen2_5_vl_7b": ("models.qwen_wrapper", "QwenVLWrapper"),
+    "qwen3_vl_8b": ("models.qwen3_vl_wrapper", "Qwen3VLWrapper"),
 }
 
 

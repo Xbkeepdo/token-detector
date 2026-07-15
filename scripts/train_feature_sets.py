@@ -11,6 +11,7 @@ from copy import deepcopy
 from typing import Sequence
 
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -57,6 +58,18 @@ FEATURE_ALIASES = {
     "kl_source_target_vp": "kl_source_target_visual_prompt_relative_vll",
     "vp_kl_source_target": "kl_source_target_visual_prompt_relative_vll",
     "kl_s_t_visual_prompt_relative_vll": "kl_source_target_visual_prompt_relative_vll",
+    "vv_attention_tk32_js": "vv_attention_tk32_js",
+    "vv_atk32_js": "vv_attention_tk32_js",
+    "vv_attention_tk32_kl_attention_source": "vv_attention_tk32_kl_attention_source",
+    "vv_atk32_kl_as": "vv_attention_tk32_kl_attention_source",
+    "vv_attention_tk32_kl_source_attention": "vv_attention_tk32_kl_source_attention",
+    "vv_atk32_kl_sa": "vv_attention_tk32_kl_source_attention",
+    "vp_attention_tk32_js": "vp_attention_tk32_js",
+    "vp_atk32_js": "vp_attention_tk32_js",
+    "vp_attention_tk32_kl_attention_source": "vp_attention_tk32_kl_attention_source",
+    "vp_atk32_kl_as": "vp_attention_tk32_kl_attention_source",
+    "vp_attention_tk32_kl_source_attention": "vp_attention_tk32_kl_source_attention",
+    "vp_atk32_kl_sa": "vp_attention_tk32_kl_source_attention",
     "risk_geo_raw": "risk_relative_vll_cost_geo",
     "risk_geo_cap085": "risk_relative_vll_cost_geo_capped_topmass_085",
     "risk_geo_capped_topmass_085": "risk_relative_vll_cost_geo_capped_topmass_085",
@@ -536,6 +549,18 @@ _register_relative_cost_aliases()
 _register_topk_region_aliases()
 
 
+ATTENTION_TOPK_DIVERGENCE_BLOCKS = {
+    "vv_attention_tk32_js": ("vv", "js"),
+    "vv_attention_tk32_kl_attention_source": ("vv", "kl_attention_source"),
+    "vv_attention_tk32_kl_source_attention": ("vv", "kl_source_attention"),
+    "vp_attention_tk32_js": ("vp", "js"),
+    "vp_attention_tk32_kl_attention_source": ("vp", "kl_attention_source"),
+    "vp_attention_tk32_kl_source_attention": ("vp", "kl_source_attention"),
+}
+ATTENTION_TOPK_DIVERGENCE_CACHE_KEY = "_computed_attention_topk32_source_divergence"
+ATTENTION_TOPK_DIVERGENCE_EPS = 1e-12
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -673,6 +698,9 @@ def build_selected_matrix(features: Sequence[dict], blocks: Sequence[str]) -> tu
 
 
 def feature_block(feat: dict, block: str) -> np.ndarray:
+    if block in ATTENTION_TOPK_DIVERGENCE_BLOCKS:
+        return _attention_topk_source_divergence_block(feat, block)
+
     if block == "target_visual_hidden_cosine_relative_vll_shift1":
         return _shift_right_one_layer(feature_block(feat, "target_visual_hidden_cosine_relative_vll"))
 
@@ -755,6 +783,83 @@ def feature_block(feat: dict, block: str) -> np.ndarray:
     if values is None:
         raise KeyError(f"Feature block {block!r} requires missing key {key!r}.")
     return np.asarray(values, dtype=np.float32).reshape(-1)
+
+
+def _attention_topk_source_divergence_block(feat: dict, block: str) -> np.ndarray:
+    scope, metric = ATTENTION_TOPK_DIVERGENCE_BLOCKS[block]
+    cache = feat.setdefault(ATTENTION_TOPK_DIVERGENCE_CACHE_KEY, {})
+    if scope not in cache:
+        attention_key = f"dgst_t_{scope}_support_attention_per_layer"
+        source_key = f"dgst_t_{scope}_source_dist_per_layer"
+        attention_values = feat.get(attention_key)
+        source_values = feat.get(source_key)
+        if attention_values is None or source_values is None:
+            raise KeyError(
+                f"Feature block {block!r} requires {attention_key!r} and {source_key!r}."
+            )
+
+        attention = torch.as_tensor(attention_values).detach().cpu().to(dtype=torch.float64)
+        source = torch.as_tensor(source_values).detach().cpu().to(dtype=torch.float64)
+        if attention.ndim != 2 or source.ndim != 2 or attention.shape != source.shape:
+            raise ValueError(
+                "Attention-TK divergence requires matching [layers, support] tensors, got "
+                f"attention={tuple(attention.shape)}, source={tuple(source.shape)}."
+            )
+        if attention.shape[-1] <= 0:
+            raise ValueError("Attention-TK divergence requires non-empty support.")
+
+        attention = torch.nan_to_num(
+            attention, nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp_min(0.0)
+        source = torch.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        top_k = min(32, int(attention.shape[-1]))
+        indices = torch.topk(
+            attention, k=top_k, dim=-1, largest=True, sorted=False
+        ).indices
+        attention_prob = _smooth_probability_rows(torch.gather(attention, -1, indices))
+        source_prob = _smooth_probability_rows(torch.gather(source, -1, indices))
+        midpoint = 0.5 * (attention_prob + source_prob)
+
+        cache[scope] = {
+            "js": (
+                0.5
+                * torch.sum(
+                    attention_prob * (torch.log(attention_prob) - torch.log(midpoint)), dim=-1
+                )
+                + 0.5
+                * torch.sum(
+                    source_prob * (torch.log(source_prob) - torch.log(midpoint)), dim=-1
+                )
+            )
+            .numpy()
+            .astype(np.float32),
+            "kl_attention_source": torch.sum(
+                attention_prob * (torch.log(attention_prob) - torch.log(source_prob)), dim=-1
+            )
+            .numpy()
+            .astype(np.float32),
+            "kl_source_attention": torch.sum(
+                source_prob * (torch.log(source_prob) - torch.log(attention_prob)), dim=-1
+            )
+            .numpy()
+            .astype(np.float32),
+        }
+    return np.asarray(cache[scope][metric], dtype=np.float32).reshape(-1)
+
+
+def _smooth_probability_rows(values: torch.Tensor) -> torch.Tensor:
+    values = torch.nan_to_num(
+        values.to(dtype=torch.float64), nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp_min(0.0)
+    totals = values.sum(dim=-1, keepdim=True)
+    uniform = torch.full_like(values, 1.0 / float(values.shape[-1]))
+    probabilities = torch.where(
+        totals > 0.0,
+        values / totals.clamp_min(ATTENTION_TOPK_DIVERGENCE_EPS),
+        uniform,
+    )
+    probabilities = probabilities.clamp_min(ATTENTION_TOPK_DIVERGENCE_EPS)
+    return probabilities / probabilities.sum(dim=-1, keepdim=True)
 
 
 def _shift_right_one_layer(values: np.ndarray) -> np.ndarray:
