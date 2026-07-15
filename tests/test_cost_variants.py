@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 from features.dgst_t import (
     COST_VARIANT_RISK_KEYS,
     GAUSSIAN_MAD_SCALE,
+    _compute_gate_comparison_from_parts,
     _compute_cost_variant_risks,
     _cosine_distance_matrix,
     _relative_vll_evidence_signal,
@@ -24,7 +25,10 @@ from features.dgst_t import (
     _topk_union_indices,
     _transport_risk_on_support,
 )
-from features.extractor import _build_cost_variant_feature_record
+from features.extractor import (
+    _build_cost_variant_feature_record,
+    _build_gate_comparison_feature_record,
+)
 from train_feature_sets import build_selected_matrix, parse_feature_set
 
 
@@ -78,6 +82,65 @@ class CostVariantTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(evidence).all())
         self.assertTrue(torch.isfinite(gate).all())
         self.assertTrue(torch.allclose(gate, torch.full((3,), 0.5)))
+
+    def test_softmax_relative_vll_applies_mad_to_target_probabilities(self) -> None:
+        # These are p(w* | h_i) values obtained after a full-vocabulary
+        # softmax at each visual position, not a softmax over positions.
+        probabilities = torch.tensor([0.01, 0.04, 0.25])
+        evidence, gate, _, stats = _relative_vll_evidence_signal(
+            attention_signal=torch.ones(3),
+            target_logits=probabilities,
+            support_positions=[0, 1, 2],
+            visual_start=0,
+            visual_end=3,
+            candidate_scope="visual",
+            stat_prefix="softmax_relative_vll",
+            epsilon=1e-6,
+            barrier_margin=0.5,
+            barrier_max=3.0,
+            mad_scale=GAUSSIAN_MAD_SCALE,
+        )
+        median = probabilities.median()
+        mad = torch.abs(probabilities - median).median()
+        expected = torch.sigmoid(
+            (probabilities - median) / (GAUSSIAN_MAD_SCALE * mad + 1e-6)
+        )
+        self.assertTrue(torch.allclose(gate, expected, atol=1e-6))
+        self.assertTrue(torch.allclose(evidence, expected, atol=1e-6))
+        self.assertEqual(stats["softmax_relative_vll_mad_scale"], GAUSSIAN_MAD_SCALE)
+
+    def test_gate_comparison_emits_matched_hpre_features(self) -> None:
+        result = _compute_gate_comparison_from_parts(
+            source_ffn_states=[torch.tensor([0.4, 0.2])],
+            source_attn_states=[torch.tensor([0.1, -0.1])],
+            prediction_hidden_states=[torch.tensor([0.9, 0.5])],
+            support_h_prev_states=[self.states],
+            support_h_mid_states=[self.states + 0.1],
+            support_attentions=[torch.tensor([0.2, 0.3, 0.5])],
+            semantic_probs=[torch.tensor([0.02, 0.10, 0.04])],
+            relative_vll_logits=[torch.tensor([0.0, 1.0, 4.0])],
+            support_positions=[0, 1, 2],
+            visual_start=0,
+            visual_end=3,
+            tau=0.07,
+            source_distribution_mode="softmax",
+            transport_top_k=3,
+            ot_solver="linprog",
+            atarget_visual_top_k=2,
+            relative_vll_mad_epsilon=1e-6,
+            relative_barrier_margin=0.5,
+            relative_barrier_max=3.0,
+        )
+        series_keys = [
+            key
+            for key in result
+            if key.endswith("_per_layer")
+        ]
+        self.assertEqual(len(series_keys), 6)
+        for key in series_keys:
+            self.assertEqual(tuple(result[key].shape), (1,))
+            self.assertTrue(torch.isfinite(result[key]).all(), key)
+        self.assertEqual(result["dgst_t_gate_comparison_cost"], "sqrt_cosine_hpre")
 
     def test_all_risks_are_finite_and_raw_attention_is_direct(self) -> None:
         source = torch.tensor([0.7, 0.2, 0.1])
@@ -223,6 +286,93 @@ class CostVariantTests(unittest.TestCase):
         self.assertEqual(len(record), 27)
         self.assertNotIn("dgst_t_layer_stats", record)
         self.assertEqual(tuple(record["dgst_t_vv_source_dist_per_layer"].shape), (2, 3))
+
+    def test_gate_comparison_compact_record(self) -> None:
+        tensor_keys = (
+            "dgst_t_relative_vll_gauss_risk_sqrt_hpre_per_layer",
+            "dgst_t_softmax_relative_vll_gauss_risk_sqrt_hpre_per_layer",
+            "dgst_t_legacy_prob_risk_sqrt_hpre_per_layer",
+            "dgst_t_relative_vll_gauss_target_visual_hpre_cosine_per_layer",
+            "dgst_t_softmax_relative_vll_gauss_target_visual_hpre_cosine_per_layer",
+            "dgst_t_legacy_prob_target_visual_hpre_cosine_per_layer",
+        )
+        dgst_t = {key: torch.ones(2) for key in tensor_keys}
+        dgst_t.update(
+            {
+                "dgst_t_gate_comparison_methods": [
+                    "relative_vll",
+                    "softmax_relative_vll",
+                    "legacy_prob",
+                ],
+                "dgst_t_gate_comparison_cost": "sqrt_cosine_hpre",
+                "dgst_t_gate_comparison_target_cosine_state": "hpre",
+                "dgst_t_gate_comparison_softmax_axis": "vocabulary",
+                "dgst_t_gate_comparison_mad_axis": "visual_tokens",
+                "dgst_t_gate_comparison_mad_scale": GAUSSIAN_MAD_SCALE,
+                "dgst_t_gate_comparison_transport_top_k": 64,
+                "dgst_t_gate_comparison_target_cosine_top_k": 32,
+                "dgst_t_relative_vll_logit_source": "h_mid",
+                "dgst_t_source_distribution_mode": "softmax",
+            }
+        )
+        record = _build_gate_comparison_feature_record(
+            image_id=1,
+            span={"word": "car", "label": 0},
+            response_index=2,
+            target_token_id=3,
+            model_out=SimpleNamespace(token_id=3),
+            dgst_t=dgst_t,
+        )
+        self.assertEqual(record["label"], 0)
+        self.assertEqual(record["dgst_t_gate_comparison_cost"], "sqrt_cosine_hpre")
+        self.assertEqual(record["dgst_t_gate_comparison_softmax_axis"], "vocabulary")
+        self.assertEqual(record["dgst_t_gate_comparison_mad_axis"], "visual_tokens")
+        for key in tensor_keys:
+            self.assertEqual(record[key], [1.0, 1.0])
+
+    def test_gate_comparison_probe_aliases_build_matched_blocks(self) -> None:
+        row = {
+            "label": 0,
+            "dgst_t_relative_vll_gauss_risk_sqrt_hpre_per_layer": [0.1, 0.2],
+            "dgst_t_relative_vll_gauss_target_visual_hpre_cosine_per_layer": [
+                0.3,
+                0.4,
+            ],
+            "dgst_t_softmax_relative_vll_gauss_risk_sqrt_hpre_per_layer": [
+                0.5,
+                0.6,
+            ],
+            "dgst_t_softmax_relative_vll_gauss_target_visual_hpre_cosine_per_layer": [
+                0.7,
+                0.8,
+            ],
+            "dgst_t_legacy_prob_risk_sqrt_hpre_per_layer": [0.9, 1.0],
+            "dgst_t_legacy_prob_target_visual_hpre_cosine_per_layer": [1.1, 1.2],
+        }
+        expected = {
+            "gate-relative-vll-risk": [0.1, 0.2],
+            "gate-relative-vll-hprecosine": [0.3, 0.4],
+            "gate-softmax-relative-vll-risk": [0.5, 0.6],
+            "gate-softmax-relative-vll-hprecosine": [0.7, 0.8],
+            "gate-legacy-prob-risk": [0.9, 1.0],
+            "gate-legacy-prob-hprecosine": [1.1, 1.2],
+        }
+        for feature_set, values in expected.items():
+            matrix, labels = build_selected_matrix([row], parse_feature_set(feature_set))
+            self.assertTrue(np.allclose(matrix, np.asarray([values], dtype=np.float32)))
+            self.assertTrue(np.array_equal(labels, np.asarray([0], dtype=np.int32)))
+
+        matrix, _labels = build_selected_matrix(
+            [row],
+            parse_feature_set(
+                "gate-softmax-relative-vll-risk+"
+                "gate-softmax-relative-vll-hprecosine"
+            ),
+        )
+        self.assertEqual(matrix.shape, (1, 4))
+        self.assertTrue(
+            np.allclose(matrix[0], np.asarray([0.5, 0.6, 0.7, 0.8], dtype=np.float32))
+        )
 
 
 if __name__ == "__main__":

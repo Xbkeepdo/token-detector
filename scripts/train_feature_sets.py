@@ -566,9 +566,71 @@ def _register_topk_region_aliases() -> None:
                             FEATURE_ALIASES[alias] = block
 
 
+def _register_gate_comparison_aliases() -> None:
+    """Register matched COCO100 target-gate risk/cosine feature blocks."""
+    specs = {
+        "gate_relative_vll_risk": (
+            "dgst_t_relative_vll_gauss_risk_sqrt_hpre_per_layer"
+        ),
+        "gate_relative_vll_hprecosine": (
+            "dgst_t_relative_vll_gauss_target_visual_hpre_cosine_per_layer"
+        ),
+        "gate_softmax_relative_vll_risk": (
+            "dgst_t_softmax_relative_vll_gauss_risk_sqrt_hpre_per_layer"
+        ),
+        "gate_softmax_relative_vll_hprecosine": (
+            "dgst_t_softmax_relative_vll_gauss_target_visual_hpre_cosine_per_layer"
+        ),
+        "gate_legacy_prob_risk": (
+            "dgst_t_legacy_prob_risk_sqrt_hpre_per_layer"
+        ),
+        "gate_legacy_prob_hprecosine": (
+            "dgst_t_legacy_prob_target_visual_hpre_cosine_per_layer"
+        ),
+    }
+    for block, feature_key in specs.items():
+        FEATURE_ALIASES[block] = block
+        FEATURE_KEYS[block] = feature_key
+
+
+def _register_four_gate_aliases() -> None:
+    """Register aliases for the active gates and raw-attention control."""
+    methods = (
+        "hpre_raw_logit_gauss",
+        "hpre_softmax_prob_gauss",
+        "hmid_raw_logit_gauss",
+        "hmid_softmax_prob_gauss",
+        "raw_attention",
+    )
+    for method in methods:
+        specs = {
+            f"{method}_risk": f"dgst_t_{method}_risk_sqrt_hpre_per_layer",
+            f"{method}_target_cosine": (
+                f"dgst_t_{method}_target_cosine_topk32_hpre_per_layer"
+            ),
+            f"{method}_ev": f"dgst_t_{method}_ev_topk32_hpre_per_layer",
+        }
+        for block, feature_key in specs.items():
+            FEATURE_ALIASES[block] = block
+            FEATURE_KEYS[block] = feature_key
+
+
+def _register_ads_cgc_aliases() -> None:
+    """Register the two root ADS/CGC layerwise vectors."""
+    for block, feature_key in {
+        "ads": "ads_per_layer",
+        "cgc": "cgc_per_layer",
+    }.items():
+        FEATURE_ALIASES[block] = block
+        FEATURE_KEYS[block] = feature_key
+
+
 _register_delta_source_aliases()
 _register_relative_cost_aliases()
 _register_topk_region_aliases()
+_register_gate_comparison_aliases()
+_register_four_gate_aliases()
+_register_ads_cgc_aliases()
 
 
 ATTENTION_TOPK_DIVERGENCE_BLOCKS = {
@@ -628,6 +690,15 @@ def main() -> None:
 
     all_features = load_pkl(feature_path)
     splits = load_json(splits_path)
+    from utils.split_utils import validate_strict_811_split
+
+    split_counts = validate_strict_811_split(splits)
+    configured_count = int((config.get("dataset") or {}).get("num_images", 0))
+    if configured_count and sum(split_counts.values()) != configured_count:
+        raise ValueError(
+            "Strict split size differs from dataset.num_images: "
+            f"{sum(split_counts.values())} != {configured_count}"
+        )
     train_feats, val_feats, test_feats = split_by_image_id(
         all_features,
         train_image_ids={int(x) for x in splits["train"]},
@@ -648,14 +719,12 @@ def main() -> None:
         X_train, y_train = build_selected_matrix(train_feats, blocks)
         X_val, y_val = build_selected_matrix(val_feats, blocks)
         X_test, y_test = build_selected_matrix(test_feats, blocks)
-        if X_train.shape[0] == 0:
-            raise ValueError(f"No training rows for feature set {feature_set!r}.")
-        if X_val.shape[0] == 0 or len(np.unique(y_val)) < 2:
-            print(f"[FeatureSets] WARNING: val split unusable for {feature_set}; using train as val.")
-            X_val, y_val = X_train.copy(), y_train.copy()
-        if X_test.shape[0] == 0 or len(np.unique(y_test)) < 2:
-            print(f"[FeatureSets] WARNING: test split unusable for {feature_set}; using val as test.")
-            X_test, y_test = X_val.copy(), y_val.copy()
+        _require_strict_binary_splits(
+            feature_set=feature_set,
+            train=(X_train, y_train),
+            val=(X_val, y_val),
+            test=(X_test, y_test),
+        )
 
         print(f"\n[FeatureSets] {feature_set}: X={X_train.shape[1]} dims")
         set_results = results.setdefault(feature_set, {})
@@ -685,6 +754,29 @@ def main() -> None:
 
     print(f"\n[FeatureSets] Saved results to {out_path}")
     _write_summary_table(out_path)
+
+
+def _require_strict_binary_splits(
+    *,
+    feature_set: str,
+    train: tuple[np.ndarray, np.ndarray],
+    val: tuple[np.ndarray, np.ndarray],
+    test: tuple[np.ndarray, np.ndarray],
+) -> None:
+    """Reject unusable partitions instead of leaking rows across 8:1:1 splits."""
+    for split_name, (matrix, labels) in (
+        ("train", train),
+        ("val", val),
+        ("test", test),
+    ):
+        classes = np.unique(labels)
+        if matrix.shape[0] == 0 or classes.size < 2:
+            raise ValueError(
+                f"Strict 8:1:1 violation for feature set {feature_set!r}: "
+                f"{split_name} has {matrix.shape[0]} rows and classes "
+                f"{classes.tolist()}. Splits are never substituted; repair the "
+                "labels/image split before training."
+            )
 
 
 def parse_feature_set(value: str) -> list[str]:

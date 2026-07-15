@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
 
-from models.base_wrapper import BaseLVLMWrapper, GenerationOutput
+from models.base_wrapper import (
+    AttentionRequirement,
+    BaseLVLMWrapper,
+    ExtractionRequirements,
+    GenerationOutput,
+)
 from features.attention import compute_alpha_img_alpha_text
+from features.ads import compute_ads
+from features.cgc import compute_cgc
 from features.dgst_t import compute_dgst_t
 from utils.io_utils import append_pkl, load_json, load_pkl
 
@@ -21,21 +28,63 @@ def extract_features_for_dataset(
     cfg_dgst_t: dict,
     output_path: str,
     resume: bool = True,
+    prompt: Optional[str] = None,
+    cfg_feature_extraction: Optional[dict] = None,
+    baseline_runtime=None,
+    baseline_output_path: Optional[str] = None,
 ) -> List[dict]:
     """Main entry point.  Iterates over `coco_samples`, extracts features"""
     all_features: List[dict] = []
+    family_flags = _feature_family_flags(cfg_feature_extraction)
+    active_dgst_t = (
+        _resolve_active_dgst_config(cfg_dgst_t)
+        if family_flags["method"]
+        else None
+    )
     done_image_ids = set()
+    baseline_features: List[dict] = []
+    baseline_done_image_ids: set[int] = set()
     output_dir = os.path.dirname(output_path)
     generation_results = _load_generation_results(output_dir)
     if resume and os.path.exists(output_path):
         all_features = load_pkl(output_path)
         done_image_ids = {f["image_id"] for f in all_features}
         print(f"[Extractor] Resuming — {len(done_image_ids)} images already done.")
+    if baseline_runtime is not None:
+        if baseline_output_path is None:
+            raise ValueError("baseline_runtime requires baseline_output_path.")
+        if resume and os.path.exists(baseline_output_path):
+            baseline_features = load_pkl(baseline_output_path)
+            baseline_done_image_ids = {
+                int(feature["image_id"])
+                for feature in baseline_features
+                if "image_id" in feature
+            }
+            print(
+                "[Extractor] Baseline resume — "
+                f"{len(baseline_done_image_ids)} images already done."
+            )
 
     for sample in tqdm(coco_samples, desc="Extracting features"):
         image_id = sample["image_id"]
-        if image_id in done_image_ids:
+        root_is_done = image_id in done_image_ids
+        baseline_is_done = (
+            baseline_runtime is None or image_id in baseline_done_image_ids
+        )
+        if root_is_done and baseline_is_done:
             continue
+        requirements = build_extraction_requirements(
+            method=bool(family_flags["method"] and not root_is_done),
+            ads_cgc=bool(family_flags["ads_cgc"] and not root_is_done),
+            baseline=False,
+        )
+        if baseline_runtime is not None and not baseline_is_done:
+            requirements = requirements.merged(baseline_runtime.requirements)
+        image_dgst_t = (
+            active_dgst_t
+            if family_flags["method"] and not root_is_done
+            else None
+        )
 
         label_info = labeling_results.get(image_id)
         if label_info is None:
@@ -75,9 +124,12 @@ def extract_features_for_dataset(
             token_indices = span.get("token_indices") or []
             if not token_indices:
                 continue
-            first_idx = int(token_indices[0])
-            if first_idx < 0 or first_idx >= len(gen_out.response_token_ids):
+            if not all(
+                0 <= int(index) < len(gen_out.response_token_ids)
+                for index in token_indices
+            ):
                 continue
+            first_idx = int(token_indices[0])
             valid_spans.append(span)
             response_indices.append(first_idx)
             target_token_ids.append(int(gen_out.response_token_ids[first_idx]))
@@ -91,12 +143,20 @@ def extract_features_for_dataset(
                 response_token_ids=gen_out.response_token_ids,
                 response_token_indices=response_indices,
                 target_token_ids=target_token_ids,
-                cfg_dgst_t=cfg_dgst_t,
+                cfg_dgst_t=image_dgst_t,
+                prompt=prompt,
+                requirements=requirements,
             )
         except Exception as e:
             import traceback
             print(f"[Extractor] Warning — batch forward failed for image {image_id}: {e}")
             traceback.print_exc()
+            if baseline_runtime is not None:
+                raise RuntimeError(
+                    "Joint baseline extraction requires one caption-level batch "
+                    "forward for MetaToken/HalLoc alignment; per-object fallback "
+                    f"is unsafe for image {image_id}."
+                ) from e
             model_outputs = _extract_token_features_fallback(
                 model_wrapper=model_wrapper,
                 image=image,
@@ -105,39 +165,253 @@ def extract_features_for_dataset(
                 response_token_ids=gen_out.response_token_ids,
                 response_indices=response_indices,
                 target_token_ids=target_token_ids,
-                cfg_dgst_t=cfg_dgst_t,
+                cfg_dgst_t=image_dgst_t,
+                prompt=prompt,
+                requirements=requirements,
             )
 
         if len(model_outputs) != len(valid_spans):
-            print(
-                f"[Extractor] Warning — image {image_id} returned "
-                f"{len(model_outputs)} outputs for {len(valid_spans)} object tokens."
+            raise RuntimeError(
+                f"Image {image_id} returned {len(model_outputs)} outputs for "
+                f"{len(valid_spans)} object tokens. Refusing to mark a partial "
+                "image complete because image-level resume would skip its "
+                "missing object spans."
             )
 
-        for span, first_idx, target_token_id, model_out in zip(
-            valid_spans,
-            response_indices,
-            target_token_ids,
-            model_outputs,
-        ):
-            if model_out is None:
-                continue
-            feat = _build_feature_record(
-                image_id=image_id,
-                span=span,
-                response_index=int(first_idx),
-                target_token_id=int(target_token_id),
-                model_out=model_out,
-                cfg_dgst_t=cfg_dgst_t,
+        successful = [
+            (span, first_idx, target_token_id, model_out)
+            for span, first_idx, target_token_id, model_out in zip(
+                valid_spans,
+                response_indices,
+                target_token_ids,
+                model_outputs,
             )
-            image_features.append(feat)
+            if model_out is not None
+        ]
+        if len(successful) != len(valid_spans):
+            raise RuntimeError(
+                f"Image {image_id} produced {len(successful)} successful outputs "
+                f"for {len(valid_spans)} object tokens. Refusing to persist a "
+                "partial image because image-level resume would skip it."
+            )
+        if not root_is_done:
+            for span, first_idx, target_token_id, model_out in successful:
+                feat = _build_enabled_feature_record(
+                    image_id=image_id,
+                    span=span,
+                    response_index=int(first_idx),
+                    target_token_id=int(target_token_id),
+                    model_out=model_out,
+                    cfg_dgst_t=active_dgst_t,
+                    cfg_feature_extraction=cfg_feature_extraction,
+                    family_flags=family_flags,
+                )
+                image_features.append(feat)
 
-        all_features.extend(image_features)
-        if image_features:
+        if baseline_runtime is not None and successful and not baseline_is_done:
+            image_baselines = baseline_runtime.build_image_records(
+                image=image,
+                image_id=int(image_id),
+                response_token_ids=gen_out.response_token_ids,
+                spans=[item[0] for item in successful],
+                model_outputs=[item[3] for item in successful],
+            )
+            baseline_features.extend(image_baselines)
+            if image_baselines:
+                append_pkl(image_baselines, baseline_output_path)
+
+        if not root_is_done:
+            all_features.extend(image_features)
+        if image_features and not root_is_done:
             append_pkl(image_features, output_path)
 
     print(f"[Extractor] Done. {len(all_features)} DGST-T object tokens saved to {output_path}.")
+    if baseline_runtime is not None:
+        print(
+            f"[Extractor] Done. {len(baseline_features)} baseline object tokens "
+            f"saved to {baseline_output_path}."
+        )
     return all_features
+
+
+def build_extraction_requirements(
+    *,
+    method: bool,
+    ads_cgc: bool,
+    baseline: bool,
+) -> ExtractionRequirements:
+    """Return the least set of tensors required by all enabled consumers."""
+    requirements = ExtractionRequirements(
+        attention=AttentionRequirement.NONE,
+        logits=False,
+        token_hidden_states=False,
+        patch_hidden_states=False,
+        response_hidden_states=False,
+        visual_layout=False,
+        dgst_capture=bool(method),
+    )
+    if ads_cgc:
+        requirements = requirements.merged(
+            ExtractionRequirements(
+                attention=AttentionRequirement.PER_HEAD,
+                logits=False,
+                token_hidden_states=True,
+                patch_hidden_states=True,
+                response_hidden_states=False,
+                visual_layout=True,
+                dgst_capture=False,
+            )
+        )
+    if baseline:
+        requirements = requirements.merged(
+            ExtractionRequirements(
+                attention=AttentionRequirement.PER_HEAD,
+                # MetaToken is compacted during its caption pass; no baseline
+                # keeps per-object vocabulary rows.  ProjectAway needs raw
+                # visual layer outputs, while HalLoc needs only final response
+                # embeddings.
+                logits=False,
+                token_hidden_states=False,
+                patch_hidden_states=True,
+                response_hidden_states=True,
+                visual_layout=True,
+                dgst_capture=False,
+            )
+        )
+    return requirements
+
+
+def _feature_family_flags(cfg_feature_extraction: Optional[dict]) -> dict[str, bool]:
+    # Historical call sites passed only cfg_dgst_t and therefore mean method-only.
+    if cfg_feature_extraction is None:
+        return {"method": True, "ads_cgc": False, "baseline": False}
+
+    def enabled(name: str, default: bool = False) -> bool:
+        value = cfg_feature_extraction.get(name, {})
+        if isinstance(value, dict):
+            return bool(value.get("enabled", default))
+        return bool(value)
+
+    flags = {
+        "method": enabled("method"),
+        "ads_cgc": enabled("ads_cgc"),
+        "baseline": enabled("baseline"),
+    }
+    if not any(flags.values()):
+        raise ValueError("No feature family is enabled for extraction.")
+    return flags
+
+
+def _resolve_active_dgst_config(cfg_dgst_t: dict) -> dict:
+    resolved = dict(cfg_dgst_t or {})
+    if not bool(resolved.get("enabled", True)):
+        raise ValueError("feature_extraction.method is enabled but dgst_t.enabled=false.")
+    branches = resolved.get("branches")
+    if isinstance(branches, dict):
+        configured = resolved.get("four_gate_methods") or list(branches)
+        enabled_methods = [
+            str(method)
+            for method in configured
+            if bool(branches.get(str(method), True))
+        ]
+        if not enabled_methods:
+            raise ValueError("All four DGST branch switches are disabled.")
+        resolved["four_gate_methods"] = enabled_methods
+    return resolved
+
+
+def _build_enabled_feature_record(
+    *,
+    image_id: int,
+    span: dict,
+    response_index: int,
+    target_token_id: int,
+    model_out,
+    cfg_dgst_t: Optional[dict],
+    cfg_feature_extraction: Optional[dict],
+    family_flags: dict[str, bool],
+) -> dict:
+    if family_flags["method"]:
+        if cfg_dgst_t is None:
+            raise RuntimeError("Method extraction requires a DGST configuration.")
+        feat = _build_feature_record(
+            image_id=image_id,
+            span=span,
+            response_index=response_index,
+            target_token_id=target_token_id,
+            model_out=model_out,
+            cfg_dgst_t=cfg_dgst_t,
+        )
+    else:
+        feat = _base_token_record(
+            image_id=image_id,
+            span=span,
+            response_index=response_index,
+            target_token_id=target_token_id,
+            model_out=model_out,
+        )
+    if family_flags["ads_cgc"]:
+        feat.update(
+            _compute_ads_cgc_features(
+                model_out,
+                cfg_feature_extraction or {},
+            )
+        )
+    return feat
+
+
+def _base_token_record(
+    *,
+    image_id: int,
+    span: dict,
+    response_index: int,
+    target_token_id: int,
+    model_out,
+) -> dict:
+    return {
+        "feature_schema_version": "token-detector-v2",
+        "image_id": int(image_id),
+        "token_str": span["word"],
+        "token_id": int(model_out.token_id),
+        "target_token_id": int(target_token_id),
+        "response_token_idx": int(response_index),
+        "label": int(span["label"]),
+    }
+
+
+def _compute_ads_cgc_features(model_out, cfg_feature_extraction: dict) -> dict:
+    if model_out.text_to_patch_attn.numel() == 0:
+        raise RuntimeError("ADS/CGC requires per-head text-to-patch attention.")
+    if model_out.token_hidden_states.numel() == 0 or model_out.patch_hidden_states.numel() == 0:
+        raise RuntimeError("CGC requires token and visual-patch hidden states.")
+    ads_cfg = dict(cfg_feature_extraction.get("ads") or {})
+    cgc_cfg = dict(cfg_feature_extraction.get("cgc") or {})
+    ads_score, ads_per_layer = compute_ads(
+        model_out.text_to_patch_attn,
+        top_patch_pct=float(ads_cfg.get("top_patch_pct", 0.10)),
+        connectivity=int(ads_cfg.get("connectivity", 8)),
+        min_blob_area=int(ads_cfg.get("min_blob_area", 3)),
+        top_k_layers=int(ads_cfg.get("top_k_layers", 10)),
+        grid_shape=model_out.visual_grid,
+    )
+    cgc_score, cgc_per_layer = compute_cgc(
+        model_out.token_hidden_states,
+        model_out.patch_hidden_states,
+        top_k_patches=int(cgc_cfg.get("top_k_patches", 5)),
+        top_k_pct=float(cgc_cfg.get("top_k_pct", 0.05)),
+        text_to_patch_attn=(
+            model_out.text_to_patch_attn
+            if bool(cgc_cfg.get("use_attn_weighting", False))
+            else None
+        ),
+        mid_layer_pct=tuple(cgc_cfg.get("mid_layer_pct", (0.25, 0.75))),
+    )
+    return {
+        "ads_score": float(ads_score),
+        "ads_per_layer": _compact_numpy(ads_per_layer, dtype=np.float32),
+        "cgc_score": float(cgc_score),
+        "cgc_per_layer": _compact_numpy(cgc_per_layer, dtype=np.float32),
+    }
 
 
 def _load_generation_results(output_dir: str) -> dict[int, dict]:
@@ -160,6 +434,24 @@ def _build_feature_record(
     dgst_t = _compute_dgst_t_result(model_out, cfg_dgst_t)
     if cfg_dgst_t.get("feature_output_profile") == "costvariant_vv":
         return _build_cost_variant_feature_record(
+            image_id=image_id,
+            span=span,
+            response_index=response_index,
+            target_token_id=target_token_id,
+            model_out=model_out,
+            dgst_t=dgst_t,
+        )
+    if cfg_dgst_t.get("feature_output_profile") == "gate_comparison_vv":
+        return _build_gate_comparison_feature_record(
+            image_id=image_id,
+            span=span,
+            response_index=response_index,
+            target_token_id=target_token_id,
+            model_out=model_out,
+            dgst_t=dgst_t,
+        )
+    if cfg_dgst_t.get("feature_output_profile") == "four_gate_vv":
+        return _build_four_gate_feature_record(
             image_id=image_id,
             span=span,
             response_index=response_index,
@@ -457,6 +749,151 @@ def _build_cost_variant_feature_record(
     return feat
 
 
+def _build_gate_comparison_feature_record(
+    *,
+    image_id: int,
+    span: dict,
+    response_index: int,
+    target_token_id: int,
+    model_out,
+    dgst_t: dict,
+) -> dict:
+    risk_keys = (
+        "dgst_t_relative_vll_gauss_risk_sqrt_hpre_per_layer",
+        "dgst_t_softmax_relative_vll_gauss_risk_sqrt_hpre_per_layer",
+        "dgst_t_legacy_prob_risk_sqrt_hpre_per_layer",
+    )
+    cosine_keys = (
+        "dgst_t_relative_vll_gauss_target_visual_hpre_cosine_per_layer",
+        "dgst_t_softmax_relative_vll_gauss_target_visual_hpre_cosine_per_layer",
+        "dgst_t_legacy_prob_target_visual_hpre_cosine_per_layer",
+    )
+    metadata_keys = (
+        "dgst_t_gate_comparison_methods",
+        "dgst_t_gate_comparison_cost",
+        "dgst_t_gate_comparison_target_cosine_state",
+        "dgst_t_gate_comparison_softmax_axis",
+        "dgst_t_gate_comparison_mad_axis",
+        "dgst_t_gate_comparison_mad_scale",
+        "dgst_t_gate_comparison_transport_top_k",
+        "dgst_t_gate_comparison_target_cosine_top_k",
+    )
+    required = (*risk_keys, *cosine_keys, *metadata_keys)
+    missing = [key for key in required if key not in dgst_t]
+    if missing:
+        raise KeyError(f"Missing gate-comparison DGST-T fields: {missing}")
+
+    feat = {
+        "image_id": int(image_id),
+        "token_str": span["word"],
+        "token_id": int(model_out.token_id),
+        "target_token_id": int(target_token_id),
+        "response_token_idx": int(response_index),
+        "label": int(span["label"]),
+        "dgst_t_relative_vll_logit_source": str(
+            dgst_t.get("dgst_t_relative_vll_logit_source", "h_mid")
+        ),
+        "dgst_t_source_distribution_mode": str(
+            dgst_t.get("dgst_t_source_distribution_mode", "softmax")
+        ),
+    }
+    for key in (*risk_keys, *cosine_keys):
+        value = dgst_t[key]
+        feat[key] = value.detach().cpu().tolist() if hasattr(value, "detach") else list(value)
+    for key in metadata_keys:
+        feat[key] = dgst_t[key]
+    return feat
+
+
+def _build_four_gate_feature_record(
+    *,
+    image_id: int,
+    span: dict,
+    response_index: int,
+    target_token_id: int,
+    model_out,
+    dgst_t: dict,
+) -> dict:
+    """Build the compact, explicitly named four-gate feature record."""
+    methods = tuple(dgst_t.get("dgst_t_four_gate_methods") or ())
+    if not methods:
+        raise KeyError("Missing dgst_t_four_gate_methods in four-gate result.")
+    required_metadata = (
+        "dgst_t_profile",
+        "dgst_t_mad_axis",
+        "dgst_t_mad_scale",
+        "dgst_t_softmax_axis",
+        "dgst_t_source_distribution_mode",
+        "dgst_t_transport_top_k",
+        "dgst_t_target_region_top_k",
+        "dgst_t_cost",
+        "dgst_t_ot_solver",
+    )
+    required_matrices = (
+        "dgst_t_attention_support_per_layer",
+        "dgst_t_source_dist_per_layer",
+    )
+    method_keys = []
+    for method in methods:
+        method_keys.extend(
+            [
+                f"dgst_t_{method}_gate_per_layer",
+                f"dgst_t_{method}_risk_sqrt_hpre_per_layer",
+                f"dgst_t_{method}_target_cosine_topk32_hpre_per_layer",
+                f"dgst_t_{method}_ev_topk32_hpre_per_layer",
+            ]
+        )
+    missing = [
+        key
+        for key in (*required_metadata, *required_matrices, *method_keys)
+        if key not in dgst_t
+    ]
+    if missing:
+        raise KeyError(f"Missing four-gate DGST fields: {missing}")
+
+    has_raw_attention = "raw_attention" in methods
+    feat = {
+        "feature_schema_version": (
+            "dgst-target-comparison-v2"
+            if has_raw_attention
+            else "dgst-four-gate-v1"
+        ),
+        "image_id": int(image_id),
+        "token_str": span["word"],
+        "token_id": int(model_out.token_id),
+        "target_token_id": int(target_token_id),
+        "response_token_idx": int(response_index),
+        "label": int(span["label"]),
+        "dgst_t_four_gate_methods": list(methods),
+    }
+    for key in required_metadata:
+        feat[key] = dgst_t[key]
+    if has_raw_attention:
+        feat["dgst_t_raw_attention_definition"] = dgst_t.get(
+            "dgst_t_raw_attention_definition",
+            "post_softmax_head_mean_visual_support_renormalized",
+        )
+    for key in required_matrices:
+        feat[key] = _compact_numpy(dgst_t[key], dtype=np.float16)
+    for method in methods:
+        gate_key = f"dgst_t_{method}_gate_per_layer"
+        feat[gate_key] = _compact_numpy(dgst_t[gate_key], dtype=np.float16)
+        for suffix in (
+            "risk_sqrt_hpre_per_layer",
+            "target_cosine_topk32_hpre_per_layer",
+            "ev_topk32_hpre_per_layer",
+        ):
+            key = f"dgst_t_{method}_{suffix}"
+            feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
+    return feat
+
+
+def _compact_numpy(value, *, dtype):
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=dtype)
+
+
 def _compute_dgst_t_result(model_out, cfg_dgst_t: dict) -> dict:
     dgst_t = model_out.dgst_t_result
     if dgst_t is not None:
@@ -517,6 +954,8 @@ def _extract_token_features_fallback(
     response_indices: List[int],
     target_token_ids: List[int],
     cfg_dgst_t: dict | None = None,
+    prompt: Optional[str] = None,
+    requirements: Optional[ExtractionRequirements] = None,
 ):
     outputs = []
     for span, first_idx, target_token_id in zip(spans, response_indices, target_token_ids):
@@ -528,6 +967,8 @@ def _extract_token_features_fallback(
                     response_token_idx=int(first_idx),
                     target_token_id=int(target_token_id),
                     cfg_dgst_t=cfg_dgst_t,
+                    prompt=prompt,
+                    requirements=requirements,
                 )
             )
         except Exception as exc:

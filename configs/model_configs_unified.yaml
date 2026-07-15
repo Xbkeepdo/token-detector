@@ -1,180 +1,18 @@
-# Unified token-detector config template.
+# Unified COCO hallucination-detection experiment settings.
 #
-# Purpose:
-#   Keep one runnable config with switch-style parameters and a visible record of
-#   the method variants tried in the split yaml files. Old config files are kept
-#   untouched; this file is meant to replace them gradually after inspection.
-#
-# Typical commands:
-#   OneVision VP + relative VLL + geo:
-#     MODEL=llava_onevision_1_5_8b \
-#     CONFIG=configs/model_configs_unified.yaml \
-#     OUTPUT=outputs/llava_onevision_1_5_8b/COCO500-vp-relativevll-cost-geo \
-#     bash run.sh
-#
-#   VV run with the same file:
-#     Change experiment.mode to "vv", then choose an OUTPUT name containing vv.
-#
-#   Override training feature sets without editing this file:
-#     FEATURE_SETS="risk_geo_raw visualcosine_raw risk_geo_raw+visualcosine_raw" bash run.sh
-#
-# Switch map:
-#   experiment.mode:
-#     vv: visual-only support for DGST-T source/target.
-#     vp: visual+prompt support for DGST-T source/target.
-#   experiment.dgst_t_support_scope:
-#     Optional manual override. Valid values are "visual" or "visual_prompt".
-#     Leave unset to let utils/config_utils.py infer it from experiment.mode.
-#   feature_extraction.dgst_t.dgst_t_dual_scope:
-#     false: only emit fields for the active support scope.
-#     true: when the active support scope is VP, also emit VV fields in the same
-#           features.pkl. run.sh still trains only feature_sets[mode] unless
-#           FEATURE_SETS is passed from the shell.
-#   feature_extraction.dgst_t.target_gate_mode:
-#     legacy_prob: original softmax probability target.
-#     relative_vll / relative: relative VLL target.
-#     dual: emit both legacy and relative fields.
-#   feature_extraction.dgst_t.relative_vll_logit_source:
-#     h_prev: block input before attention.
-#     h_mid: pre-FFN residual state, h_prev + attention output.
-#     final_norm_h_mid: h_mid after the decoder final norm, if the wrapper can capture it.
-#     Cosine features still compare h_out states, where h_out = h_mid + FFN output.
-#   feature_extraction.dgst_t.cost_mode:
-#     direct, decomposed.
-#   feature_extraction.dgst_t.relative_cost_mode / relative_cost_modes:
-#     geo,
-#     target_barrier_geo / tbar,
-#     symmetric_barrier_geo / sbar,
-#     target_additive_barrier_geo / tadd,
-#     source_additive_barrier_geo / sadd,
-#     two_end_additive_barrier_geo / tsadd,
-#     direct,
-#     decomposed,
-#     inherit / cost_mode.
-#   feature_extraction.dgst_t.relative_cost_state_modes:
-#     mid, out, avg, state_update.
-#   feature_extraction.dgst_t.relative_cost_update_lambdas:
-#     Any non-negative floats. Tried values: [0.05, 0.10, 0.20, 1.0].
-#   feature_extraction.dgst_t.source_distribution_mode:
-#     softmax, relu_norm.
-#   feature_extraction.dgst_t.source_modes:
-#     legacy_ffn, delta_src.
-#   feature_extraction.dgst_t.target_attention_gammas:
-#     Any non-negative floats. Tried values: [0.0, 0.5, 1.0].
-#   feature_extraction.dgst_t.dgst_t_prompt_support_mode:
-#     full: use the full prompt as prompt support.
-#     user_text: use only dgst_t_user_prompt_text, usually "Describe this image."
-#   feature_extraction.dgst_t.compute_ffn_injection_features:
-#     false: skip FFN diagnostic features.
-#     true: emit ffn_fad, ffn_eifdose, ffn_logitlift, ffn_gate, ffn_fgr,
-#           ffn_eiffrac_svd, ffn_eifdose_svd, ffn_eiffrac_pca, ffn_eifdose_pca.
-#   feature_extraction.dgst_t.compute_capped_topmass_085:
-#     false: raw-only runs.
-#     true: also emit cap085 fields.
-#
-# Feature-set aliases commonly used by scripts/train_feature_sets.py:
-#   VV raw:
-#     risk_geo_raw
-#     visualcosine_raw
-#     risk_geo_raw+visualcosine_raw
-#   VP raw:
-#     risk_visual_prompt_relative_vll_cost_geo
-#     target_visual_prompt_hidden_cosine_visual_prompt_relative_vll
-#     risk_visual_prompt_relative_vll_cost_geo+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll
-#   Relative-cost variants:
-#     risk_relative_vll_cost_geo
-#     risk_relative_vll_cost_tbar
-#     risk_relative_vll_cost_sbar
-#     risk_relative_vll_cost_tadd
-#     risk_relative_vll_cost_sadd
-#     risk_relative_vll_cost_tsadd
-#     risk_relative_vll_cost_qmatch
-#     risk_visual_prompt_relative_vll_cost_geo
-#     risk_visual_prompt_relative_vll_cost_tbar
-#     risk_visual_prompt_relative_vll_cost_sbar
-#     risk_visual_prompt_relative_vll_cost_tadd
-#     risk_visual_prompt_relative_vll_cost_sadd
-#     risk_visual_prompt_relative_vll_cost_tsadd
-#     risk_visual_prompt_relative_vll_cost_qmatch
-#   Relative-cost state variants:
-#     risk_relative_vll_cost_geo_mid
-#     risk_relative_vll_cost_geo_out
-#     risk_relative_vll_cost_geo_avg
-#     risk_relative_vll_cost_geo_stateupd_lu005
-#     risk_relative_vll_cost_geo_stateupd_lu01
-#     risk_relative_vll_cost_geo_stateupd_lu02
-#     risk_relative_vll_cost_geo_stateupd_lu1
-#     risk_visual_prompt_relative_vll_cost_geo_mid
-#     risk_visual_prompt_relative_vll_cost_geo_out
-#     risk_visual_prompt_relative_vll_cost_geo_avg
-#     risk_visual_prompt_relative_vll_cost_geo_stateupd_lu005
-#     risk_visual_prompt_relative_vll_cost_geo_stateupd_lu01
-#     risk_visual_prompt_relative_vll_cost_geo_stateupd_lu02
-#     risk_visual_prompt_relative_vll_cost_geo_stateupd_lu1
-#   Delta-source variants:
-#     rvll_delta_g0, rvll_delta_g05, rvll_delta_g1
-#     rvll_delta_g0_cos, rvll_delta_g05_cos, rvll_delta_g1_cos
-#     vp_rvll_delta_g0, vp_rvll_delta_g05, vp_rvll_delta_g1
-#     vp_rvll_delta_g0_cos, vp_rvll_delta_g05_cos, vp_rvll_delta_g1_cos
-#     Each also has *_cap085 and *_cos_cap085 if cap085 is enabled.
-#   FFN variants:
-#     ffn_fad
-#     ffn_fad_x_risk_geo_raw
-#     ffn_eifdose
-#     ffn_logitlift
-#     ffn_gate
-#     ffn_fgr
-#     ffn_eiffrac_svd
-#     ffn_eifdose_svd
-#     ffn_eifdose_svd_x_risk_geo_raw
-#     ffn_eiffrac_pca
-#     ffn_eifdose_pca
-#   Other baseline aliases:
-#     risk
-#     target_cosine
-#     risk+target_cosine
-#     prompt_confidence_top3
-#     prompt_confidence_max
-#     context_confidence
-#     context_confidence_max_prompt
-#     prompt_last_cosine
-#     prompt_mean_cosine
+# `run.sh` only selects model/output/devices and invokes the three stages.
+# Prompt, extraction families, DGST branches and training behavior live here.
+# The active DGST profile is visual-only and contains four Gaussian-MAD
+# branches plus one raw-attention control. Historical VP/legacy/topmass/FFN/
+# Sinkhorn experiments remain in their older config files and are intentionally
+# absent from this active YAML.
+
+run:
+  prompt: "Describe this image."
+  extraction_mode: "all"                   # all | method_only | ads_cgc_only | baseline_only
 
 experiment:
-  # Choose one: "vv" or "vp".
-  mode: "vp"
-
-  # Optional hard override. Usually leave commented and let mode decide.
-  # dgst_t_support_scope: "visual_prompt"
-
-  # run.sh picks feature_sets[experiment.mode]. Shell FEATURE_SETS overrides this.
-  feature_sets:
-    vv:
-      - "risk_geo_raw"
-      - "visualcosine_raw"
-      - "risk_geo_raw+visualcosine_raw"
-    vp:
-      - "risk_visual_prompt_relative_vll_cost_geo"
-      - "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll"
-      - "risk_visual_prompt_relative_vll_cost_geo+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll"
-    # Catalog of FFN visual-only combinations. Keep experiment.mode="vv" and
-    # pass FEATURE_SETS from the shell when training these, or explicitly set
-    # experiment.dgst_t_support_scope="visual" if you make a custom mode.
-    ffn_visual:
-      - "risk_geo_raw"
-      - "visualcosine_raw"
-      - "risk_geo_raw+visualcosine_raw"
-      - "ffn_fad"
-      - "ffn_eifdose"
-      - "ffn_logitlift"
-      - "ffn_gate"
-      - "ffn_fgr"
-      - "ffn_gate+risk_geo_raw+visualcosine_raw"
-      - "ffn_fad+risk_geo_raw+visualcosine_raw"
-    default:
-      - "risk"
-      - "target_cosine"
-      - "risk+target_cosine"
+  mode: "vv"                               # Fixed visual-only support for this profile.
 
 models:
   llava_1_5_7b:
@@ -261,6 +99,52 @@ models:
     prompt_template: null
 
 feature_extraction:
+  # Family switches define what is available; run.extraction_mode selects the
+  # active subset without adding method switches to run.sh.
+  method:
+    enabled: true
+  ads_cgc:
+    enabled: true
+  baseline:
+    enabled: true
+    output_subdir: "baseline"
+    methods: ["metatoken", "svar", "dhcp", "projectaway", "halloc"]
+    seed: 42
+    metatoken:
+      classifiers: ["lr", "gb"]             # LR(lbfgs), GB(100 estimators).
+      gb_n_estimators: 100
+    svar:
+      layer_start: 5                         # Inclusive; official LLaVA range is 5..18.
+      layer_end: 19                          # Exclusive.
+      hidden_dim: 248
+      learning_rate: 0.001
+      batch_size: 32
+      epochs: 50
+      early_stopping_patience: 5             # Validation loss only.
+    dhcp:
+      # Cross-backbone adaptation: dynamic visual grids are mass-preservingly
+      # resized to a fixed shape. The original LLaVA DHCP uses native P=576.
+      spatial_size: [12, 12]
+      hidden_dim: 128
+      learning_rate: 0.001
+      batch_size: 1024
+      epochs: 30
+      early_stopping_patience: 5
+      shard_dtype: "float16"
+    projectaway:
+      detection_only: true
+    halloc:
+      clip_model: "openai/clip-vit-base-patch32"          # Pretrained CLIP ViT-B/32.
+      visualbert_model: "uclanlp/visualbert-vqa-coco-pre" # Pretrained VisualBERT.
+      freeze_clip: true
+      learning_rate: 1.0e-6
+      weight_decay: 1.0e-2
+      betas: [0.9, 0.999]
+      batch_size: 16
+      epochs: 25
+      scheduler: "cosine"
+      early_stopping_patience: 3
+
   ads:
     top_patch_pct: 0.10
     connectivity: 8
@@ -273,73 +157,93 @@ feature_extraction:
     use_attn_weighting: false
 
   dgst_t:
-    # Core settings. Tried tau values: 0.05, 0.07, 0.10.
+    enabled: true
+    feature_output_profile: "four_gate_vv"   # Four Gaussian gates plus the raw-attention control.
+    target_gate_mode: "four_gate"
+    save_raw_capture: false                   # Only final matrices/curves are serialized.
+    # raw_logit is the target-word unembedding dot product; softmax_prob applies
+    # vocabulary softmax first.  Methods can also be removed from this list.
+    four_gate_methods:
+      - "hpre_raw_logit_gauss"
+      - "hpre_softmax_prob_gauss"
+      - "hmid_raw_logit_gauss"
+      - "hmid_softmax_prob_gauss"
+      # Control: use post-softmax visual support-attention directly as the
+      # target distribution; do not multiply it by a Gaussian gate.
+      - "raw_attention"
+    # Boolean form retained for convenient one-line switches.
+    branches:
+      hpre_raw_logit_gauss: true
+      hpre_softmax_prob_gauss: true
+      hmid_raw_logit_gauss: true
+      hmid_softmax_prob_gauss: true
+      raw_attention: true
+
+    # Shared transport math for all four gates and the raw-attention control.
     tau: 0.07
+    source_distribution_mode: "softmax"
+    support_scope: "visual"
     transport_top_k: 64
-    cost_mode: "decomposed"
-    lambda_d: 1.0
-    lambda_s: 1.0
-    lambda_t: 1.0
-    lambda_int: 1.0
-    baseline_layers: 10
-    risk_start_layer: 15
-    alpha: 2.0
+    cost_mode: "sqrt_hpre"
     ot_solver: "emd"
     atarget_visual_top_k: 32
-
-    # Raw vs cap085/topmass outputs.
-    compute_topmass_085: false
-    compute_capped_topmass_085: false
-    topmass_085_alpha: 0.85
-    capped_topmass_085_alpha: 0.85
-    capped_topmass_085_min_k: 32
-    capped_topmass_085_max_k: 64
-
-    # Target gate. Choose: legacy_prob, relative_vll dual.
-    target_gate_mode: "relative_vll"
     relative_vll_mad_epsilon: 1.0e-6
-    relative_vll_logit_source: "h_mid"
-
-    # Cost variants. Keep primary geo, semantic-match geo, and geo state-update
-    # lu=1.0 variants by default.
-    relative_cost_mode: "geo"
-    relative_cost_modes: ["geo", "semantic_match_geo"]
-    relative_cost_state_modes: ["state_update"]
-    relative_cost_update_lambdas: [1.0]
-    relative_barrier_lambda: 1.0
-    relative_barrier_margin: 0.5
-    relative_barrier_max: 3.0
-
-    # State/update variants are disabled by default. Uncomment for sweeps.
-    # relative_cost_state_modes: ["mid", "out", "avg", "state_update"]
-    # relative_cost_update_lambdas: [0.05, 0.10, 0.20, 1.0]
-
-    # Source distribution and delta-source variants.
-    source_distribution_mode: "softmax"
-    # source_modes: ["legacy_ffn", "delta_src"]
-    # target_attention_gammas: [0.0, 0.5, 1.0]
     target_attention_epsilon: 1.0e-12
+    matrix_dtype: "float16"                  # attention/source/gates [L,P].
+    curve_dtype: "float32"                   # risk/target-cosine/EV [L].
 
-    # Prompt-support variants.
-    dgst_t_prompt_support_mode: "full"
-    dgst_t_user_prompt_text: "Describe this image."
-
-    # FFN diagnostic variants.
-    compute_ffn_injection_features: false
-    ffn_injection_evidence_top_k: 32
-    ffn_injection_evidence_rank: 8
-    ffn_injection_eps: 1.0e-8
-
-    # Dual-scope extraction. See switch map above.
-    dgst_t_dual_scope: true
+    # Deprecated VP, legacy-probability, cost-sweep, topmass, FFN-diagnostic,
+    # and Sinkhorn switches intentionally do not appear in the active config.
 
 dataset:
   coco_root: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco"
   annotation_file: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco/annotations/instances_val2014.json"
   captions_file: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco/annotations/captions_val2014.json"
   num_images: 4000
-  train_ratio: 0.90
+  split_strategy: "strict_811"               # Mutually exclusive image-level split.
+  train_ratio: 0.80
+  val_ratio: 0.10
+  test_ratio: 0.10
   seed: 42
+  # Cross-model master split.  A different 4,000-image cohort is rejected.
+  shared_split_path: "outputs/shared/COCO4000_seed42_image_splits_811.json"
+
+# Root features.pkl probe settings. Names are aliases registered by the
+# feature-training implementation and are read directly by train_and_eval.py.
+training:
+  trainer: "torch_mlp"                     # torch_mlp | sklearn
+  positive_class: "hallucination"          # hallucination | real
+  torch_probe:
+    batch_size: 256
+    num_epochs: 100
+    early_stopping_patience: 10
+    seed: 42
+  feature_sets:
+    method:
+      - "hpre_raw_logit_gauss_risk"
+      - "hpre_raw_logit_gauss_target_cosine"
+      - "hpre_raw_logit_gauss_ev"
+      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_target_cosine+hpre_raw_logit_gauss_ev"
+      - "hpre_softmax_prob_gauss_risk"
+      - "hpre_softmax_prob_gauss_target_cosine"
+      - "hpre_softmax_prob_gauss_ev"
+      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_target_cosine+hpre_softmax_prob_gauss_ev"
+      - "hmid_raw_logit_gauss_risk"
+      - "hmid_raw_logit_gauss_target_cosine"
+      - "hmid_raw_logit_gauss_ev"
+      - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_target_cosine+hmid_raw_logit_gauss_ev"
+      - "hmid_softmax_prob_gauss_risk"
+      - "hmid_softmax_prob_gauss_target_cosine"
+      - "hmid_softmax_prob_gauss_ev"
+      - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_target_cosine+hmid_softmax_prob_gauss_ev"
+      - "raw_attention_risk"
+      - "raw_attention_target_cosine"
+      - "raw_attention_ev"
+      - "raw_attention_risk+raw_attention_target_cosine+raw_attention_ev"
+    ads_cgc:
+      - "ads"
+      - "cgc"
+      - "ads+cgc"
 
 classifiers:
   xgb:

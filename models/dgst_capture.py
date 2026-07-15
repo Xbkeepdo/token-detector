@@ -122,6 +122,7 @@ def run_forward_with_dgst_captures(
     model: Any,
     *,
     output_hidden_states: bool = True,
+    retain_attention_updates: bool = True,
     **forward_kwargs,
 ):
     """Run a forward pass while capturing decoder attention and FFN updates."""
@@ -187,8 +188,115 @@ def run_forward_with_dgst_captures(
             if capture[key].device != target_device:
                 capture[key] = capture[key].to(target_device)
         capture["h_mid"] = capture["h_prev"] + capture["o_attn"]
+        if not retain_attention_updates:
+            # The active four-gate profile consumes h_mid but never o_attn
+            # separately. Releasing this full [B,S,D] tensor for every layer
+            # before vocabulary projection provides crucial headroom on 32-GiB
+            # GPUs while legacy diagnostic paths keep the old field by default.
+            capture["o_attn"] = None
 
     return outputs, captures
+
+
+def run_forward_with_layer_hidden_captures(
+    model: Any,
+    *,
+    output_attentions: bool = False,
+    capture_all_layers: bool = True,
+    **forward_kwargs,
+):
+    """Run a forward while retaining raw decoder-layer outputs only.
+
+    Hugging Face ``hidden_states[-1]`` is final-normalized for the supported
+    decoder models, whereas DGST hooks expose the raw last residual state.  A
+    lightweight layer-output hook keeps ADS/CGC and ProjectAway identical in
+    DGST ``all`` and standalone extraction without installing the much larger
+    DGST attention/MLP capture set.
+    """
+    layers = resolve_decoder_layers(model)
+    selected = range(len(layers)) if capture_all_layers else (len(layers) - 1,)
+    captured: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def layer_hook(index: int):
+        def hook(_module, _args, output):
+            value = output[0] if isinstance(output, tuple) else output
+            captured[index] = value.detach()
+
+        return hook
+
+    for index in selected:
+        handles.append(layers[index].register_forward_hook(layer_hook(index)))
+    try:
+        with torch.no_grad():
+            outputs = model(
+                **forward_kwargs,
+                output_attentions=bool(output_attentions),
+                output_hidden_states=False,
+                return_dict=True,
+                use_cache=False,
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    missing = [index for index in selected if index not in captured]
+    if missing:
+        raise RuntimeError(f"Decoder output hooks missed layers: {missing}")
+    return outputs, [captured[index] for index in selected]
+
+
+def hidden_states_from_layer_outputs(
+    layer_outputs: Sequence[torch.Tensor],
+    *,
+    token_position: int,
+    visual_start: int,
+    visual_end: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract raw per-layer token and visual residual states."""
+    if not layer_outputs:
+        raise ValueError("No decoder layer outputs were captured.")
+    token_states = torch.stack(
+        [state[0, int(token_position), :] for state in layer_outputs], dim=0
+    )
+    patch_states = torch.stack(
+        [
+            state[0, int(visual_start) : int(visual_end), :]
+            for state in layer_outputs
+        ],
+        dim=0,
+    )
+    return token_states, patch_states
+
+
+def final_normalized_hidden_slice(
+    *,
+    model: Any,
+    out: Any,
+    start: int,
+    end: int,
+    dgst_captures: Sequence[dict[str, Any]] | None = None,
+    layer_outputs: Sequence[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Return the final-norm decoder state for one response slice.
+
+    This normalizes hook-derived raw residual states exactly once and uses the
+    model-provided final-normalized state when it is already available.
+    """
+    hidden_states = getattr(out, "hidden_states", None)
+    if hidden_states is not None:
+        return hidden_states[-1][0, int(start) : int(end), :]
+    if dgst_captures is not None:
+        last = dgst_captures[-1]
+        if last.get("h_mid") is None or last.get("o_ffn") is None:
+            raise RuntimeError("Last DGST capture was released before hidden slicing.")
+        raw = last["h_mid"] + last["o_ffn"]
+    elif layer_outputs:
+        raw = layer_outputs[-1]
+    else:
+        raise RuntimeError("Response hidden states were requested but not captured.")
+    normed = apply_decoder_final_norm(resolve_decoder_final_norm(model), raw)
+    return normed[0, int(start) : int(end), :]
 
 
 def build_dgst_t_raw(
@@ -510,6 +618,7 @@ def resolve_support_positions(
     return sorted(dict.fromkeys(visual_positions + [int(pos) for pos in prompt_positions]))
 
 
+@torch.no_grad()
 def target_probabilities(
     *,
     output_layer: Any,
@@ -526,6 +635,7 @@ def target_probabilities(
     ).squeeze(-1)
 
 
+@torch.no_grad()
 def target_probabilities_multi(
     *,
     output_layer: Any,
@@ -570,9 +680,146 @@ def target_probabilities_multi(
         for valid_offset, (column, _token_id) in enumerate(valid_columns):
             chunk_probs[:, column] = valid_probs[:, valid_offset]
         probs.append(chunk_probs)
-    return torch.cat(probs, dim=0).reshape(*states.shape[:-1], len(token_ids)).float()
+    return (
+        torch.cat(probs, dim=0)
+        .reshape(*states.shape[:-1], len(token_ids))
+        .float()
+        .detach()
+    )
 
 
+@torch.no_grad()
+def target_logits_and_probabilities_multi(
+    *,
+    output_layer: Any,
+    states: torch.Tensor,
+    target_token_ids: Sequence[int],
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return target raw logits and vocabulary-softmax probabilities together.
+
+    Each state chunk is projected through the full output vocabulary exactly
+    once.  The target column supplies the raw logit while the same matrix's
+    log-sum-exp supplies the softmax denominator.  Only the two compact
+    ``[..., num_targets]`` tensors are retained; the full-vocabulary matrix is
+    released at the end of every chunk.
+
+    Raw logits follow the project's target-unembedding convention and exclude
+    an optional LM-head bias.  Softmax probabilities include the model-defined
+    bias, matching a normal vocabulary softmax.  Decoder-only LVLM heads used
+    in this project are normally bias-free, but keeping the distinction makes
+    the behavior explicit.
+    """
+    weight = output_layer.weight
+    bias = getattr(output_layer, "bias", None)
+    token_ids = [int(token_id) for token_id in target_token_ids]
+    output_shape = (*states.shape[:-1], len(token_ids))
+    if not token_ids:
+        empty = torch.empty(output_shape, dtype=torch.float32, device=states.device)
+        return empty, empty.clone()
+
+    valid_columns = [
+        (column, token_id)
+        for column, token_id in enumerate(token_ids)
+        if 0 <= token_id < int(weight.shape[0])
+    ]
+    if not valid_columns:
+        zeros = torch.zeros(output_shape, dtype=torch.float32, device=states.device)
+        return zeros, zeros.clone()
+
+    valid_token_index = torch.tensor(
+        [token_id for _column, token_id in valid_columns],
+        dtype=torch.long,
+        device=weight.device,
+    )
+    flat_states = states.reshape(-1, states.shape[-1])
+    raw_chunks: list[torch.Tensor] = []
+    prob_chunks: list[torch.Tensor] = []
+    step = max(1, int(chunk_size))
+    start = 0
+    while start < int(flat_states.shape[0]):
+        current_step = min(step, int(flat_states.shape[0]) - start)
+        chunk = flat_states[start : start + current_step].to(
+            device=weight.device,
+            dtype=weight.dtype,
+        )
+        vocab_logits = None
+        selected_with_bias = None
+        selected_raw = None
+        selected_prob = None
+        log_denominator = None
+        try:
+            vocab_logits = F.linear(
+                chunk,
+                weight,
+                bias.to(device=weight.device, dtype=weight.dtype)
+                if bias is not None
+                else None,
+            ).float()
+            selected_with_bias = vocab_logits.index_select(1, valid_token_index)
+            if bias is None:
+                selected_raw = selected_with_bias
+            else:
+                selected_raw = selected_with_bias - bias.index_select(
+                    0, valid_token_index
+                ).float().unsqueeze(0)
+            log_denominator = torch.logsumexp(
+                vocab_logits,
+                dim=-1,
+                keepdim=True,
+            )
+            selected_prob = torch.exp(
+                (selected_with_bias - log_denominator).clamp(max=0.0)
+            )
+        except torch.OutOfMemoryError:
+            # Large-vocabulary OneVision checkpoints can leave less than one
+            # 64-row projection available on 32 GiB cards.  Retry the same
+            # rows with a smaller transient matrix; compact results already
+            # produced for prior rows remain valid.
+            del (
+                chunk,
+                vocab_logits,
+                selected_with_bias,
+                selected_raw,
+                selected_prob,
+                log_denominator,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if current_step <= 1:
+                raise
+            step = max(1, current_step // 2)
+            continue
+
+        raw = torch.zeros(
+            int(chunk.shape[0]),
+            len(token_ids),
+            dtype=torch.float32,
+            device=states.device,
+        )
+        probs = torch.zeros_like(raw)
+        selected_raw = selected_raw.to(states.device)
+        selected_prob = selected_prob.to(states.device)
+        for valid_offset, (column, _token_id) in enumerate(valid_columns):
+            raw[:, column] = selected_raw[:, valid_offset]
+            probs[:, column] = selected_prob[:, valid_offset]
+        raw_chunks.append(raw)
+        prob_chunks.append(probs)
+        del (
+            vocab_logits,
+            selected_with_bias,
+            selected_raw,
+            selected_prob,
+            log_denominator,
+        )
+        start += current_step
+
+    raw_result = torch.cat(raw_chunks, dim=0).reshape(output_shape).float().detach()
+    prob_result = torch.cat(prob_chunks, dim=0).reshape(output_shape).float().detach()
+    return raw_result, prob_result
+
+
+@torch.no_grad()
 def target_logits_multi(
     *,
     output_layer: Any,
@@ -614,7 +861,12 @@ def target_logits_multi(
         for valid_offset, (column, _token_id) in enumerate(valid_columns):
             chunk_logits[:, column] = valid_logits[:, valid_offset]
         logits.append(chunk_logits)
-    return torch.cat(logits, dim=0).reshape(*states.shape[:-1], len(token_ids)).float()
+    return (
+        torch.cat(logits, dim=0)
+        .reshape(*states.shape[:-1], len(token_ids))
+        .float()
+        .detach()
+    )
 
 
 def merged_position_for_tokenized_position(
@@ -676,8 +928,15 @@ def hidden_states_from_captures(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token_states = []
     patch_states = []
-    for capture in captures:
-        layer_hidden = capture["h_mid"] + capture["o_ffn"]
+    for index, capture in enumerate(captures):
+        if index + 1 < len(captures):
+            # The next block's input is the exact post-layer state.  This also
+            # includes architecture-level processing performed after a decoder
+            # block returns (notably Qwen3-VL DeepStack injection in layers
+            # 0..2), which h_mid + o_ffn alone cannot reconstruct.
+            layer_hidden = captures[index + 1]["h_prev"]
+        else:
+            layer_hidden = capture["h_mid"] + capture["o_ffn"]
         token_states.append(layer_hidden[0, int(token_position), :])
         patch_states.append(layer_hidden[0, int(visual_start) : int(visual_end), :])
     return torch.stack(token_states, dim=0), torch.stack(patch_states, dim=0)

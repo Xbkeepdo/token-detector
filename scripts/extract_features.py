@@ -2,14 +2,25 @@
 """Extract DGST-T features for all labeled object tokens."""
 
 import argparse
+import copy
 import os
 import sys
+from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from multiprocessing import get_context
 
 from data.coco_loader import load_coco_samples
 from utils.io_utils import load_json, load_pkl, save_pkl
+
+
+FOUR_GATE_METHODS = (
+    "hpre_raw_logit_gauss",
+    "hpre_softmax_prob_gauss",
+    "hmid_raw_logit_gauss",
+    "hmid_softmax_prob_gauss",
+    "raw_attention",
+)
 
 
 def parse_args():
@@ -23,6 +34,33 @@ def parse_args():
     p.add_argument("--resume",     action="store_true")
     p.add_argument("--num-images", type=int, default=None)
     p.add_argument("--seed",       type=int, default=None)
+    p.add_argument(
+        "--prompt",
+        default=None,
+        help="Caption instruction. Overrides the model prompt when provided.",
+    )
+    p.add_argument(
+        "--max-pixels",
+        type=int,
+        default=None,
+        help="Optional per-image processor pixel cap; unset keeps native preprocessing.",
+    )
+    p.add_argument(
+        "--extraction-mode",
+        choices=("all", "method_only", "ads_cgc_only", "baseline_only"),
+        default=None,
+        help=(
+            "Override run.extraction_mode from YAML. baseline_only delegates to "
+            "scripts/extract_baselines.py so root features.pkl is untouched."
+        ),
+    )
+    p.add_argument(
+        "--dgst-branches",
+        nargs="+",
+        choices=FOUR_GATE_METHODS,
+        default=None,
+        help="Extract only the selected DGST target-comparison branches.",
+    )
     return p.parse_args()
 
 
@@ -31,13 +69,65 @@ def main():
     from features.extractor import extract_features_for_dataset
     from models import build_model
     from utils.config_utils import (
-        load_config, get_model_cfg, get_dataset_cfg, get_dgst_t_cfg
+        extraction_mode_flags,
+        get_dataset_cfg,
+        get_dgst_t_cfg,
+        get_model_cfg,
+        load_config,
     )
 
     config = load_config(args.config)
+    extraction_mode = _resolve_extraction_mode(config, args.extraction_mode)
+    if extraction_mode == "baseline_only":
+        baseline_config = (config.get("feature_extraction") or {}).get(
+            "baseline", {}
+        )
+        if isinstance(baseline_config, dict) and not bool(
+            baseline_config.get("enabled", True)
+        ):
+            raise ValueError(
+                "run.extraction_mode=baseline_only but baseline.enabled=false"
+            )
+        _run_baseline_only(args)
+        return
+
     model_cfg   = get_model_cfg(config, args.model)
+    if args.max_pixels is not None:
+        if args.max_pixels <= 0:
+            raise ValueError("--max-pixels must be a positive integer")
+        model_cfg["max_pixels"] = int(args.max_pixels)
     dataset_cfg = get_dataset_cfg(config)
-    dgst_t_cfg  = get_dgst_t_cfg(config)
+    feature_cfg = copy.deepcopy(config.get("feature_extraction") or {})
+    if extraction_mode is not None:
+        flags = extraction_mode_flags(extraction_mode)
+        for family in ("method", "ads_cgc", "baseline"):
+            section = feature_cfg.get(family)
+            if isinstance(section, dict):
+                configured = bool(section.get("enabled", True))
+            else:
+                configured = True if section is None else bool(section)
+                section = {}
+                feature_cfg[family] = section
+            section["enabled"] = bool(flags[family] and configured)
+    # Workers receive this local resolved copy; the source YAML is never
+    # rewritten and old commands without --extraction-mode retain its switches.
+    config["feature_extraction"] = feature_cfg
+    dgst_t_cfg = copy.deepcopy(get_dgst_t_cfg(config))
+    if args.dgst_branches is not None:
+        selected_branches = list(dict.fromkeys(args.dgst_branches))
+        selected_set = set(selected_branches)
+        dgst_t_cfg["four_gate_methods"] = selected_branches
+        dgst_t_cfg["branches"] = {
+            method: method in selected_set for method in FOUR_GATE_METHODS
+        }
+    baseline_section = dict(feature_cfg.get("baseline") or {})
+    baseline_enabled = bool(baseline_section.get("enabled", False))
+    baseline_subdir = str(baseline_section.get("output_subdir", "baseline"))
+    prompt = str(
+        args.prompt
+        or model_cfg.get("prompt")
+        or "Describe this image."
+    )
 
     images_dir = os.path.join(dataset_cfg["coco_root"], "val2014")
     label_path = os.path.join(args.output_dir, "labeling.json")
@@ -76,6 +166,11 @@ def main():
             samples=samples,
             labeling_results=labeling_results,
             cfg_dgst_t=dgst_t_cfg,
+            cfg_feature_extraction=feature_cfg,
+            prompt=prompt,
+            full_config=config,
+            baseline_enabled=baseline_enabled,
+            baseline_subdir=baseline_subdir,
             output_dir=args.output_dir,
             output_path=output_path,
             devices=devices,
@@ -84,15 +179,84 @@ def main():
     else:
         print(f"[Extract] Loading model '{args.model}' on {devices[0]} …")
         wrapper = build_model(args.model, model_cfg, device=devices[0])
-        extract_features_for_dataset(
-            model_wrapper=wrapper,
-            coco_samples=samples,
-            labeling_results=labeling_results,
-            cfg_dgst_t=dgst_t_cfg,
-            output_path=output_path,
-            resume=args.resume,
-        )
+        if baseline_enabled:
+            from features.baseline import BaselineRuntime, baseline_config
+
+            baseline_dir = os.path.join(args.output_dir, baseline_subdir)
+            baseline_output_path = os.path.join(baseline_dir, "features.pkl")
+            with BaselineRuntime(
+                wrapper=wrapper,
+                methods=baseline_section.get("methods", "all"),
+                baseline_dir=baseline_dir,
+                config=baseline_config(config),
+                device=devices[0],
+                resume=args.resume,
+            ) as baseline_runtime:
+                extract_features_for_dataset(
+                    model_wrapper=wrapper,
+                    coco_samples=samples,
+                    labeling_results=labeling_results,
+                    cfg_dgst_t=dgst_t_cfg,
+                    output_path=output_path,
+                    resume=args.resume,
+                    prompt=prompt,
+                    cfg_feature_extraction=feature_cfg,
+                    baseline_runtime=baseline_runtime,
+                    baseline_output_path=baseline_output_path,
+                )
+        else:
+            extract_features_for_dataset(
+                model_wrapper=wrapper,
+                coco_samples=samples,
+                labeling_results=labeling_results,
+                cfg_dgst_t=dgst_t_cfg,
+                output_path=output_path,
+                resume=args.resume,
+                prompt=prompt,
+                cfg_feature_extraction=feature_cfg,
+            )
     print(f"[Extract] Features saved to {output_path}")
+
+
+def _resolve_extraction_mode(
+    config: dict,
+    cli_value: Optional[str],
+) -> Optional[str]:
+    if cli_value is not None:
+        return str(cli_value).strip().lower()
+    configured = (config.get("run") or {}).get("extraction_mode")
+    if configured in (None, ""):
+        return None
+    return str(configured).strip().lower()
+
+
+def _run_baseline_only(args) -> None:
+    """Keep the three-stage shell while preserving baseline output isolation."""
+    import subprocess
+
+    command = [
+        sys.executable,
+        os.path.join(os.path.dirname(__file__), "extract_baselines.py"),
+        "--model",
+        args.model,
+        "--config",
+        args.config,
+        "--output-dir",
+        args.output_dir,
+        "--device",
+        args.device,
+    ]
+    if args.feature_devices:
+        command.extend(["--feature-devices", *args.feature_devices])
+    if args.prompt is not None:
+        command.extend(["--prompt", args.prompt])
+    if args.max_pixels is not None:
+        command.extend(["--max-pixels", str(args.max_pixels)])
+    if args.num_images is not None:
+        command.extend(["--num-images", str(args.num_images)])
+    if args.resume:
+        command.append("--resume")
+    subprocess.run(command, check=True)
 
 
 def _parallel_extract(
@@ -102,6 +266,11 @@ def _parallel_extract(
     samples: list[dict],
     labeling_results: dict[int, dict],
     cfg_dgst_t: dict,
+    cfg_feature_extraction: dict,
+    prompt: str,
+    full_config: dict,
+    baseline_enabled: bool,
+    baseline_subdir: str,
     output_dir: str,
     output_path: str,
     devices: list[str],
@@ -111,7 +280,21 @@ def _parallel_extract(
         os.path.join(output_dir, f"features.part{worker_id}.pkl")
         for worker_id in range(len(devices))
     ]
-    done_image_ids = _done_image_ids(output_path, part_paths) if resume else set()
+    baseline_dir = os.path.join(output_dir, baseline_subdir)
+    baseline_output_path = os.path.join(baseline_dir, "features.pkl")
+    baseline_part_paths = [
+        os.path.join(baseline_dir, f"features.part{worker_id}.pkl")
+        for worker_id in range(len(devices))
+    ]
+    root_done = _done_image_ids(output_path, part_paths) if resume else set()
+    if baseline_enabled and resume:
+        baseline_done = _done_image_ids(
+            baseline_output_path,
+            baseline_part_paths,
+        )
+        done_image_ids = root_done & baseline_done
+    else:
+        done_image_ids = root_done
     pending_samples = [
         sample for sample in samples
         if int(sample["image_id"]) not in done_image_ids
@@ -124,7 +307,9 @@ def _parallel_extract(
     ctx = get_context("spawn")
     jobs = []
     with ctx.Pool(processes=len(devices)) as pool:
-        for worker_id, (device, chunk, part_path) in enumerate(zip(devices, chunks, part_paths)):
+        for worker_id, (device, chunk, part_path, baseline_part_path) in enumerate(
+            zip(devices, chunks, part_paths, baseline_part_paths)
+        ):
             if chunk:
                 jobs.append(
                     pool.apply_async(
@@ -137,6 +322,13 @@ def _parallel_extract(
                             chunk,
                             labeling_results,
                             cfg_dgst_t,
+                            cfg_feature_extraction,
+                            prompt,
+                            full_config,
+                            baseline_enabled,
+                            baseline_dir,
+                            baseline_part_path,
+                            len(devices) > 1,
                             part_path,
                             resume,
                         ),
@@ -153,6 +345,12 @@ def _parallel_extract(
         part_paths=part_paths,
         resume=resume,
     )
+    if baseline_enabled:
+        _merge_feature_parts(
+            output_path=baseline_output_path,
+            part_paths=baseline_part_paths,
+            resume=resume,
+        )
 
 
 def _extract_worker(
@@ -163,6 +361,13 @@ def _extract_worker(
     samples: list[dict],
     labeling_results: dict[int, dict],
     cfg_dgst_t: dict,
+    cfg_feature_extraction: dict,
+    prompt: str,
+    full_config: dict,
+    baseline_enabled: bool,
+    baseline_dir: str,
+    baseline_part_path: str,
+    parallel: bool,
     part_path: str,
     resume: bool,
 ) -> str:
@@ -174,14 +379,43 @@ def _extract_worker(
         f"for {len(samples)} images."
     )
     wrapper = build_model(model_key, model_cfg, device=device)
-    extract_features_for_dataset(
-        model_wrapper=wrapper,
-        coco_samples=samples,
-        labeling_results=labeling_results,
-        cfg_dgst_t=cfg_dgst_t,
-        output_path=part_path,
-        resume=resume,
-    )
+    if baseline_enabled:
+        from features.baseline import BaselineRuntime, baseline_config
+
+        baseline_section = dict(cfg_feature_extraction.get("baseline") or {})
+        with BaselineRuntime(
+            wrapper=wrapper,
+            methods=baseline_section.get("methods", "all"),
+            baseline_dir=baseline_dir,
+            config=baseline_config(full_config),
+            device=device,
+            worker_id=worker_id,
+            parallel=parallel,
+            resume=resume,
+        ) as baseline_runtime:
+            extract_features_for_dataset(
+                model_wrapper=wrapper,
+                coco_samples=samples,
+                labeling_results=labeling_results,
+                cfg_dgst_t=cfg_dgst_t,
+                output_path=part_path,
+                resume=resume,
+                prompt=prompt,
+                cfg_feature_extraction=cfg_feature_extraction,
+                baseline_runtime=baseline_runtime,
+                baseline_output_path=baseline_part_path,
+            )
+    else:
+        extract_features_for_dataset(
+            model_wrapper=wrapper,
+            coco_samples=samples,
+            labeling_results=labeling_results,
+            cfg_dgst_t=cfg_dgst_t,
+            output_path=part_path,
+            resume=resume,
+            prompt=prompt,
+            cfg_feature_extraction=cfg_feature_extraction,
+        )
     return part_path
 
 

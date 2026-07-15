@@ -1,171 +1,214 @@
 #!/usr/bin/env python3
-"""Train classifiers on extracted features and evaluate on the test set."""
+"""Train every feature family selected by the unified YAML configuration."""
+
+from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
+import shlex
+import subprocess
 import sys
+from typing import Mapping, Sequence
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from detection.train import train_and_evaluate
-from detection.evaluate import (
-    evaluate_ads_threshold,
-    evaluate_cgc_threshold,
-    layerwise_analysis,
-    compute_shap_importance,
-)
-from utils.config_utils import load_config, get_classifier_cfgs
-from utils.io_utils import load_pkl, load_json, save_json
+from scripts.run_pipeline import _enabled_method_feature_sets
+from utils.config_utils import extraction_mode_flags, load_config
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model",      required=True)
-    p.add_argument("--config",     default="configs/model_configs.yaml")
-    p.add_argument("--output-dir", required=True)
-    p.add_argument("--shap",       action="store_true",
-                   help="Compute SHAP feature importance (slow)")
-    return p.parse_args()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--config", default="configs/model_configs_unified.yaml")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the configured training commands without running them.",
+    )
+    return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
-
     config = load_config(args.config)
-    clf_cfgs = get_classifier_cfgs(config)
-
-    feat_path   = os.path.join(args.output_dir, "features.pkl")
-    splits_path = os.path.join(args.output_dir, "image_splits.json")
-    results_dir = os.path.join(args.output_dir, "results")
-    os.makedirs(results_dir, exist_ok=True)
-
-    for p in [feat_path, splits_path]:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Required file not found: {p}")
-
-    splits = load_json(splits_path)
-    train_ids = set(splits["train"])
-    val_ids   = set(splits["val"])
-    test_ids  = set(splits["test"])
-
-    all_feats = load_pkl(feat_path)
-
-    test_feats = [f for f in all_feats if f["image_id"] in test_ids]
-    val_feats  = [f for f in all_feats if f["image_id"] in val_ids]
-
-    print("\n" + "=" * 60)
-    print("  DGST-T threshold evaluator (test set)")
-    print("=" * 60)
-
-    print("\nDGST-T score detector:")
-    dgst_t_metrics = evaluate_ads_threshold(test_feats)
-    _print_metrics(dgst_t_metrics)
-
-    save_json(
-        {"dgst_t": dgst_t_metrics},
-        os.path.join(results_dir, f"{args.model}_single_metric.json"),
+    commands = build_training_commands(
+        config=config,
+        model=args.model,
+        config_path=args.config,
+        output_dir=args.output_dir,
+        device=args.device,
     )
+    if not commands:
+        raise ValueError("YAML configuration enables no trainable feature family")
+    for command in commands:
+        print("[Train] $ " + shlex.join(command))
+        if not args.dry_run:
+            subprocess.run(command, check=True, cwd=str(Path(__file__).resolve().parents[1]))
+    print("[Train] Completed configured training and evaluation.")
 
-    print("\n" + "=" * 60)
-    print("  Layer-wise analysis — DGST-T transport risk")
-    print("=" * 60)
-    lw_dgst_t = layerwise_analysis(all_feats, feature_key="dgst_t_per_layer")
-    save_json(lw_dgst_t, os.path.join(results_dir, "layerwise_dgst_t.json"))
 
-    print("\n" + "=" * 60)
-    print("  Layer-wise analysis — DGST-T context confidence")
-    print("=" * 60)
-    lw_ctx = layerwise_analysis(all_feats, feature_key="dgst_t_context_confidence_per_layer")
-    save_json(lw_ctx, os.path.join(results_dir, "layerwise_dgst_t_context_confidence.json"))
+def build_training_commands(
+    *,
+    config: dict,
+    model: str,
+    config_path: str,
+    output_dir: str,
+    device: str,
+) -> list[list[str]]:
+    flags = _configured_family_flags(config)
+    training = config.get("training") or {}
+    if not isinstance(training, Mapping):
+        raise ValueError("training must be a YAML mapping")
 
-    print("\n" + "=" * 60)
-    print("  Training classifiers (XGB / RF / MLP)")
-    print("=" * 60)
-    all_results = train_and_evaluate(
-        feature_path=feat_path,
-        train_image_ids=train_ids,
-        val_image_ids=val_ids,
-        test_image_ids=test_ids,
-        clf_configs=clf_cfgs,
-        output_dir=results_dir,
-        model_key=args.model,
-    )
-
-    print("\n" + "=" * 60)
-    print("  Feature-type ablation")
-    print("=" * 60)
-
-    try:
-        from analysis.ablation import run_feature_ablation, print_feature_ablation_table
-    except ImportError as e:
-        print(f"  [WARN] Feature ablation unavailable: {e}")
-    else:
-        val_feats  = [f for f in all_feats if f["image_id"] in val_ids]
-        ablation_results = run_feature_ablation(
-            train_feats=[f for f in all_feats if f["image_id"] in train_ids],
-            val_features=val_feats if val_feats else [f for f in all_feats if f["image_id"] in train_ids],
-            test_features=test_feats,
-        )
-        ablation_txt = print_feature_ablation_table(ablation_results)
-
-        with open(os.path.join(results_dir, f"{args.model}_feature_ablation.txt"), "w") as fh:
-            fh.write(ablation_txt + "\n")
-        save_json(
-            {k: {kk: round(vv, 4) for kk, vv in v.items()} for k, v in ablation_results.items()},
-            os.path.join(results_dir, f"{args.model}_feature_ablation.json"),
-        )
-
-    if args.shap:
-        import pickle
-        xgb_path = os.path.join(results_dir, f"{args.model}_xgb.pkl")
-        if os.path.exists(xgb_path):
-            with open(xgb_path, "rb") as f:
-                xgb_clf = pickle.load(f)
-
-            sample_feat = next(
-                (x for x in all_feats if x.get("label") in (0, 1)), None
+    commands: list[list[str]] = []
+    if flags["method"] or flags["ads_cgc"]:
+        feature_sets = _configured_feature_sets(config, flags)
+        trainer = str(
+            training.get(
+                "trainer",
+                (config.get("run") or {}).get("trainer", "torch_mlp"),
             )
-            if sample_feat:
-                num_layers = len(sample_feat["dgst_t_per_layer"])
-                print(f"\n[SHAP] Computing importance for {args.model} (XGB) …")
-                shap_vals = compute_shap_importance(
-                    xgb_clf, test_feats, num_layers=num_layers
+        ).strip().lower()
+        common = [
+            "--model",
+            str(model),
+            "--config",
+            str(config_path),
+            "--output-dir",
+            str(output_dir),
+            "--feature-sets",
+            *feature_sets,
+        ]
+        if trainer in {"torch_mlp", "torch_probe"}:
+            positive_class = str(
+                training.get(
+                    "positive_class",
+                    (config.get("run") or {}).get("positive_class", "real"),
                 )
-                if shap_vals:
-                    save_json(
-                        {k: v.tolist() for k, v in shap_vals.items()},
-                        os.path.join(results_dir, f"{args.model}_shap.json"),
-                    )
-                    print("[SHAP] Saved.")
+            )
+            command = [
+                sys.executable,
+                "scripts/train_torch_probe_feature_sets.py",
+                *common,
+                "--device",
+                str(device),
+                "--positive-class",
+                positive_class,
+            ]
+            command.extend(_torch_probe_cli_args(training.get("torch_probe") or {}))
+            commands.append(command)
+        elif trainer in {"sklearn", "xgb_rf"}:
+            commands.append(
+                [sys.executable, "scripts/train_feature_sets.py", *common]
+            )
+        else:
+            raise ValueError(
+                "training.trainer must be torch_mlp, torch_probe, sklearn, or xgb_rf"
+            )
 
-    print("\n" + "=" * 60)
-    print("  Baseline comparison")
-    print("=" * 60)
-    import subprocess
-    baseline_cmd = [
-        sys.executable, "scripts/eval_baselines.py",
-        "--features",   feat_path,
-        "--splits",     splits_path,
-        "--output-dir", results_dir,
-        "--model-name", args.model,
-    ]
-    try:
-        subprocess.run(baseline_cmd, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"  [WARN] Baselines failed: {e}")
-        print("  (This is expected if features.pkl lacks token_logits — "
-              "re-run step2 to populate them.)")
-
-    print(f"\n[Train] All done. Results in {results_dir}")
+    if flags["baseline"]:
+        commands.append(
+            [
+                sys.executable,
+                "scripts/train_baselines.py",
+                "--model",
+                str(model),
+                "--config",
+                str(config_path),
+                "--output-dir",
+                str(output_dir),
+                "--device",
+                str(device),
+            ]
+        )
+    return commands
 
 
-def _print_metrics(m: dict) -> None:
-    print(
-        f"  PR={m.get('precision', 0):.3f}  "
-        f"RC={m.get('recall', 0):.3f}  "
-        f"F1={m.get('f1', 0):.3f}  "
-        f"ACC={m.get('accuracy', 0):.3f}  "
-        f"AUC={m.get('auc', 0):.3f}"
-    )
+def _configured_family_flags(config: Mapping[str, object]) -> dict[str, bool]:
+    run = config.get("run") or {}
+    if not isinstance(run, Mapping):
+        raise ValueError("run must be a YAML mapping")
+    selected = extraction_mode_flags(str(run.get("extraction_mode", "all")))
+    extraction = config.get("feature_extraction") or {}
+    if not isinstance(extraction, Mapping):
+        raise ValueError("feature_extraction must be a YAML mapping")
+
+    fallback = {
+        "method": "dgst_t" in extraction,
+        "ads_cgc": "ads" in extraction or "cgc" in extraction,
+        "baseline": False,
+    }
+    for family in selected:
+        section = extraction.get(family)
+        if isinstance(section, Mapping):
+            configured = bool(section.get("enabled", True))
+        elif section is None:
+            configured = fallback[family]
+        else:
+            configured = bool(section)
+        selected[family] = bool(selected[family] and configured)
+    return selected
+
+
+def _configured_feature_sets(
+    config: Mapping[str, object],
+    flags: Mapping[str, bool],
+) -> list[str]:
+    training = config.get("training") or {}
+    configured = training.get("feature_sets") if isinstance(training, Mapping) else None
+    values: list[str] = []
+    if isinstance(configured, Mapping):
+        if flags["method"]:
+            method_values = _as_string_list(configured.get("method") or [])
+            values.extend(_enabled_method_feature_sets(config, method_values))
+        if flags["ads_cgc"]:
+            values.extend(_as_string_list(configured.get("ads_cgc") or []))
+    elif isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
+        values.extend(_as_string_list(configured))
+    if not values:
+        raise ValueError(
+            "No root training.feature_sets remain for the YAML extraction mode"
+        )
+    return list(dict.fromkeys(values))
+
+
+def _as_string_list(values: Sequence[object]) -> list[str]:
+    return [str(value) for value in values]
+
+
+def _torch_probe_cli_args(config: object) -> list[str]:
+    if not isinstance(config, Mapping):
+        raise ValueError("training.torch_probe must be a YAML mapping")
+    scalar_options = {
+        "batch_size": "--batch-size",
+        "num_epochs": "--num-epochs",
+        "learning_rate": "--learning-rate",
+        "weight_decay": "--weight-decay",
+        "lr_factor": "--lr-factor",
+        "lr_patience": "--lr-patience",
+        "early_stopping_patience": "--early-stopping-patience",
+        "dropout": "--dropout",
+        "seed": "--seed",
+    }
+    allowed = {*scalar_options, "hidden_sizes", "paper_config"}
+    unknown = sorted(set(config) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown training.torch_probe options: {unknown}")
+    result: list[str] = []
+    for key, option in scalar_options.items():
+        if key in config:
+            result.extend([option, str(config[key])])
+    if config.get("hidden_sizes") is not None:
+        hidden_sizes = config["hidden_sizes"]
+        if not isinstance(hidden_sizes, Sequence) or isinstance(hidden_sizes, (str, bytes)):
+            raise ValueError("training.torch_probe.hidden_sizes must be a list")
+        result.extend(["--hidden-sizes", *[str(value) for value in hidden_sizes]])
+    if bool(config.get("paper_config", False)):
+        result.append("--paper-config")
+    return result
 
 
 if __name__ == "__main__":

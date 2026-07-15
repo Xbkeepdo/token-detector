@@ -1,19 +1,31 @@
 """Qwen2.5-VL wrapper for generation and feature extraction."""
 
 from __future__ import annotations
-from typing import List, Optional, Sequence, Tuple
+from dataclasses import replace
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
-from models.base_wrapper import BaseLVLMWrapper, GenerationOutput, ModelOutput
+from models.base_wrapper import (
+    AttentionRequirement,
+    BaseLVLMWrapper,
+    ExtractionRequirements,
+    GenerationOutput,
+    ModelOutput,
+    compact_response_logit_statistics,
+    configure_image_processor_limits,
+)
 from models.dgst_capture import (
-    build_dgst_t_raw,
+    final_normalized_hidden_slice,
+    hidden_states_from_captures,
+    hidden_states_from_layer_outputs,
     run_forward_with_dgst_captures,
+    run_forward_with_layer_hidden_captures,
 )
 from models.prompt_support import resolve_prompt_support_positions
-from features.dgst_t import compute_dgst_t
+from features.dgst_t import compute_dgst_t_batch_from_captures
 
 
 class QwenVLWrapper(BaseLVLMWrapper):
@@ -25,6 +37,7 @@ class QwenVLWrapper(BaseLVLMWrapper):
         self.processor = AutoProcessor.from_pretrained(
             hf_name, trust_remote_code=True
         )
+        configure_image_processor_limits(self.processor, self.cfg)
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             hf_name,
             torch_dtype=torch.bfloat16,
@@ -40,6 +53,15 @@ class QwenVLWrapper(BaseLVLMWrapper):
         self._vision_end_id = self.tokenizer.convert_tokens_to_ids(
             self.cfg.get("vision_end_token", "<|vision_end|>")
         )
+        config_image_token_id = getattr(self.model.config, "image_token_id", None)
+        self._image_token_id = int(
+            config_image_token_id
+            if config_image_token_id is not None
+            else self.tokenizer.convert_tokens_to_ids(
+                self.cfg.get("image_token", "<|image_pad|>")
+            )
+        )
+        self._last_num_visual_tokens: Optional[int] = None
         print(
             f"[QwenVLWrapper] Loaded. "
             f"vision_start={self._vision_start_id}, "
@@ -48,11 +70,22 @@ class QwenVLWrapper(BaseLVLMWrapper):
 
     @property
     def num_layers(self) -> int:
-        return self.model.config.num_hidden_layers
+        text_config = getattr(self.model.config, "text_config", None)
+        if text_config is not None and hasattr(text_config, "num_hidden_layers"):
+            return int(text_config.num_hidden_layers)
+        return int(self.model.config.num_hidden_layers)
 
     @property
     def num_visual_tokens(self) -> int:
-        return self.cfg.get("num_visual_tokens") or 256
+        configured = self.cfg.get("num_visual_tokens")
+        if configured is not None:
+            return int(configured)
+        if self._last_num_visual_tokens is not None:
+            return int(self._last_num_visual_tokens)
+        raise RuntimeError(
+            "Qwen2.5-VL uses a dynamic visual-token count. Process an image first "
+            "or read ModelOutput.visual_grid instead of assuming 256 tokens."
+        )
 
 
     def generate(
@@ -60,8 +93,7 @@ class QwenVLWrapper(BaseLVLMWrapper):
         image: Image.Image,
         prompt: Optional[str] = None,
     ) -> GenerationOutput:
-        if prompt is None:
-            prompt = "Describe this image."
+        prompt = self.resolve_prompt(prompt)
 
         messages = [
             {
@@ -87,8 +119,8 @@ class QwenVLWrapper(BaseLVLMWrapper):
             output_ids = self.model.generate(
                 **inputs,
                 do_sample=False,
-                temperature=self.cfg["temperature"],
-                top_p=self.cfg["top_p"],
+                temperature=self.cfg.get("temperature", 0.1),
+                top_p=self.cfg.get("top_p", 0.5),
                 max_new_tokens=self.generation_max_new_tokens,
             )
 
@@ -115,13 +147,20 @@ class QwenVLWrapper(BaseLVLMWrapper):
         target_token_id: Optional[int] = None,
         cfg_dgst_t: Optional[dict] = None,
         prompt: Optional[str] = None,
+        requirements: Optional[ExtractionRequirements] = None,
     ) -> ModelOutput:
+        prompt = self.resolve_prompt(prompt)
+        requirements_were_explicit = requirements is not None
+        requirements = self.resolve_extraction_requirements(
+            requirements,
+            dgst_enabled=cfg_dgst_t is not None,
+        )
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": image},
-                    {"type": "text", "text": prompt or "Describe this image."},
+                    {"type": "text", "text": prompt},
                 ],
             }
         ]
@@ -134,120 +173,190 @@ class QwenVLWrapper(BaseLVLMWrapper):
             return_tensors="pt",
         )
         prompt_tokenized_length = int(prompt_inputs["input_ids"].shape[1])
-        partial_response = self.tokenizer.decode(
-            prefix_token_ids, skip_special_tokens=True
+        inputs = _append_prefix_token_ids(
+            prompt_inputs,
+            prefix_token_ids=prefix_token_ids,
+            device=self.device,
         )
-        full_text = text + partial_response
-
-        inputs = self.processor(
-            text=[full_text],
-            images=[image],
-            return_tensors="pt",
-        ).to(self.device)
 
         input_ids = inputs["input_ids"][0]
         img_start, img_end = self._find_vision_token_range(input_ids)
+        visual_grid = self._resolve_visual_grid(inputs, img_end - img_start)
 
-        out, captures = run_forward_with_dgst_captures(self.model, **inputs)
+        use_dgst = bool(requirements.dgst_capture and cfg_dgst_t is not None)
+        layer_outputs = None
+        if use_dgst:
+            out, captures = run_forward_with_dgst_captures(
+                self.model,
+                # Decoder hooks already contain every state consumed by DGST,
+                # ADS/CGC, and the compact baseline path.  Asking the model for
+                # hidden_states as well would retain a second full layer stack.
+                output_hidden_states=False,
+                retain_attention_updates=(
+                    str(cfg_dgst_t.get("target_gate_mode", "four_gate"))
+                    .strip()
+                    .lower()
+                    != "four_gate"
+                ),
+                **inputs,
+            )
+        elif requirements.needs_hidden_states:
+            captures = None
+            out, layer_outputs = run_forward_with_layer_hidden_captures(
+                self.model,
+                output_attentions=requirements.needs_attention_weights,
+                capture_all_layers=(
+                    requirements.token_hidden_states
+                    or requirements.patch_hidden_states
+                ),
+                **inputs,
+            )
+        else:
+            captures = None
+            with torch.no_grad():
+                out = self.model(
+                    **inputs,
+                    output_attentions=requirements.needs_attention_weights,
+                    output_hidden_states=requirements.needs_hidden_states,
+                    return_dict=True,
+                    use_cache=False,
+                )
 
-        expanded_seq_len = out.attentions[0].shape[-1]
-        text_to_patch_attn, text_to_text_attn = _extract_attention_features(
-            out.attentions, img_start, img_end, expanded_seq_len
+        expanded_seq_len = int(input_ids.shape[0])
+        if out.attentions is not None and len(out.attentions) > 0:
+            expanded_seq_len = int(out.attentions[0].shape[-1])
+        compact_profile = bool(
+            cfg_dgst_t is not None
+            and cfg_dgst_t.get("feature_output_profile")
+            in {"costvariant_vv", "gate_comparison_vv", "four_gate_vv"}
         )
-        token_hidden_states, patch_hidden_states = _extract_hidden_states(
-            out.hidden_states, img_start, img_end
+        keep_attention = (
+            (not compact_profile or requirements_were_explicit)
+            and requirements.attention is not AttentionRequirement.NONE
+        )
+        keep_hidden = (not compact_profile or requirements_were_explicit) and (
+            requirements.token_hidden_states or requirements.patch_hidden_states
+        )
+        if keep_attention:
+            if out.attentions is None or not out.attentions:
+                raise RuntimeError(
+                    "Qwen2.5-VL attention features were requested but the model "
+                    "returned no attentions; eager attention is required."
+                )
+            text_to_patch_attn, text_to_text_attn = _extract_attention_features(
+                out.attentions, img_start, img_end, expanded_seq_len
+            )
+            if requirements.attention is AttentionRequirement.HEAD_MEAN:
+                text_to_patch_attn = text_to_patch_attn.mean(dim=1, keepdim=True)
+                text_to_text_attn = text_to_text_attn.mean(dim=1, keepdim=True)
+        else:
+            text_to_patch_attn = torch.empty(0)
+            text_to_text_attn = torch.empty(0)
+        text_to_patch_attn = text_to_patch_attn.cpu()
+        text_to_text_attn = text_to_text_attn.cpu()
+        out.attentions = None
+
+        if keep_hidden:
+            if captures is not None:
+                token_hidden_states, patch_hidden_states = hidden_states_from_captures(
+                    captures,
+                    token_position=expanded_seq_len - 1,
+                    visual_start=img_start,
+                    visual_end=img_end,
+                )
+            elif layer_outputs is not None:
+                token_hidden_states, patch_hidden_states = hidden_states_from_layer_outputs(
+                    layer_outputs,
+                    token_position=expanded_seq_len - 1,
+                    visual_start=img_start,
+                    visual_end=img_end,
+                )
+            elif out.hidden_states is not None:
+                token_hidden_states, patch_hidden_states = _extract_hidden_states(
+                    out.hidden_states, img_start, img_end
+                )
+            else:
+                raise RuntimeError("Qwen2.5-VL hidden states were requested but not returned.")
+            if not requirements.token_hidden_states:
+                token_hidden_states = torch.empty(0, device=patch_hidden_states.device)
+            if not requirements.patch_hidden_states:
+                patch_hidden_states = torch.empty(0, device=token_hidden_states.device)
+        else:
+            token_hidden_states = torch.empty(0)
+            patch_hidden_states = torch.empty(0)
+        token_hidden_states = token_hidden_states.cpu()
+        patch_hidden_states = patch_hidden_states.cpu()
+
+        response_hidden_states = (
+            final_normalized_hidden_slice(
+                model=self.model,
+                out=out,
+                dgst_captures=captures,
+                layer_outputs=layer_outputs,
+                start=prompt_tokenized_length,
+                end=int(input_ids.shape[0]),
+            ).cpu()
+            if requirements.response_hidden_states
+            else None
         )
 
         pred_token_id = out.logits[0, -1].argmax().item()
         pred_token_str = self.tokenizer.decode([pred_token_id], skip_special_tokens=False)
-        last_logits = out.logits[0, -1].float().cpu()
+        last_logits = (
+            out.logits[0, -1].float().cpu() if requirements.logits else None
+        )
+        out.logits = None
         dgst_target_id = int(target_token_id) if target_token_id is not None else int(pred_token_id)
-        prompt_positions_override = resolve_prompt_support_positions(
-            tokenizer=self.tokenizer,
-            full_input_ids=input_ids.tolist(),
-            prompt_tokenized_length=prompt_tokenized_length,
-            image_token_id=int(self.model.config.image_token_id),
-            visual_start=img_start,
-            visual_end=img_end,
-            cfg_dgst_t=cfg_dgst_t,
-            model_name="Qwen2.5-VL",
-        )
-        dgst_t_raw = build_dgst_t_raw(
-            model=self.model,
-            full_input_ids=input_ids.tolist(),
-            prompt_tokenized_length=prompt_tokenized_length,
-            captures=captures,
-            visual_start=img_start,
-            visual_end=img_end,
-            image_token_id=int(self.model.config.image_token_id),
-            target_token_id=dgst_target_id,
-            prediction_position=expanded_seq_len - 1,
-            support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
-            relative_vll_logit_source=(
-                cfg_dgst_t.get("relative_vll_logit_source", "h_mid")
-                if cfg_dgst_t is not None
-                else "h_mid"
-            ),
-            prompt_positions_override=prompt_positions_override,
-            keep_on_device=cfg_dgst_t is not None,
-        )
         dgst_t_result = None
-        if cfg_dgst_t is not None:
-            dgst_t_result = compute_dgst_t(
-                dgst_t_raw,
-                tau=cfg_dgst_t.get("tau", 0.07),
-                source_distribution_mode=cfg_dgst_t.get("source_distribution_mode", "softmax"),
-                transport_top_k=cfg_dgst_t.get("transport_top_k", 64),
-                cost_mode=cfg_dgst_t.get("cost_mode", "direct"),
-                lambda_d=cfg_dgst_t.get("lambda_d", 1.0),
-                lambda_s=cfg_dgst_t.get("lambda_s", 1.0),
-                lambda_t=cfg_dgst_t.get("lambda_t", 1.0),
-                lambda_int=cfg_dgst_t.get("lambda_int", 1.0),
-                baseline_layers=cfg_dgst_t.get("baseline_layers", 10),
-                risk_start_layer=cfg_dgst_t.get("risk_start_layer", 15),
-                alpha=cfg_dgst_t.get("alpha", 2.0),
-                ot_solver=cfg_dgst_t.get("ot_solver", "linprog"),
-                atarget_visual_top_k=cfg_dgst_t.get("atarget_visual_top_k", 32),
-                topmass_alpha=cfg_dgst_t.get("topmass_085_alpha", 0.85),
-                capped_topmass_alpha=cfg_dgst_t.get("capped_topmass_085_alpha", 0.85),
-                capped_topmass_min_k=cfg_dgst_t.get("capped_topmass_085_min_k", 32),
-                capped_topmass_max_k=cfg_dgst_t.get("capped_topmass_085_max_k", 64),
-                compute_topmass_085=cfg_dgst_t.get("compute_topmass_085", True),
-                compute_capped_topmass_085=cfg_dgst_t.get("compute_capped_topmass_085", True),
-                target_gate_mode=cfg_dgst_t.get("target_gate_mode", "legacy_prob"),
-                relative_vll_mad_epsilon=cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6),
-                relative_cost_mode=cfg_dgst_t.get("relative_cost_mode"),
-                relative_cost_modes=cfg_dgst_t.get("relative_cost_modes"),
-                relative_cost_state_modes=cfg_dgst_t.get("relative_cost_state_modes"),
-                relative_cost_update_lambdas=cfg_dgst_t.get("relative_cost_update_lambdas"),
-                relative_barrier_lambda=cfg_dgst_t.get("relative_barrier_lambda", 1.0),
-                relative_barrier_margin=cfg_dgst_t.get("relative_barrier_margin", 0.5),
-                relative_barrier_max=cfg_dgst_t.get("relative_barrier_max", 3.0),
-                source_modes=cfg_dgst_t.get("source_modes"),
-                target_attention_gammas=cfg_dgst_t.get("target_attention_gammas"),
-                target_attention_epsilon=cfg_dgst_t.get("target_attention_epsilon", 1e-12),
-                compute_ffn_injection_features=cfg_dgst_t.get("compute_ffn_injection_features", True),
-                ffn_injection_evidence_top_k=cfg_dgst_t.get("ffn_injection_evidence_top_k", 32),
-                ffn_injection_evidence_rank=cfg_dgst_t.get("ffn_injection_evidence_rank", 8),
-                ffn_injection_eps=cfg_dgst_t.get("ffn_injection_eps", 1e-12),
-                compute_dual_scope=cfg_dgst_t.get(
-                    "dgst_t_dual_scope",
-                    cfg_dgst_t.get("compute_dual_scope", False),
-                ),
+        if use_dgst:
+            prompt_positions_override = resolve_prompt_support_positions(
+                tokenizer=self.tokenizer,
+                full_input_ids=input_ids.tolist(),
+                prompt_tokenized_length=prompt_tokenized_length,
+                image_token_id=self._image_token_id,
+                visual_start=img_start,
+                visual_end=img_end,
+                cfg_dgst_t=cfg_dgst_t,
+                model_name="Qwen2.5-VL",
             )
-            dgst_t_raw = None
+            dgst_t_result = _compute_dgst_result_from_captures(
+                model=self.model,
+                input_ids=input_ids.tolist(),
+                prompt_tokenized_length=prompt_tokenized_length,
+                captures=captures,
+                visual_start=img_start,
+                visual_end=img_end,
+                image_token_id=self._image_token_id,
+                target_token_id=dgst_target_id,
+                prediction_position=expanded_seq_len - 1,
+                support_scope=self.cfg.get("dgst_t_support_scope", "visual"),
+                prompt_positions_override=prompt_positions_override,
+                cfg=cfg_dgst_t,
+                release_layer_captures=True,
+            )
+        baseline_capture = {
+            "prediction_position": int(expanded_seq_len - 1),
+            "visual_start": int(img_start),
+            "visual_end": int(img_end),
+            "attention_requirement": requirements.attention.value,
+        }
 
         return ModelOutput(
             token_id=pred_token_id,
             token_str=pred_token_str,
-            text_to_patch_attn=text_to_patch_attn.cpu(),
-            text_to_text_attn=text_to_text_attn.cpu(),
-            token_hidden_states=token_hidden_states.cpu(),
-            patch_hidden_states=patch_hidden_states.cpu(),
+            text_to_patch_attn=text_to_patch_attn,
+            text_to_text_attn=text_to_text_attn,
+            token_hidden_states=token_hidden_states,
+            patch_hidden_states=patch_hidden_states,
             response_token_idx=response_token_idx,
             token_logits=last_logits,
-            dgst_t_raw=dgst_t_raw,
+            dgst_t_raw=None,
             dgst_t_result=dgst_t_result,
+            visual_grid=visual_grid if requirements.visual_layout else None,
+            response_hidden_states=(
+                response_hidden_states
+            ),
+            baseline_capture=baseline_capture,
         )
 
     def extract_token_features_batch(
@@ -258,6 +367,7 @@ class QwenVLWrapper(BaseLVLMWrapper):
         target_token_ids: Optional[Sequence[int]] = None,
         cfg_dgst_t: Optional[dict] = None,
         prompt: Optional[str] = None,
+        requirements: Optional[ExtractionRequirements] = None,
     ) -> List[ModelOutput]:
         """Qwen uses one prefix forward per object token to avoid long-sequence OOM.
 
@@ -277,6 +387,17 @@ class QwenVLWrapper(BaseLVLMWrapper):
             if target_token_ids is not None
             else [response_ids[index] for index in requested_indices]
         )
+        if len(targets) != len(requested_indices):
+            raise ValueError(
+                "target_token_ids and response_token_indices must have the same length."
+            )
+
+        per_prefix_requirements = requirements
+        if requirements is not None and requirements.response_hidden_states:
+            per_prefix_requirements = replace(
+                requirements,
+                response_hidden_states=False,
+            )
 
         outputs: List[ModelOutput] = []
         for response_index, target_token_id in zip(requested_indices, targets):
@@ -288,32 +409,143 @@ class QwenVLWrapper(BaseLVLMWrapper):
                     target_token_id=int(target_token_id),
                     cfg_dgst_t=cfg_dgst_t,
                     prompt=prompt,
+                    requirements=per_prefix_requirements,
                 )
             )
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        if requirements is not None and requirements.response_hidden_states:
+            shared_capture = self._extract_full_response_baseline_capture(
+                image=image,
+                response_token_ids=response_ids,
+                prompt=prompt,
+            )
+            for output in outputs:
+                output.response_hidden_states = shared_capture[
+                    "response_hidden_states"
+                ]
+                output.baseline_capture = {
+                    **(output.baseline_capture or {}),
+                    **shared_capture["statistics"],
+                }
         return outputs
 
 
+    def _extract_full_response_baseline_capture(
+        self,
+        *,
+        image: Image.Image,
+        response_token_ids: Sequence[int],
+        prompt: Optional[str],
+    ) -> dict[str, Any]:
+        """One lightweight full-caption pass for HalLoc/MetaToken inputs."""
+        resolved_prompt = self.resolve_prompt(prompt)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": resolved_prompt},
+                ],
+            }
+        ]
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_inputs = self.processor(
+            text=[text],
+            images=[image],
+            return_tensors="pt",
+        )
+        prompt_length = int(prompt_inputs["input_ids"].shape[1])
+        inputs = _append_prefix_token_ids(
+            prompt_inputs,
+            prefix_token_ids=response_token_ids,
+            device=self.device,
+        )
+        response_count = len(response_token_ids)
+        if response_count == 0:
+            return {
+                "response_hidden_states": torch.empty((0, 0)),
+                "statistics": compact_response_logit_statistics(
+                    torch.empty((0, int(self.model.config.vocab_size))),
+                    response_token_ids=[],
+                ),
+            }
+        logits_positions = torch.arange(
+            prompt_length - 1,
+            prompt_length + response_count - 1,
+            dtype=torch.long,
+            device=inputs["input_ids"].device,
+        )
+        with torch.no_grad():
+            out = self.model(
+                **inputs,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+                logits_to_keep=logits_positions,
+            )
+        response_hidden = out.hidden_states[-1][
+            0,
+            prompt_length:prompt_length + response_count,
+            :,
+        ].detach().cpu()
+        teacher_logits = out.logits[0]
+        if int(teacher_logits.shape[0]) != response_count:
+            teacher_logits = teacher_logits.index_select(
+                0,
+                logits_positions.to(teacher_logits.device),
+            )
+        statistics = compact_response_logit_statistics(
+            teacher_logits,
+            response_token_ids=response_token_ids,
+        )
+        del teacher_logits, out
+        return {
+            "response_hidden_states": response_hidden,
+            "statistics": statistics,
+        }
+
+
     def _find_vision_token_range(self, input_ids: torch.Tensor) -> Tuple[int, int]:
-        """Locate <|vision_start|> and <|vision_end|> in input_ids and"""
-        ids = input_ids.tolist()
-        try:
-            vs_pos = ids.index(self._vision_start_id)
-            ve_pos = ids.index(self._vision_end_id)
-            return vs_pos + 1, ve_pos
-        except ValueError:
-            return 5, 5 + 256
+        """Locate the exact contiguous image-pad span in processor input IDs."""
+        ids = [int(token_id) for token_id in input_ids.tolist()]
+        positions = [
+            index for index, token_id in enumerate(ids)
+            if token_id == self._image_token_id
+        ]
+        if not positions:
+            raise ValueError(
+                "Qwen2.5-VL processor output contains no <|image_pad|> tokens; "
+                "cannot align visual attention safely."
+            )
+        expected = list(range(positions[0], positions[-1] + 1))
+        if positions != expected:
+            raise ValueError("Qwen2.5-VL image-pad positions are not contiguous.")
+        self._last_num_visual_tokens = len(positions)
+        return int(positions[0]), int(positions[-1] + 1)
 
-
-def _extract_text_to_patch_attn(
-    attentions: tuple, img_start: int, img_end: int
-) -> torch.Tensor:
-    layers = []
-    for attn in attentions:
-        patch_attn = attn[0, :, -1, img_start:img_end]
-        layers.append(patch_attn)
-    return torch.stack(layers, dim=0)
+    def _resolve_visual_grid(
+        self,
+        inputs: dict[str, Any],
+        visual_token_count: int,
+    ) -> Optional[Tuple[int, int]]:
+        grid = inputs.get("image_grid_thw")
+        if grid is None or int(grid.shape[0]) != 1:
+            return None
+        merge_size = int(getattr(self.processor.image_processor, "merge_size", 1))
+        height = int(grid[0, 1].item()) // merge_size
+        width = int(grid[0, 2].item()) // merge_size
+        if height * width != int(visual_token_count):
+            raise ValueError(
+                "Qwen2.5-VL visual grid does not match image-pad token count: "
+                f"grid={height}x{width}, tokens={visual_token_count}."
+            )
+        return height, width
 
 
 def _extract_hidden_states(
@@ -326,53 +558,137 @@ def _extract_hidden_states(
     return torch.stack(token_list, 0), torch.stack(patch_list, 0)
 
 
-def _extract_attention_features(attentions, img_start, img_end, seq_len):
-    visual_set = set(range(img_start, img_end))
-    last_pos = seq_len - 1
-    text_indices = [i for i in range(seq_len) if i not in visual_set and i != last_pos]
-    text_idx_tensor = __import__('torch').tensor(text_indices, dtype=__import__('torch').long)
+def _extract_attention_features(
+    attentions: tuple,
+    img_start: int,
+    img_end: int,
+    seq_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    visual_set = set(range(int(img_start), int(img_end)))
+    last_pos = int(seq_len) - 1
+    text_indices = [
+        index
+        for index in range(int(seq_len))
+        if index not in visual_set and index != last_pos
+    ]
     patch_layers, text_layers = [], []
     for layer_attn in attentions:
         row = layer_attn[0, :, last_pos, :]
+        text_idx_tensor = torch.tensor(
+            text_indices,
+            dtype=torch.long,
+            device=row.device,
+        )
         patch_layers.append(row[:, img_start:img_end])
         text_layers.append(row[:, text_idx_tensor])
-    import torch
     return torch.stack(patch_layers, dim=0), torch.stack(text_layers, dim=0)
 
 
-def _extract_attention_features(attentions, img_start, img_end, seq_len):
-    visual_set = set(range(img_start, img_end))
-    last_pos = seq_len - 1
-    text_indices = [i for i in range(seq_len) if i not in visual_set and i != last_pos]
-    text_idx_tensor = __import__('torch').tensor(text_indices, dtype=__import__('torch').long)
-    patch_layers, text_layers = [], []
-    for layer_attn in attentions:
-        row = layer_attn[0, :, last_pos, :]
-        patch_layers.append(row[:, img_start:img_end])
-        text_layers.append(row[:, text_idx_tensor])
-    import torch
-    return torch.stack(patch_layers, dim=0), torch.stack(text_layers, dim=0)
+def _append_prefix_token_ids(
+    prompt_inputs: Any,
+    *,
+    prefix_token_ids: Sequence[int],
+    device: str,
+) -> dict[str, Any]:
+    """Append generated IDs without a lossy decode/re-tokenize round trip."""
+    inputs = {
+        key: value.to(device=device) if torch.is_tensor(value) else value
+        for key, value in dict(prompt_inputs).items()
+    }
+    prefix = torch.tensor(
+        [int(token_id) for token_id in prefix_token_ids],
+        dtype=inputs["input_ids"].dtype,
+        device=inputs["input_ids"].device,
+    ).unsqueeze(0)
+    if prefix.numel() == 0:
+        return inputs
+    inputs["input_ids"] = torch.cat((inputs["input_ids"], prefix), dim=1)
+    if "attention_mask" in inputs:
+        suffix_mask = torch.ones(
+            (inputs["attention_mask"].shape[0], prefix.shape[1]),
+            dtype=inputs["attention_mask"].dtype,
+            device=inputs["attention_mask"].device,
+        )
+        inputs["attention_mask"] = torch.cat(
+            (inputs["attention_mask"], suffix_mask),
+            dim=1,
+        )
+    for stale_key in ("position_ids", "cache_position", "rope_deltas"):
+        inputs.pop(stale_key, None)
+    return inputs
 
 
-def _extract_attention_features_at_position(attentions, img_start, img_end, seq_len, token_position):
-    visual_set = set(range(img_start, img_end))
-    last_pos = int(token_position)
-    text_indices = [i for i in range(seq_len) if i not in visual_set and i != last_pos]
-    text_idx_tensor = torch.tensor(text_indices, dtype=torch.long)
-    patch_layers, text_layers = [], []
-    for layer_attn in attentions:
-        row = layer_attn[0, :, last_pos, :]
-        idx = text_idx_tensor.to(layer_attn.device)
-        patch_layers.append(row[:, img_start:img_end])
-        text_layers.append(row[:, idx])
-    return torch.stack(patch_layers, dim=0), torch.stack(text_layers, dim=0)
-
-
-def _to_device_dtype(inputs: dict, device: str) -> dict:
-    result = {}
-    for key, value in inputs.items():
-        if torch.is_tensor(value):
-            result[key] = value.to(device=device)
-        else:
-            result[key] = value
-    return result
+def _compute_dgst_result_from_captures(
+    *,
+    model: Any,
+    input_ids: Sequence[int],
+    prompt_tokenized_length: int,
+    captures: Sequence[dict[str, Any]],
+    visual_start: int,
+    visual_end: int,
+    image_token_id: int,
+    target_token_id: int,
+    prediction_position: int,
+    support_scope: str,
+    prompt_positions_override: Optional[Sequence[int]],
+    cfg: dict[str, Any],
+    release_layer_captures: bool = False,
+) -> dict[str, Any]:
+    results = compute_dgst_t_batch_from_captures(
+        model=model,
+        full_input_ids=input_ids,
+        prompt_tokenized_length=int(prompt_tokenized_length),
+        captures=captures,
+        visual_start=int(visual_start),
+        visual_end=int(visual_end),
+        image_token_id=int(image_token_id),
+        target_token_ids=[int(target_token_id)],
+        prediction_positions=[int(prediction_position)],
+        support_scope=str(support_scope),
+        semantic_chunk_size=int(cfg.get("semantic_chunk_size", 64)),
+        prompt_positions_override=prompt_positions_override,
+        tau=float(cfg.get("tau", 0.07)),
+        source_distribution_mode=cfg.get("source_distribution_mode", "softmax"),
+        transport_top_k=int(cfg.get("transport_top_k", 64)),
+        cost_mode=cfg.get("cost_mode", "direct"),
+        lambda_d=float(cfg.get("lambda_d", 1.0)),
+        lambda_s=float(cfg.get("lambda_s", 1.0)),
+        lambda_t=float(cfg.get("lambda_t", 1.0)),
+        lambda_int=float(cfg.get("lambda_int", 1.0)),
+        baseline_layers=int(cfg.get("baseline_layers", 10)),
+        risk_start_layer=int(cfg.get("risk_start_layer", 15)),
+        alpha=float(cfg.get("alpha", 2.0)),
+        ot_solver=cfg.get("ot_solver", "linprog"),
+        atarget_visual_top_k=int(cfg.get("atarget_visual_top_k", 32)),
+        topmass_alpha=float(cfg.get("topmass_085_alpha", 0.85)),
+        capped_topmass_alpha=float(cfg.get("capped_topmass_085_alpha", 0.85)),
+        capped_topmass_min_k=int(cfg.get("capped_topmass_085_min_k", 32)),
+        capped_topmass_max_k=int(cfg.get("capped_topmass_085_max_k", 64)),
+        compute_topmass_085=bool(cfg.get("compute_topmass_085", True)),
+        compute_capped_topmass_085=bool(cfg.get("compute_capped_topmass_085", True)),
+        target_gate_mode=cfg.get("target_gate_mode", "four_gate"),
+        relative_vll_mad_epsilon=float(cfg.get("relative_vll_mad_epsilon", 1e-6)),
+        relative_vll_logit_source=cfg.get("relative_vll_logit_source", "h_mid"),
+        relative_cost_mode=cfg.get("relative_cost_mode"),
+        relative_cost_modes=cfg.get("relative_cost_modes"),
+        relative_cost_state_modes=cfg.get("relative_cost_state_modes"),
+        relative_cost_update_lambdas=cfg.get("relative_cost_update_lambdas"),
+        relative_barrier_lambda=float(cfg.get("relative_barrier_lambda", 1.0)),
+        relative_barrier_margin=float(cfg.get("relative_barrier_margin", 0.5)),
+        relative_barrier_max=float(cfg.get("relative_barrier_max", 3.0)),
+        source_modes=cfg.get("source_modes"),
+        target_attention_gammas=cfg.get("target_attention_gammas"),
+        target_attention_epsilon=float(cfg.get("target_attention_epsilon", 1e-12)),
+        compute_ffn_injection_features=bool(cfg.get("compute_ffn_injection_features", False)),
+        ffn_injection_evidence_top_k=int(cfg.get("ffn_injection_evidence_top_k", 32)),
+        ffn_injection_evidence_rank=int(cfg.get("ffn_injection_evidence_rank", 8)),
+        ffn_injection_eps=float(cfg.get("ffn_injection_eps", 1e-12)),
+        compute_dual_scope=bool(
+            cfg.get("dgst_t_dual_scope", cfg.get("compute_dual_scope", False))
+        ),
+        four_gate_methods=cfg.get("four_gate_methods"),
+        release_layer_captures=bool(release_layer_captures),
+    )
+    if len(results) != 1:
+        raise RuntimeError(f"Expected one DGST result, received {len(results)}.")
+    return results[0]

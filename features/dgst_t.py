@@ -26,6 +26,36 @@ RELATIVE_VLL_MAD_EPSILON = 1e-6
 COSINE16_TOP_K = 16
 GAUSSIAN_MAD_SCALE = 1.4826
 
+# The active DGST profile keeps four matched target-gate constructions.  The
+# prefix names deliberately encode both the decoder state used for the logit
+# lens and whether the gate sees a raw target logit or a vocabulary-softmax
+# probability.  This prevents the corresponding target-cosine features from
+# being confused at training time.
+FOUR_GATE_METHODS = (
+    "hpre_raw_logit_gauss",
+    "hpre_softmax_prob_gauss",
+    "hmid_raw_logit_gauss",
+    "hmid_softmax_prob_gauss",
+)
+RAW_ATTENTION_METHOD = "raw_attention"
+TARGET_COMPARISON_METHODS = (*FOUR_GATE_METHODS, RAW_ATTENTION_METHOD)
+FOUR_GATE_CAPTURE_FIELDS = (
+    "prediction_hpre",
+    "visual_hpre",
+    "attention_support",
+    "source_dist",
+    "hpre_raw_target_logits",
+    "hpre_softmax_target_probs",
+    "hmid_raw_target_logits",
+    "hmid_softmax_target_probs",
+)
+
+GATE_COMPARISON_METHODS = (
+    "relative_vll",
+    "softmax_relative_vll",
+    "legacy_prob",
+)
+
 COST_VARIANT_RISK_KEYS = (
     "risk_geo",
     "risk_cosine_hpre",
@@ -84,6 +114,12 @@ def compute_dgst_t(
     compute_dual_scope: bool = False,
 ) -> dict[str, Any]:
     """Compute DGST-T layer features from raw wrapper captures."""
+    if _normalize_target_gate_mode(target_gate_mode) == "four_gate":
+        raise RuntimeError(
+            "four_gate must be computed directly from decoder captures via "
+            "compute_dgst_t_batch_from_captures; the compact active profile "
+            "does not build legacy dgst_t_raw."
+        )
     support_states = dgst_t_raw["support_h_mid_states"]
     support_h_prev_states = dgst_t_raw.get("support_h_prev_states", support_states)
     support_output_states = dgst_t_raw.get("support_output_states", support_states)
@@ -263,6 +299,8 @@ def compute_dgst_t_batch_from_captures(
     ffn_injection_evidence_rank: int = 8,
     ffn_injection_eps: float = EPS,
     compute_dual_scope: bool = False,
+    four_gate_methods: Sequence[str] | None = None,
+    release_layer_captures: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute DGST-T for several target tokens directly from shared captures."""
     from models.dgst_capture import (
@@ -283,6 +321,23 @@ def compute_dgst_t_batch_from_captures(
         raise ValueError("target_token_ids and prediction_positions must have the same length.")
     if not target_ids:
         return []
+
+    if _normalize_target_gate_mode(target_gate_mode) == "four_gate":
+        return compute_four_gate_dgst_batch_from_captures(
+            model=model,
+            captures=captures,
+            visual_start=int(visual_start),
+            visual_end=int(visual_end),
+            target_token_ids=target_ids,
+            prediction_positions=pred_positions,
+            semantic_chunk_size=int(semantic_chunk_size),
+            tau=float(tau),
+            transport_top_k=int(transport_top_k),
+            target_region_top_k=int(atarget_visual_top_k),
+            mad_epsilon=float(relative_vll_mad_epsilon),
+            enabled_methods=four_gate_methods,
+            release_layer_captures=bool(release_layer_captures),
+        )
 
     prompt_positions = (
         [int(position) for position in prompt_positions_override]
@@ -628,8 +683,9 @@ def _compute_dgst_t_from_parts(
     gamma_values = _normalize_target_attention_gammas(target_attention_gammas)
     source_distribution = _normalize_source_distribution_mode(source_distribution_mode)
     compute_cost_variants = gate_mode == "cost_variants"
+    compute_gate_comparison = gate_mode == "gate_comparison"
     compute_relative_vll = gate_mode in {"relative_vll", "dual", "cost_variants"}
-    if compute_relative_vll and relative_vll_logits is None:
+    if (compute_relative_vll or compute_gate_comparison) and relative_vll_logits is None:
         raise ValueError("target_gate_mode requires relative_vll_logits, but they are missing.")
     for name, values in {
         "prediction_hidden_states": prediction_hidden_states,
@@ -649,6 +705,29 @@ def _compute_dgst_t_from_parts(
         raise ValueError("DGST-T layer count mismatch for source_attn_states.")
     if relative_vll_logits is not None and len(relative_vll_logits) != layer_count:
         raise ValueError("DGST-T layer count mismatch for relative_vll_logits.")
+
+    if compute_gate_comparison:
+        return _compute_gate_comparison_from_parts(
+            source_ffn_states=source_ffn_states,
+            source_attn_states=source_attn_states,
+            prediction_hidden_states=prediction_hidden_states,
+            support_h_prev_states=support_h_prev_states,
+            support_h_mid_states=support_h_mid_states,
+            support_attentions=support_attentions,
+            semantic_probs=semantic_probs,
+            relative_vll_logits=relative_vll_logits,
+            support_positions=support_positions,
+            visual_start=visual_start,
+            visual_end=visual_end,
+            tau=tau,
+            source_distribution_mode=source_distribution,
+            transport_top_k=transport_top_k,
+            ot_solver=ot_solver,
+            atarget_visual_top_k=atarget_visual_top_k,
+            relative_vll_mad_epsilon=relative_vll_mad_epsilon,
+            relative_barrier_margin=relative_barrier_margin,
+            relative_barrier_max=relative_barrier_max,
+        )
 
     layer_stats = []
     risk_per_layer = []
@@ -2942,6 +3021,14 @@ def _optional_layer_tensors(value: Any) -> list[torch.Tensor] | None:
 
 def _normalize_target_gate_mode(value: str) -> str:
     mode = str(value).strip().lower()
+    if mode in {
+        "four_gate",
+        "four_gates",
+        "four_gate_vv",
+        "four_branch",
+        "selected_four_gate",
+    }:
+        return "four_gate"
     if mode in {"legacy", "legacy_prob", "prob", "softmax_prob"}:
         return "legacy_prob"
     if mode in {"relative_vll", "relative", "relative_logit"}:
@@ -2950,9 +3037,16 @@ def _normalize_target_gate_mode(value: str) -> str:
         return "dual"
     if mode in {"cost_variants", "costvariant", "coco500_costvariant"}:
         return "cost_variants"
+    if mode in {
+        "gate_comparison",
+        "gate_compare",
+        "softmax_relative_vll_legacy_compare",
+        "coco100_gate_comparison",
+    }:
+        return "gate_comparison"
     raise ValueError(
         "DGST-T target_gate_mode must be 'legacy_prob', 'relative_vll', "
-        "'dual', or 'cost_variants'."
+        "'dual', 'cost_variants', 'gate_comparison', or 'four_gate'."
     )
 
 
@@ -3835,6 +3929,625 @@ def _relative_vll_evidence_signal(
         f"{stat_prefix}_mad_scale": float(scale),
     }
     return evidence, semantic_gate, relative_barrier, stats
+
+
+@torch.inference_mode()
+def compute_four_gate_dgst_batch_from_captures(
+    *,
+    model: Any,
+    captures: Sequence[dict[str, Any]],
+    visual_start: int,
+    visual_end: int,
+    target_token_ids: Sequence[int],
+    prediction_positions: Sequence[int],
+    semantic_chunk_size: int = 64,
+    tau: float = 0.07,
+    transport_top_k: int = 64,
+    target_region_top_k: int = 32,
+    mad_epsilon: float = RELATIVE_VLL_MAD_EPSILON,
+    enabled_methods: Sequence[str] | None = None,
+    release_layer_captures: bool = False,
+) -> list[dict[str, Any]]:
+    """Compute the active four-gate VV profile directly from decoder captures.
+
+    This is intentionally an early, compact path.  It does not build the
+    historical ``dgst_t_raw`` payload and never computes prompt/VP features,
+    legacy gates, alternative costs, or FFN diagnostics.  For h_pre and h_mid,
+    one chunked vocabulary projection produces both the target raw logit and
+    the target vocabulary-softmax probability.
+    """
+    from models.dgst_capture import (
+        resolve_output_embedding_layer,
+    )
+
+    target_ids = [int(token_id) for token_id in target_token_ids]
+    pred_positions = [int(position) for position in prediction_positions]
+    if len(target_ids) != len(pred_positions):
+        raise ValueError("target_token_ids and prediction_positions must have the same length.")
+    if not target_ids:
+        return []
+    if not captures:
+        raise ValueError("four-gate DGST requires at least one decoder-layer capture.")
+    if int(visual_end) <= int(visual_start):
+        raise ValueError("four-gate DGST requires at least one visual support token.")
+    if int(target_region_top_k) != 32:
+        raise ValueError(
+            "The four-gate feature schema is fixed to target_region_top_k=32; "
+            f"received {target_region_top_k}."
+        )
+    methods = _normalize_four_gate_methods(enabled_methods)
+    output_layer = resolve_output_embedding_layer(model)
+
+    records: list[dict[str, Any]] = []
+    for _target_id in target_ids:
+        records.append(
+            {
+                "attention": [],
+                "source": [],
+                "gates": {method: [] for method in methods},
+                "problems": {method: [] for method in methods},
+                "cosines": {method: [] for method in methods},
+                "ev": {method: [] for method in methods},
+            }
+        )
+
+    for layer_index, capture in enumerate(captures):
+        missing = [
+            key
+            for key in ("h_prev", "h_mid", "o_ffn", "attn_weights")
+            if capture.get(key) is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"four-gate DGST layer {layer_index} is missing captures: {missing}."
+            )
+        compact_capture = build_compact_four_gate_layer_capture(
+            output_layer=output_layer,
+            capture=capture,
+            visual_start=int(visual_start),
+            visual_end=int(visual_end),
+            target_token_ids=target_ids,
+            prediction_positions=pred_positions,
+            semantic_chunk_size=int(semantic_chunk_size),
+            tau=float(tau),
+            enabled_methods=methods,
+        )
+        if tuple(compact_capture) != FOUR_GATE_CAPTURE_FIELDS:
+            raise AssertionError("Unexpected fields in compact four-gate capture.")
+        visual_hpre = compact_capture["visual_hpre"]
+        sequence_length = int(capture["h_prev"].shape[1])
+
+        for target_offset, prediction_position in enumerate(pred_positions):
+            if prediction_position < 0 or prediction_position >= sequence_length:
+                raise ValueError(
+                    f"Prediction position {prediction_position} is outside sequence length "
+                    f"{sequence_length}."
+                )
+            attention_support = compact_capture["attention_support"][target_offset]
+            source_dist = compact_capture["source_dist"][target_offset]
+            prediction_hpre = compact_capture["prediction_hpre"][target_offset]
+            cosine_map = F.cosine_similarity(
+                prediction_hpre.unsqueeze(0),
+                visual_hpre,
+                dim=-1,
+            )
+            cosine_map = torch.nan_to_num(
+                cosine_map.float(), nan=0.0, posinf=1.0, neginf=-1.0
+            ).clamp(-1.0, 1.0)
+            gate_input_fields = {
+                "hpre_raw_logit_gauss": "hpre_raw_target_logits",
+                "hpre_softmax_prob_gauss": "hpre_softmax_target_probs",
+                "hmid_raw_logit_gauss": "hmid_raw_target_logits",
+                "hmid_softmax_prob_gauss": "hmid_softmax_target_probs",
+            }
+
+            record = records[target_offset]
+            record["attention"].append(attention_support)
+            record["source"].append(source_dist)
+            for method in methods:
+                if method == RAW_ATTENTION_METHOD:
+                    # This baseline uses the model's post-softmax attention
+                    # weights directly.  The all-ones gate keeps the stored
+                    # matrix schema aligned with the Gaussian-gated methods.
+                    gate = torch.ones_like(attention_support).detach()
+                    target_dist = attention_support.detach()
+                else:
+                    gate_values = compact_capture[gate_input_fields[method]]
+                    if gate_values is None:
+                        raise RuntimeError(
+                            f"Missing compact target values for enabled method {method}."
+                        )
+                    gate = _gaussian_mad_gate(
+                        gate_values[target_offset],
+                        epsilon=float(mad_epsilon),
+                    ).detach()
+                    target_dist = _renormalize(attention_support * gate).detach()
+                support = _topk_union_indices(
+                    source_dist,
+                    target_dist,
+                    int(transport_top_k),
+                )
+                problem = _prepare_transport_problem_for_state_cost(
+                    source_dist=source_dist,
+                    target_dist=target_dist,
+                    states=visual_hpre,
+                    support=support,
+                    sqrt_cosine=True,
+                    keep_on_device=False,
+                )
+                region = _stable_topk_indices(
+                    target_dist,
+                    int(target_region_top_k),
+                )
+                if region.numel() == 0:
+                    target_cosine = 0.0
+                    evidence_value = 0.0
+                else:
+                    local_cosine = cosine_map.index_select(0, region)
+                    target_cosine = float(local_cosine.mean().item())
+                    local_attention = attention_support.index_select(0, region)
+                    evidence_value = float(
+                        (local_attention * ((1.0 + local_cosine) / 2.0)).sum().item()
+                    )
+                record["gates"][method].append(gate)
+                record["problems"][method].append(problem)
+                record["cosines"][method].append(target_cosine)
+                record["ev"][method].append(evidence_value)
+
+        del compact_capture, visual_hpre
+        if release_layer_captures:
+            # Method-only extraction has no downstream consumer for the hook
+            # tensors.  Drop every large decoder reference as soon as this
+            # layer has been reduced to the eight compact inputs/results.
+            for key in (
+                "h_prev",
+                "o_attn",
+                "h_mid",
+                "o_ffn",
+                "attn_weights",
+            ):
+                capture[key] = None
+
+    results: list[dict[str, Any]] = []
+    for target_offset, record in enumerate(records):
+        # POT's exact EMD is the only solver exposed by this active profile.
+        risk_series = _solve_exact_emd_problem_series(record["problems"])
+        result: dict[str, Any] = {
+            "dgst_t_profile": (
+                "target_comparison_v2"
+                if RAW_ATTENTION_METHOD in methods
+                else "four_gate_vv_v1"
+            ),
+            "dgst_t_target_token_id": int(target_ids[target_offset]),
+            "dgst_t_prediction_position": int(pred_positions[target_offset]),
+            "dgst_t_four_gate_methods": list(methods),
+            "dgst_t_mad_axis": "visual_tokens",
+            "dgst_t_mad_scale": float(GAUSSIAN_MAD_SCALE),
+            "dgst_t_softmax_axis": "vocabulary",
+            "dgst_t_source_distribution_mode": "softmax",
+            "dgst_t_transport_top_k": int(transport_top_k),
+            "dgst_t_target_region_top_k": int(target_region_top_k),
+            "dgst_t_cost": "sqrt_cosine_hpre",
+            "dgst_t_ot_solver": "emd",
+            "dgst_t_attention_support_per_layer": torch.stack(
+                record["attention"], dim=0
+            ).detach().to(device="cpu", dtype=torch.float16),
+            "dgst_t_source_dist_per_layer": torch.stack(
+                record["source"], dim=0
+            ).detach().to(device="cpu", dtype=torch.float16),
+        }
+        if RAW_ATTENTION_METHOD in methods:
+            result["dgst_t_raw_attention_definition"] = (
+                "post_softmax_head_mean_visual_support_renormalized"
+            )
+        for method in methods:
+            result[f"dgst_t_{method}_gate_per_layer"] = torch.stack(
+                record["gates"][method], dim=0
+            ).detach().to(device="cpu", dtype=torch.float16)
+            result[f"dgst_t_{method}_risk_sqrt_hpre_per_layer"] = torch.tensor(
+                risk_series[method], dtype=torch.float32
+            )
+            result[
+                f"dgst_t_{method}_target_cosine_topk32_hpre_per_layer"
+            ] = torch.tensor(record["cosines"][method], dtype=torch.float32)
+            result[f"dgst_t_{method}_ev_topk32_hpre_per_layer"] = torch.tensor(
+                record["ev"][method], dtype=torch.float32
+            )
+        results.append(result)
+    return results
+
+
+@torch.inference_mode()
+def build_compact_four_gate_layer_capture(
+    *,
+    output_layer: Any,
+    capture: dict[str, Any],
+    visual_start: int,
+    visual_end: int,
+    target_token_ids: Sequence[int],
+    prediction_positions: Sequence[int],
+    semantic_chunk_size: int = 64,
+    tau: float = 0.07,
+    enabled_methods: Sequence[str] | None = None,
+) -> dict[str, torch.Tensor | None]:
+    """Reduce one hook capture to the eight active four-gate inputs.
+
+    ``visual_hmid`` and the two full-vocabulary chunk matrices are deliberately
+    transient.  Target raw logits and target vocabulary-softmax probabilities
+    are produced by the same projection for each of hpre/hmid, then only their
+    compact ``[T,P]`` columns survive this function.
+    """
+    from models.dgst_capture import (
+        target_logits_and_probabilities_multi,
+        target_logits_multi,
+    )
+
+    methods = _normalize_four_gate_methods(enabled_methods)
+
+    h_prev = capture["h_prev"][0]
+    h_mid = capture["h_mid"][0]
+    o_ffn = capture["o_ffn"][0]
+    attention_weights = capture["attn_weights"]
+    sequence_length = int(h_prev.shape[0])
+    if int(visual_start) < 0 or int(visual_end) > sequence_length:
+        raise ValueError(
+            "Visual support range is outside the captured sequence: "
+            f"[{visual_start}, {visual_end}) vs {sequence_length}."
+        )
+    positions = [int(value) for value in prediction_positions]
+    if any(value < 0 or value >= sequence_length for value in positions):
+        raise ValueError("A prediction position is outside the captured sequence.")
+    visual_index = torch.arange(
+        int(visual_start), int(visual_end), dtype=torch.long, device=h_prev.device
+    )
+    position_index = torch.tensor(positions, dtype=torch.long, device=h_prev.device)
+    visual_hpre = h_prev.index_select(0, visual_index).float()
+    visual_hmid = h_mid.index_select(0, visual_index).float()
+
+    hpre_raw = hpre_prob = hmid_raw = hmid_prob = None
+    needs_hpre_raw = "hpre_raw_logit_gauss" in methods
+    needs_hpre_prob = "hpre_softmax_prob_gauss" in methods
+    needs_hmid_raw = "hmid_raw_logit_gauss" in methods
+    needs_hmid_prob = "hmid_softmax_prob_gauss" in methods
+
+    if needs_hpre_prob:
+        hpre_raw_projected, hpre_prob = target_logits_and_probabilities_multi(
+            output_layer=output_layer,
+            states=visual_hpre,
+            target_token_ids=target_token_ids,
+            chunk_size=int(semantic_chunk_size),
+        )
+        if needs_hpre_raw:
+            hpre_raw = hpre_raw_projected
+        else:
+            del hpre_raw_projected
+    elif needs_hpre_raw:
+        hpre_raw = target_logits_multi(
+            output_layer=output_layer,
+            states=visual_hpre,
+            target_token_ids=target_token_ids,
+            chunk_size=int(semantic_chunk_size),
+        )
+
+    if needs_hmid_prob:
+        hmid_raw_projected, hmid_prob = target_logits_and_probabilities_multi(
+            output_layer=output_layer,
+            states=visual_hmid,
+            target_token_ids=target_token_ids,
+            chunk_size=int(semantic_chunk_size),
+        )
+        if needs_hmid_raw:
+            hmid_raw = hmid_raw_projected
+        else:
+            del hmid_raw_projected
+    elif needs_hmid_raw:
+        hmid_raw = target_logits_multi(
+            output_layer=output_layer,
+            states=visual_hmid,
+            target_token_ids=target_token_ids,
+            chunk_size=int(semantic_chunk_size),
+        )
+    attention_support = torch.stack(
+        [
+            _renormalize(
+                attention_weights[
+                    0, :, position, int(visual_start) : int(visual_end)
+                ].float().mean(dim=0)
+            )
+            for position in positions
+        ],
+        dim=0,
+    )
+    source_dist = torch.stack(
+        [
+            _source_distribution(
+                source_update=o_ffn[position, :].float(),
+                support_states=visual_hmid,
+                tau=float(tau),
+                mode="softmax",
+            )
+            for position in positions
+        ],
+        dim=0,
+    )
+    result = {
+        "prediction_hpre": h_prev.index_select(0, position_index).float(),
+        "visual_hpre": visual_hpre,
+        "attention_support": attention_support,
+        "source_dist": source_dist,
+        "hpre_raw_target_logits": (
+            hpre_raw.transpose(0, 1).contiguous().detach()
+            if hpre_raw is not None else None
+        ),
+        "hpre_softmax_target_probs": (
+            hpre_prob.transpose(0, 1).contiguous().detach()
+            if hpre_prob is not None else None
+        ),
+        "hmid_raw_target_logits": (
+            hmid_raw.transpose(0, 1).contiguous().detach()
+            if hmid_raw is not None else None
+        ),
+        "hmid_softmax_target_probs": (
+            hmid_prob.transpose(0, 1).contiguous().detach()
+            if hmid_prob is not None else None
+        ),
+    }
+    del visual_hmid, hpre_raw, hpre_prob, hmid_raw, hmid_prob
+    return result
+
+
+def _normalize_four_gate_methods(
+    values: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if values is None:
+        return FOUR_GATE_METHODS
+    requested = [str(value).strip().lower() for value in values]
+    unknown = sorted(set(requested) - set(TARGET_COMPARISON_METHODS))
+    if unknown:
+        raise ValueError(
+            f"Unknown four-gate methods {unknown}; expected a subset of "
+            f"{list(TARGET_COMPARISON_METHODS)}."
+        )
+    selected = tuple(
+        method for method in TARGET_COMPARISON_METHODS if method in requested
+    )
+    if not selected:
+        raise ValueError("At least one four-gate method must be enabled.")
+    return selected
+
+
+def _solve_exact_emd_problem_series(
+    problem_series: dict[str, list[Any]],
+) -> dict[str, list[float]]:
+    """Solve the active-profile risks with POT EMD, ignoring solver overrides."""
+    workers = _cost_variant_emd_workers(len(problem_series))
+    if workers == 1:
+        return {
+            name: [_solve_transport_problem(problem, "emd") for problem in problems]
+            for name, problems in problem_series.items()
+        }
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dgst-four-gate-emd") as executor:
+        futures = {
+            name: executor.submit(_solve_transport_problem_batch, problems, "emd")
+            for name, problems in problem_series.items()
+        }
+        return {name: futures[name].result() for name in problem_series}
+
+
+@torch.no_grad()
+def _gaussian_mad_gate(values: torch.Tensor, *, epsilon: float) -> torch.Tensor:
+    clean = torch.nan_to_num(
+        values.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    if clean.numel() == 0:
+        return clean
+    median = clean.median()
+    mad = torch.abs(clean - median).median()
+    z = (clean - median) / (
+        float(GAUSSIAN_MAD_SCALE) * mad + max(float(epsilon), EPS)
+    )
+    return torch.sigmoid(z).detach()
+
+
+def _stable_topk_indices(values: torch.Tensor, top_k: int) -> torch.Tensor:
+    if values.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=values.device)
+    k = min(max(int(top_k), 1), int(values.numel()))
+    try:
+        return torch.argsort(values, descending=True, stable=True)[:k]
+    except TypeError:  # pragma: no cover - compatibility with older torch
+        return torch.argsort(values, descending=True)[:k]
+
+
+def _compute_gate_comparison_from_parts(
+    *,
+    source_ffn_states: Sequence[torch.Tensor],
+    source_attn_states: Sequence[torch.Tensor] | None,
+    prediction_hidden_states: Sequence[torch.Tensor],
+    support_h_prev_states: Sequence[torch.Tensor],
+    support_h_mid_states: Sequence[torch.Tensor],
+    support_attentions: Sequence[torch.Tensor],
+    semantic_probs: Sequence[torch.Tensor],
+    relative_vll_logits: Sequence[torch.Tensor],
+    support_positions: Sequence[int],
+    visual_start: int,
+    visual_end: int,
+    tau: float,
+    source_distribution_mode: str,
+    transport_top_k: int,
+    ot_solver: str,
+    atarget_visual_top_k: int,
+    relative_vll_mad_epsilon: float,
+    relative_barrier_margin: float,
+    relative_barrier_max: float,
+) -> dict[str, Any]:
+    """Compare matched VV target gates with one shared model capture.
+
+    All methods use the same source distribution, top-k union, sqrt-cosine
+    ground cost on h_pre, and h_pre target cosine.  The only changed variable
+    is target construction:
+
+    * relative_vll: raw target logits -> Gaussian-scaled MAD -> sigmoid;
+    * softmax_relative_vll: full-vocabulary target probability ->
+      Gaussian-scaled MAD -> sigmoid;
+    * legacy_prob: full-vocabulary target probability, without MAD/sigmoid.
+    """
+    if _has_prompt_support_tokens(
+        support_positions=support_positions,
+        visual_start=visual_start,
+        visual_end=visual_end,
+    ):
+        raise ValueError("gate_comparison requires visual-only (VV) support.")
+    if source_attn_states is None:
+        raise ValueError("gate_comparison requires source attention states for h_pre.")
+
+    visual_index = _support_indices_for_scope(
+        support_positions=support_positions,
+        visual_start=visual_start,
+        visual_end=visual_end,
+        scope="visual",
+        device=support_h_mid_states[0].device,
+    )
+    if visual_index.numel() == 0:
+        raise ValueError("gate_comparison requires at least one visual support token.")
+
+    risk_problems: dict[str, list[Any]] = {
+        method: [] for method in GATE_COMPARISON_METHODS
+    }
+    cosine_series: dict[str, list[float]] = {
+        method: [] for method in GATE_COMPARISON_METHODS
+    }
+    keep_on_device = _effective_ot_solver(ot_solver) == "sinkhorn"
+
+    for layer_idx in range(len(source_ffn_states)):
+        hpre_states = support_h_prev_states[layer_idx].float()
+        hmid_states = support_h_mid_states[layer_idx].float()
+        source_ffn = source_ffn_states[layer_idx].to(hmid_states.device).float()
+        source_attn = source_attn_states[layer_idx].to(hmid_states.device).float()
+        prediction_hout = prediction_hidden_states[layer_idx].to(hmid_states.device).float()
+        prediction_hpre = prediction_hout - source_ffn - source_attn
+        attention = support_attentions[layer_idx].to(hmid_states.device).float()
+        logits = relative_vll_logits[layer_idx].to(hmid_states.device).float()
+        probabilities = semantic_probs[layer_idx].to(hmid_states.device).float()
+
+        source_dist = _source_distribution(
+            source_update=source_ffn,
+            support_states=hmid_states,
+            tau=tau,
+            mode=source_distribution_mode,
+        )
+        relative_target, _relative_gate, _relative_barrier, _relative_stats = (
+            _relative_vll_evidence_signal(
+                attention_signal=attention,
+                target_logits=logits,
+                support_positions=support_positions,
+                visual_start=visual_start,
+                visual_end=visual_end,
+                candidate_scope="visual",
+                stat_prefix="relative_vll_gauss",
+                epsilon=relative_vll_mad_epsilon,
+                barrier_margin=relative_barrier_margin,
+                barrier_max=relative_barrier_max,
+                mad_scale=GAUSSIAN_MAD_SCALE,
+            )
+        )
+        softmax_target, _softmax_gate, _softmax_barrier, _softmax_stats = (
+            _relative_vll_evidence_signal(
+                attention_signal=attention,
+                # semantic_probs contains p(w* | h_i), computed by applying
+                # softmax over the full vocabulary independently at every
+                # visual position.  MAD is then taken across visual tokens.
+                target_logits=probabilities,
+                support_positions=support_positions,
+                visual_start=visual_start,
+                visual_end=visual_end,
+                candidate_scope="visual",
+                stat_prefix="softmax_relative_vll_gauss",
+                epsilon=relative_vll_mad_epsilon,
+                barrier_margin=relative_barrier_margin,
+                barrier_max=relative_barrier_max,
+                mad_scale=GAUSSIAN_MAD_SCALE,
+            )
+        )
+
+        legacy_gate = torch.zeros_like(probabilities, dtype=torch.float32)
+        local_visual_index = visual_index.to(probabilities.device)
+        legacy_gate.index_copy_(
+            0,
+            local_visual_index,
+            torch.nan_to_num(
+                probabilities.index_select(0, local_visual_index),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0),
+        )
+        legacy_target = attention.clamp_min(0.0) * legacy_gate
+
+        targets = {
+            "relative_vll": relative_target,
+            "softmax_relative_vll": softmax_target,
+            "legacy_prob": legacy_target,
+        }
+        for method, target in targets.items():
+            target = _renormalize(target)
+            support = _topk_union_indices(source_dist, target, transport_top_k)
+            risk_problems[method].append(
+                _prepare_transport_problem_for_state_cost(
+                    source_dist=source_dist,
+                    target_dist=target,
+                    states=hpre_states,
+                    support=support,
+                    sqrt_cosine=True,
+                    keep_on_device=keep_on_device,
+                )
+            )
+            cosine_series[method].append(
+                _target_hidden_topk_visual_cosine(
+                    target_hidden=prediction_hpre.to(hpre_states.device),
+                    support_output_states=hpre_states,
+                    target_dist=target,
+                    support_positions=support_positions,
+                    visual_start=visual_start,
+                    visual_end=visual_end,
+                    top_k=atarget_visual_top_k,
+                )
+            )
+
+    risk_series = _solve_cost_variant_problem_series(
+        risk_problems,
+        ot_solver=ot_solver,
+    )
+    result: dict[str, Any] = {
+        "dgst_t_source_distribution_mode": str(source_distribution_mode),
+        "dgst_t_gate_comparison_methods": list(GATE_COMPARISON_METHODS),
+        "dgst_t_gate_comparison_cost": "sqrt_cosine_hpre",
+        "dgst_t_gate_comparison_target_cosine_state": "hpre",
+        "dgst_t_gate_comparison_softmax_axis": "vocabulary",
+        "dgst_t_gate_comparison_mad_axis": "visual_tokens",
+        "dgst_t_gate_comparison_mad_scale": float(GAUSSIAN_MAD_SCALE),
+        "dgst_t_gate_comparison_transport_top_k": int(transport_top_k),
+        "dgst_t_gate_comparison_target_cosine_top_k": int(atarget_visual_top_k),
+        "dgst_t_relative_vll_gauss_risk_sqrt_hpre_per_layer": torch.tensor(
+            risk_series["relative_vll"], dtype=torch.float32
+        ),
+        "dgst_t_softmax_relative_vll_gauss_risk_sqrt_hpre_per_layer": torch.tensor(
+            risk_series["softmax_relative_vll"], dtype=torch.float32
+        ),
+        "dgst_t_legacy_prob_risk_sqrt_hpre_per_layer": torch.tensor(
+            risk_series["legacy_prob"], dtype=torch.float32
+        ),
+        "dgst_t_relative_vll_gauss_target_visual_hpre_cosine_per_layer": torch.tensor(
+            cosine_series["relative_vll"], dtype=torch.float32
+        ),
+        "dgst_t_softmax_relative_vll_gauss_target_visual_hpre_cosine_per_layer": torch.tensor(
+            cosine_series["softmax_relative_vll"], dtype=torch.float32
+        ),
+        "dgst_t_legacy_prob_target_visual_hpre_cosine_per_layer": torch.tensor(
+            cosine_series["legacy_prob"], dtype=torch.float32
+        ),
+    }
+    return result
 
 
 def _compute_cost_variant_risks(

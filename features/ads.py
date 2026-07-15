@@ -1,7 +1,7 @@
 """Attention Dispersion Score (ADS) — mass-weighted background entropy."""
 
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -19,10 +19,18 @@ def compute_ads(
     scale_blob_area: bool = True,
     token_hidden_states: Optional[torch.Tensor] = None,
     patch_hidden_states: Optional[torch.Tensor] = None,
+    grid_shape: Optional[Tuple[int, int]] = None,
 ) -> tuple[float, torch.Tensor]:
     num_layers, num_heads, num_patches = text_to_patch_attn.shape
     attn_np = text_to_patch_attn.float().numpy()
-    grid_H, grid_W = _find_hw(num_patches)
+    if grid_shape is None:
+        grid_H, grid_W = _find_hw(num_patches)
+    else:
+        grid_H, grid_W = int(grid_shape[0]), int(grid_shape[1])
+        if grid_H <= 0 or grid_W <= 0 or grid_H * grid_W != num_patches:
+            raise ValueError(
+                f"grid_shape={grid_shape} does not match {num_patches} visual patches."
+            )
 
     k_heads = 1 if per_head_min else top_k_heads
 

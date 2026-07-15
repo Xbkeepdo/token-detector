@@ -90,10 +90,19 @@ def split_by_image_id(
     test_image_ids: Optional[set] = None,
 ) -> Tuple[List[dict], List[dict], List[dict]]:
     """Split feature list by image id to prevent leakage."""
+    if test_image_ids is None:
+        raise ValueError("Strict 8:1:1 splitting requires explicit test_image_ids.")
+    overlaps = {
+        "train/val": set(train_image_ids) & set(val_image_ids),
+        "train/test": set(train_image_ids) & set(test_image_ids),
+        "val/test": set(val_image_ids) & set(test_image_ids),
+    }
+    bad = {name: len(values) for name, values in overlaps.items() if values}
+    if bad:
+        raise ValueError(f"Image-level train/val/test splits overlap: {bad}")
     train = [f for f in features if f["image_id"] in train_image_ids]
     val   = [f for f in features if f["image_id"] in val_image_ids]
-    test  = [f for f in features if f["image_id"] in test_image_ids] \
-            if test_image_ids else val
+    test  = [f for f in features if f["image_id"] in test_image_ids]
     return train, val, test
 
 
@@ -169,7 +178,22 @@ def grid_search(
     for params in ParameterGrid(param_grid):
         clf = build_classifier(clf_type, params)
         clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_val)
+        threshold = None
+        try:
+            y_prob = _positive_class_scores(clf, X_val)
+            threshold = select_decision_threshold(
+                y_val,
+                y_prob,
+                scoring="accuracy" if scoring == "accuracy" else "f1",
+            )
+            y_pred = np.where(
+                y_prob >= threshold,
+                POSITIVE_LABEL,
+                1 - POSITIVE_LABEL,
+            )
+        except Exception:
+            y_prob = None
+            y_pred = clf.predict(X_val)
 
         if scoring == "f1":
             score = f1_score(
@@ -182,7 +206,8 @@ def grid_search(
             score = accuracy_score(y_val, y_pred)
         elif scoring == "auc":
             try:
-                y_prob = _positive_class_scores(clf, X_val)
+                if y_prob is None:
+                    y_prob = _positive_class_scores(clf, X_val)
                 score = roc_auc_score(_positive_class_targets(y_val), y_prob)
             except Exception:
                 score = -1.0
@@ -193,6 +218,8 @@ def grid_search(
             best_score = score
             best_params = params
             best_clf = clf
+            if threshold is not None:
+                setattr(best_clf, "_token_detector_threshold", float(threshold))
 
     return best_clf, best_params, best_score
 
@@ -203,12 +230,18 @@ def evaluate_classifier(
     y: np.ndarray,
 ) -> Dict[str, float]:
     """Return precision, recall, F1, accuracy, and AUC."""
-    y_pred = clf.predict(X)
-
     try:
         y_prob = _positive_class_scores(clf, X)
+        threshold = float(getattr(clf, "_token_detector_threshold", 0.5))
+        y_pred = np.where(
+            y_prob >= threshold,
+            POSITIVE_LABEL,
+            1 - POSITIVE_LABEL,
+        )
         auc = roc_auc_score(_positive_class_targets(y), y_prob)
     except Exception:
+        threshold = None
+        y_pred = clf.predict(X)
         auc = float("nan")
 
     return {
@@ -223,8 +256,41 @@ def evaluate_classifier(
         ),
         "accuracy":  accuracy_score(y, y_pred),
         "auc":       auc,
+        "decision_threshold": threshold,
         "reported_positive_class": POSITIVE_CLASS_NAME,
     }
+
+
+def select_decision_threshold(
+    y_true: np.ndarray,
+    positive_scores: np.ndarray,
+    *,
+    scoring: str = "f1",
+) -> float:
+    """Select a binary decision threshold using validation rows only."""
+    labels = np.asarray(y_true, dtype=np.int32).reshape(-1)
+    scores = np.asarray(positive_scores, dtype=np.float64).reshape(-1)
+    if labels.size != scores.size or labels.size == 0:
+        raise ValueError("Threshold selection requires equally sized non-empty arrays.")
+    targets = _positive_class_targets(labels)
+    candidates = np.unique(np.concatenate(([0.0], scores, [1.0])))
+    best_threshold = 0.5
+    best_key = (-np.inf, -np.inf, -np.inf)
+    for threshold in candidates:
+        prediction = (scores >= threshold).astype(np.int32)
+        if scoring == "accuracy":
+            primary = float(accuracy_score(targets, prediction))
+            secondary = float(f1_score(targets, prediction, zero_division=0))
+        elif scoring == "f1":
+            primary = float(f1_score(targets, prediction, zero_division=0))
+            secondary = float(accuracy_score(targets, prediction))
+        else:
+            raise ValueError("Threshold scoring must be 'f1' or 'accuracy'.")
+        key = (primary, secondary, -abs(float(threshold) - 0.5))
+        if key > best_key:
+            best_key = key
+            best_threshold = float(threshold)
+    return best_threshold
 
 
 def train_and_evaluate(
@@ -274,20 +340,17 @@ def train_and_evaluate(
             f"[Train] train split has only one class {np.unique(y_train)}. "
             "Need both class 0 (hallucinated) and class 1 (real) tokens."
         )
-    if X_val.shape[0] == 0 or len(np.unique(y_val)) < 2:
-        print(
-            f"[Train] WARNING: val split has {X_val.shape[0]} samples / "
-            f"{len(np.unique(y_val))} class(es). Falling back to train split for "
-            "hyperparameter tuning — do not use these results as final numbers."
-        )
-        X_val, y_val = X_train.copy(), y_train.copy()
-    if X_test.shape[0] == 0 or len(np.unique(y_test)) < 2:
-        print(
-            f"[Train] WARNING: test split has {X_test.shape[0]} samples / "
-            f"{len(np.unique(y_test))} class(es). Falling back to val split for "
-            "final evaluation."
-        )
-        X_test, y_test = X_val.copy(), y_val.copy()
+    for split_name, matrix, labels in (
+        ("val", X_val, y_val),
+        ("test", X_test, y_test),
+    ):
+        classes = np.unique(labels)
+        if matrix.shape[0] == 0 or classes.size < 2:
+            raise ValueError(
+                f"[Train] strict 8:1:1 violation: {split_name} has "
+                f"{matrix.shape[0]} rows and classes {classes.tolist()}. "
+                "Splits are never substituted; repair labeling/image_splits.json."
+            )
 
     all_results = {}
 

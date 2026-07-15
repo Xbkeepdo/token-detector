@@ -17,8 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PIL import Image
 from tqdm import tqdm
 
-from data.coco_loader import load_coco_samples, train_val_split
+from data.coco_loader import load_coco_samples
 from utils.io_utils import load_json, save_json
+from utils.split_utils import ensure_strict_811_split
 
 _CHAIR_PATH = Path(__file__).with_name("coco_chair.py")
 _CHAIR_MODULE_NAME = "coco_chair"
@@ -51,6 +52,17 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--generation-devices", nargs="+", default=None)
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Caption instruction. Overrides the model prompt when provided.",
+    )
+    parser.add_argument(
+        "--max-pixels",
+        type=int,
+        default=None,
+        help="Optional per-image processor pixel cap; unset keeps native preprocessing.",
+    )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -63,7 +75,16 @@ def main() -> None:
 
     config = load_config(args.config)
     model_cfg = get_model_cfg(config, args.model)
+    if args.max_pixels is not None:
+        if args.max_pixels <= 0:
+            raise ValueError("--max-pixels must be a positive integer")
+        model_cfg["max_pixels"] = int(args.max_pixels)
     dataset_cfg = get_dataset_cfg(config)
+    prompt = str(
+        args.prompt
+        or model_cfg.get("prompt")
+        or "Describe this image."
+    )
     seed = args.seed if args.seed is not None else int(dataset_cfg["seed"])
     num_images = args.num_images or int(dataset_cfg["num_images"])
 
@@ -93,6 +114,7 @@ def main() -> None:
         train_ratio=float(dataset_cfg["train_ratio"]),
         seed=seed,
         resume=args.resume,
+        shared_splits_path=dataset_cfg.get("shared_split_path"),
     )
 
     evaluator = CocoChairEvaluator.from_cache(
@@ -119,6 +141,7 @@ def main() -> None:
             generations=generations,
             generations_path=generations_path,
             generation_shard_dir=generation_shard_dir,
+            prompt=prompt,
         )
 
     labeling: dict[str, dict] = {}
@@ -160,22 +183,31 @@ def _load_or_create_splits(
     train_ratio: float,
     seed: int,
     resume: bool,
+    shared_splits_path: str | os.PathLike[str] | None = None,
 ) -> dict:
-    splits_path = os.path.join(output_dir, "image_splits.json")
-    if resume and os.path.exists(splits_path):
-        splits = load_json(splits_path)
-        print(
-            f"[COCO-CHAIR] Loaded existing split: "
-            f"{len(splits['train'])} train, {len(splits['val'])} val."
-        )
-        return splits
-    train_samples, val_samples = train_val_split(samples, train_ratio=train_ratio, seed=seed)
-    splits = {
-        "train": [int(sample["image_id"]) for sample in train_samples],
-        "val": [int(sample["image_id"]) for sample in val_samples],
-        "test": [int(sample["image_id"]) for sample in val_samples],
-    }
-    save_json(splits, splits_path)
+    # ``train_ratio`` and ``resume`` remain in the signature for callers of the
+    # historical helper.  The active protocol is always the leak-free 8:1:1
+    # image split, and ``ensure_strict_811_split`` safely reuses an identical
+    # split or backs up and replaces an old train/val==test split.
+    del train_ratio, resume
+    shared_path = None
+    if shared_splits_path:
+        shared_path = Path(shared_splits_path).expanduser()
+        if not shared_path.is_absolute():
+            shared_path = Path(__file__).resolve().parents[1] / shared_path
+    splits, backup_path = ensure_strict_811_split(
+        Path(output_dir) / "image_splits.json",
+        [int(sample["image_id"]) for sample in samples],
+        seed=int(seed),
+        shared_splits_path=shared_path,
+    )
+    if backup_path is not None:
+        print(f"[COCO-CHAIR] Backed up previous split to {backup_path}")
+    print(
+        "[COCO-CHAIR] Strict image split: "
+        f"{len(splits['train'])} train, {len(splits['val'])} val, "
+        f"{len(splits['test'])} test."
+    )
     return splits
 
 
@@ -187,6 +219,7 @@ def _caption_rows_from_generation(
     generations: dict,
     generations_path: str,
     generation_shard_dir: str,
+    prompt: str,
 ):
     from models import build_model
 
@@ -211,6 +244,7 @@ def _caption_rows_from_generation(
             samples=pending,
             devices=devices,
             shard_dir=generation_shard_dir,
+            prompt=prompt,
         ):
             generations[str(image_id)] = {
                 "generated_text": caption,
@@ -226,7 +260,7 @@ def _caption_rows_from_generation(
         for sample in tqdm(pending, desc="Generating"):
             image_id = int(sample["image_id"])
             image = Image.open(sample["image_path"]).convert("RGB")
-            gen_out = wrapper.generate(image)
+            gen_out = wrapper.generate(image, prompt=prompt)
             generations[str(image_id)] = {
                 "generated_text": gen_out.generated_text,
                 "response_token_ids": [int(token_id) for token_id in gen_out.response_token_ids],
@@ -243,6 +277,7 @@ def _parallel_generate(
     samples: list[dict],
     devices: list[str],
     shard_dir: str,
+    prompt: str,
 ) -> list[tuple[int, str, list[int]]]:
     os.makedirs(shard_dir, exist_ok=True)
     chunks = [[] for _ in devices]
@@ -261,6 +296,7 @@ def _parallel_generate(
                     device,
                     chunk,
                     os.path.join(shard_dir, f"worker_{worker_id}.jsonl"),
+                    prompt,
                 ),
             )
             for worker_id, (device, chunk) in enumerate(zip(devices, chunks))
@@ -278,6 +314,7 @@ def _generate_worker(
     device: str,
     samples: list[dict],
     shard_path: str,
+    prompt: str,
 ) -> list[tuple[int, str, list[int]]]:
     from models import build_model
 
@@ -288,7 +325,7 @@ def _generate_worker(
         for sample in tqdm(samples, desc=f"Generating worker {worker_id}"):
             image_id = int(sample["image_id"])
             image = Image.open(sample["image_path"]).convert("RGB")
-            gen_out = wrapper.generate(image)
+            gen_out = wrapper.generate(image, prompt=prompt)
             token_ids = [int(token_id) for token_id in gen_out.response_token_ids]
             row = (image_id, gen_out.generated_text, token_ids)
             rows.append(row)

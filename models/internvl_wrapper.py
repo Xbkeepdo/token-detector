@@ -1,23 +1,35 @@
 """InternVL-2.5 wrapper for generation and feature extraction."""
 
 from __future__ import annotations
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
 from transformers import AutoModel, AutoTokenizer
 
-from models.base_wrapper import BaseLVLMWrapper, GenerationOutput, ModelOutput
+from models.base_wrapper import (
+    AttentionRequirement,
+    BaseLVLMWrapper,
+    ExtractionRequirements,
+    GenerationOutput,
+    ModelOutput,
+    compact_response_logit_statistics,
+)
 from models.dgst_capture import (
     build_dgst_t_raw,
-    build_dgst_t_raw_batch,
+    final_normalized_hidden_slice,
     hidden_states_from_captures,
+    hidden_states_from_layer_outputs,
     pre_token_prediction_positions,
     resolve_prompt_positions,
     run_forward_with_dgst_captures,
+    run_forward_with_layer_hidden_captures,
 )
 from models.prompt_support import resolve_prompt_support_positions
-from features.dgst_t import compute_dgst_t_batch_from_captures
+from features.dgst_t import (
+    compute_dgst_t_batch_from_captures,
+    compute_four_gate_dgst_batch_from_captures,
+)
 
 IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
 IMG_START_TOKEN = "<img>"
@@ -84,8 +96,7 @@ class InternVLWrapper(BaseLVLMWrapper):
         image: Image.Image,
         prompt: Optional[str] = None,
     ) -> GenerationOutput:
-        if prompt is None:
-            prompt = "Describe this image."
+        prompt = self.resolve_prompt(prompt)
 
         pixel_values = self._preprocess_image(image)
         input_ids, img_start, img_end = self._build_input_ids_with_image(
@@ -150,17 +161,24 @@ class InternVLWrapper(BaseLVLMWrapper):
         target_token_id: Optional[int] = None,
         cfg_dgst_t: Optional[dict] = None,
         prompt: Optional[str] = None,
+        requirements: Optional[ExtractionRequirements] = None,
     ) -> ModelOutput:
-        """Build a full input sequence that mirrors what InternVL's chat"""
+        """Build InternVL's native chat input and retain requested tensors."""
+        user_prompt = self.resolve_prompt(prompt)
+        requirements_were_explicit = requirements is not None
+        requirements = self.resolve_extraction_requirements(
+            requirements,
+            dgst_enabled=cfg_dgst_t is not None,
+        )
         pixel_values = self._preprocess_image(image)
 
         prompt_input_ids, _, _ = self._build_input_ids_with_image(
-            pixel_values, prefix_token_ids=[], user_prompt=prompt
+            pixel_values, prefix_token_ids=[], user_prompt=user_prompt
         )
         prompt_tokenized_length = int(prompt_input_ids.shape[1])
 
         input_ids, img_start, img_end = self._build_input_ids_with_image(
-            pixel_values, prefix_token_ids, user_prompt=prompt
+            pixel_values, prefix_token_ids, user_prompt=user_prompt
         )
 
         attention_mask = torch.ones_like(input_ids)
@@ -169,70 +187,185 @@ class InternVLWrapper(BaseLVLMWrapper):
             pixel_values.shape[0], dtype=torch.long, device=self.device
         )
 
-        out, captures = run_forward_with_dgst_captures(
-            self.model,
-            input_ids=input_ids.to(self.device),
-            attention_mask=attention_mask.to(self.device),
-            pixel_values=pixel_values.to(self.device),
-            image_flags=image_flags,
-        )
+        forward_inputs = {
+            "input_ids": input_ids.to(self.device),
+            "attention_mask": attention_mask.to(self.device),
+            "pixel_values": pixel_values.to(self.device),
+            "image_flags": image_flags,
+        }
+        use_dgst = bool(requirements.dgst_capture and cfg_dgst_t is not None)
+        layer_outputs = None
+        if use_dgst:
+            out, captures = run_forward_with_dgst_captures(
+                self.model,
+                output_hidden_states=False,
+                retain_attention_updates=not _is_four_gate_mode(cfg_dgst_t),
+                **forward_inputs,
+            )
+        elif requirements.needs_hidden_states:
+            captures = None
+            out, layer_outputs = run_forward_with_layer_hidden_captures(
+                self.model,
+                output_attentions=requirements.needs_attention_weights,
+                capture_all_layers=(
+                    requirements.token_hidden_states
+                    or requirements.patch_hidden_states
+                ),
+                **forward_inputs,
+            )
+        else:
+            captures = None
+            with torch.no_grad():
+                out = self.model(
+                    **forward_inputs,
+                    output_attentions=requirements.needs_attention_weights,
+                    output_hidden_states=requirements.needs_hidden_states,
+                    return_dict=True,
+                    use_cache=False,
+                )
 
-        seq_len = out.attentions[0].shape[-1]
-        text_to_patch_attn, text_to_text_attn = _extract_attention_features(
-            out.attentions, img_start, img_end, seq_len
+        seq_len = int(out.logits.shape[1])
+        compact_profile = _is_compact_profile(cfg_dgst_t)
+        keep_attention = (
+            (not compact_profile or requirements_were_explicit)
+            and requirements.attention is not AttentionRequirement.NONE
         )
-        token_hidden_states, patch_hidden_states = _extract_hidden_states(
-            out.hidden_states, img_start, img_end
+        keep_hidden = (not compact_profile or requirements_were_explicit) and (
+            requirements.token_hidden_states or requirements.patch_hidden_states
         )
+        if keep_attention:
+            _require_attentions(out, model_name="InternVL")
+            text_to_patch_attn, text_to_text_attn = _extract_attention_features(
+                out.attentions, img_start, img_end, seq_len
+            )
+            if requirements.attention is AttentionRequirement.HEAD_MEAN:
+                text_to_patch_attn = text_to_patch_attn.mean(dim=1, keepdim=True)
+                text_to_text_attn = text_to_text_attn.mean(dim=1, keepdim=True)
+        else:
+            text_to_patch_attn = torch.empty(0)
+            text_to_text_attn = torch.empty(0)
+        text_to_patch_attn = text_to_patch_attn.cpu()
+        text_to_text_attn = text_to_text_attn.cpu()
+        out.attentions = None
 
-        pred_token_id = out.logits[0, -1].argmax().item()
+        if keep_hidden:
+            if captures is not None:
+                token_hidden_states, patch_hidden_states = hidden_states_from_captures(
+                    captures,
+                    token_position=seq_len - 1,
+                    visual_start=img_start,
+                    visual_end=img_end,
+                )
+            elif layer_outputs is not None:
+                token_hidden_states, patch_hidden_states = hidden_states_from_layer_outputs(
+                    layer_outputs,
+                    token_position=seq_len - 1,
+                    visual_start=img_start,
+                    visual_end=img_end,
+                )
+            elif out.hidden_states is not None:
+                token_hidden_states, patch_hidden_states = _extract_hidden_states(
+                    out.hidden_states, img_start, img_end
+                )
+            else:
+                raise RuntimeError("InternVL hidden states were requested but not returned.")
+            if not requirements.token_hidden_states:
+                token_hidden_states = torch.empty(0, device=patch_hidden_states.device)
+            if not requirements.patch_hidden_states:
+                patch_hidden_states = torch.empty(0, device=token_hidden_states.device)
+        else:
+            token_hidden_states = torch.empty(0)
+            patch_hidden_states = torch.empty(0)
+        token_hidden_states = token_hidden_states.cpu()
+        patch_hidden_states = patch_hidden_states.cpu()
+
+        response_hidden = None
+        if requirements.response_hidden_states:
+            response_hidden = final_normalized_hidden_slice(
+                model=self.model,
+                out=out,
+                dgst_captures=captures,
+                layer_outputs=layer_outputs,
+                start=prompt_tokenized_length,
+                end=prompt_tokenized_length + len(prefix_token_ids),
+            ).cpu()
+
+        pred_token_id = int(out.logits[0, -1].argmax().item())
         pred_token_str = self.tokenizer.decode([pred_token_id], skip_special_tokens=False)
-        last_logits = out.logits[0, -1].float().cpu()
+        last_logits = out.logits[0, -1].float().cpu() if requirements.logits else None
+        out.logits = None
         dgst_target_id = int(target_token_id) if target_token_id is not None else int(pred_token_id)
-        prompt_positions_override = resolve_prompt_support_positions(
-            tokenizer=self.tokenizer,
-            full_input_ids=input_ids[0].tolist(),
-            prompt_tokenized_length=prompt_tokenized_length,
-            image_token_id=int(self._img_ctx_id),
-            visual_start=img_start,
-            visual_end=img_end,
-            cfg_dgst_t=cfg_dgst_t,
-            model_name="InternVL",
-        )
-        dgst_t_raw = build_dgst_t_raw(
-            model=self.model,
-            full_input_ids=input_ids[0].tolist(),
-            prompt_tokenized_length=prompt_tokenized_length,
-            captures=captures,
-            visual_start=img_start,
-            visual_end=img_end,
-            image_token_id=int(self._img_ctx_id),
-            target_token_id=dgst_target_id,
-            prediction_position=seq_len - 1,
-            support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
-            semantic_chunk_size=(
-                int(cfg_dgst_t.get("semantic_chunk_size", 64))
-                if cfg_dgst_t is not None
-                else 64
-            ),
-            relative_vll_logit_source=(
-                cfg_dgst_t.get("relative_vll_logit_source", "h_mid")
-                if cfg_dgst_t is not None
-                else "h_mid"
-            ),
-            prompt_positions_override=prompt_positions_override,
-        )
+        dgst_t_raw = None
+        dgst_t_result = None
+        if use_dgst:
+            prompt_positions_override = resolve_prompt_support_positions(
+                tokenizer=self.tokenizer,
+                full_input_ids=input_ids[0].tolist(),
+                prompt_tokenized_length=prompt_tokenized_length,
+                image_token_id=int(self._img_ctx_id),
+                visual_start=img_start,
+                visual_end=img_end,
+                cfg_dgst_t=cfg_dgst_t,
+                model_name="InternVL",
+            )
+            if _is_four_gate_mode(cfg_dgst_t):
+                dgst_t_result = compute_four_gate_dgst_batch_from_captures(
+                    model=self.model,
+                    captures=captures,
+                    visual_start=img_start,
+                    visual_end=img_end,
+                    target_token_ids=[dgst_target_id],
+                    prediction_positions=[seq_len - 1],
+                    semantic_chunk_size=int(cfg_dgst_t.get("semantic_chunk_size", 64)),
+                    tau=float(cfg_dgst_t.get("tau", 0.07)),
+                    transport_top_k=int(cfg_dgst_t.get("transport_top_k", 64)),
+                    target_region_top_k=int(cfg_dgst_t.get("atarget_visual_top_k", 32)),
+                    mad_epsilon=float(cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6)),
+                    enabled_methods=cfg_dgst_t.get("four_gate_methods"),
+                    release_layer_captures=True,
+                )[0]
+            else:
+                dgst_t_raw = build_dgst_t_raw(
+                    model=self.model,
+                    full_input_ids=input_ids[0].tolist(),
+                    prompt_tokenized_length=prompt_tokenized_length,
+                    captures=captures,
+                    visual_start=img_start,
+                    visual_end=img_end,
+                    image_token_id=int(self._img_ctx_id),
+                    target_token_id=dgst_target_id,
+                    prediction_position=seq_len - 1,
+                    support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+                    semantic_chunk_size=int(cfg_dgst_t.get("semantic_chunk_size", 64)),
+                    relative_vll_logit_source=cfg_dgst_t.get(
+                        "relative_vll_logit_source", "h_mid"
+                    ),
+                    prompt_positions_override=prompt_positions_override,
+                )
 
         return ModelOutput(
             token_id=pred_token_id,
             token_str=pred_token_str,
-            text_to_patch_attn=text_to_patch_attn.cpu(),
-            text_to_text_attn=text_to_text_attn.cpu(),
-            token_hidden_states=token_hidden_states.cpu(),
-            patch_hidden_states=patch_hidden_states.cpu(),
+            text_to_patch_attn=text_to_patch_attn,
+            text_to_text_attn=text_to_text_attn,
+            token_hidden_states=token_hidden_states,
+            patch_hidden_states=patch_hidden_states,
             response_token_idx=response_token_idx,
             token_logits=last_logits,
             dgst_t_raw=dgst_t_raw,
+            dgst_t_result=dgst_t_result,
+            visual_grid=(
+                _square_visual_grid(img_end - img_start)
+                if requirements.visual_layout
+                else None
+            ),
+            response_hidden_states=response_hidden,
+            baseline_capture={
+                "prediction_position": seq_len - 1,
+                "visual_start": int(img_start),
+                "visual_end": int(img_end),
+                "attention_requirement": requirements.attention.value,
+            },
         )
 
     def extract_token_features_batch(
@@ -243,6 +376,7 @@ class InternVLWrapper(BaseLVLMWrapper):
         target_token_ids: Optional[Sequence[int]] = None,
         cfg_dgst_t: Optional[dict] = None,
         prompt: Optional[str] = None,
+        requirements: Optional[ExtractionRequirements] = None,
     ) -> List[ModelOutput]:
         requested_indices = [int(index) for index in response_token_indices]
         if not requested_indices:
@@ -253,18 +387,26 @@ class InternVLWrapper(BaseLVLMWrapper):
             if target_token_ids is not None
             else [response_ids[index] for index in requested_indices]
         )
+        if len(targets) != len(requested_indices):
+            raise ValueError("target_token_ids must match response_token_indices.")
+        requirements_were_explicit = requirements is not None
+        requirements = self.resolve_extraction_requirements(
+            requirements,
+            dgst_enabled=cfg_dgst_t is not None,
+        )
+        user_prompt = self.resolve_prompt(prompt)
 
         pixel_values = self._preprocess_image(image)
         prompt_input_ids, _, _ = self._build_input_ids_with_image(
             pixel_values,
             prefix_token_ids=[],
-            user_prompt=prompt,
+            user_prompt=user_prompt,
         )
         prompt_tokenized_length = int(prompt_input_ids.shape[1])
         input_ids, img_start, img_end = self._build_input_ids_with_image(
             pixel_values,
             prefix_token_ids=response_ids,
-            user_prompt=prompt,
+            user_prompt=user_prompt,
         )
         attention_mask = torch.ones_like(input_ids)
         image_flags = torch.ones(
@@ -273,34 +415,50 @@ class InternVLWrapper(BaseLVLMWrapper):
             device=self.device,
         )
 
-        out, captures = run_forward_with_dgst_captures(
-            self.model,
-            output_hidden_states=False,
-            input_ids=input_ids.to(self.device),
-            attention_mask=attention_mask.to(self.device),
-            pixel_values=pixel_values.to(self.device),
-            image_flags=image_flags,
-        )
-        if out.attentions is None or len(out.attentions) == 0 or out.attentions[0] is None:
-            raise RuntimeError("DGST-T batch extraction requires attention weights; use eager attention.")
+        forward_inputs = {
+            "input_ids": input_ids.to(self.device),
+            "attention_mask": attention_mask.to(self.device),
+            "pixel_values": pixel_values.to(self.device),
+            "image_flags": image_flags,
+        }
+        use_dgst = bool(requirements.dgst_capture and cfg_dgst_t is not None)
+        layer_outputs = None
+        if use_dgst:
+            out, captures = run_forward_with_dgst_captures(
+                self.model,
+                output_hidden_states=False,
+                retain_attention_updates=not _is_four_gate_mode(cfg_dgst_t),
+                **forward_inputs,
+            )
+        elif requirements.needs_hidden_states:
+            captures = None
+            out, layer_outputs = run_forward_with_layer_hidden_captures(
+                self.model,
+                output_attentions=requirements.needs_attention_weights,
+                capture_all_layers=(
+                    requirements.token_hidden_states
+                    or requirements.patch_hidden_states
+                ),
+                **forward_inputs,
+            )
+        else:
+            captures = None
+            with torch.no_grad():
+                out = self.model(
+                    **forward_inputs,
+                    output_attentions=requirements.needs_attention_weights,
+                    output_hidden_states=requirements.needs_hidden_states,
+                    return_dict=True,
+                    use_cache=False,
+                )
 
-        seq_len = int(out.attentions[0].shape[-1])
+        seq_len = int(out.logits.shape[1])
         full_prompt_positions = resolve_prompt_positions(
             full_input_ids=input_ids[0].tolist(),
             prompt_tokenized_length=prompt_tokenized_length,
             image_token_id=int(self._img_ctx_id),
             visual_start=img_start,
             visual_end=img_end,
-        )
-        support_prompt_positions = resolve_prompt_support_positions(
-            tokenizer=self.tokenizer,
-            full_input_ids=input_ids[0].tolist(),
-            prompt_tokenized_length=prompt_tokenized_length,
-            image_token_id=int(self._img_ctx_id),
-            visual_start=img_start,
-            visual_end=img_end,
-            cfg_dgst_t=cfg_dgst_t,
-            model_name="InternVL",
         )
         prediction_positions = pre_token_prediction_positions(
             full_input_ids=input_ids[0].tolist(),
@@ -310,21 +468,78 @@ class InternVLWrapper(BaseLVLMWrapper):
             visual_token_count=int(img_end - img_start),
             prompt_positions=full_prompt_positions,
         )
-        compact_costvariant = bool(
-            cfg_dgst_t is not None
-            and cfg_dgst_t.get("feature_output_profile") == "costvariant_vv"
+        compact_profile = _is_compact_profile(cfg_dgst_t)
+        keep_attention = (
+            (not compact_profile or requirements_were_explicit)
+            and requirements.attention is not AttentionRequirement.NONE
         )
-        position_logits = [
-            out.logits[0, int(position)].float().cpu()
-            for position in prediction_positions
-        ]
-        if compact_costvariant:
-            del out
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        keep_hidden = (not compact_profile or requirements_were_explicit) and (
+            requirements.token_hidden_states or requirements.patch_hidden_states
+        )
+        if keep_attention:
+            _require_attentions(out, model_name="InternVL")
+        if requirements.logits:
+            position_logits: list[Optional[torch.Tensor]] = [
+                out.logits[0, int(position)].float().cpu()
+                for position in prediction_positions
+            ]
+            position_pred_ids = [int(logits.argmax().item()) for logits in position_logits]
+        else:
+            position_logits = [None] * len(prediction_positions)
+            position_pred_ids = [
+                int(out.logits[0, int(position)].argmax().item())
+                for position in prediction_positions
+            ]
+
+        shared_response_hidden = None
+        shared_baseline_capture: dict[str, Any] = {
+            "visual_start": int(img_start),
+            "visual_end": int(img_end),
+            "attention_requirement": requirements.attention.value,
+        }
+        if requirements.response_hidden_states:
+            shared_response_hidden = final_normalized_hidden_slice(
+                model=self.model,
+                out=out,
+                dgst_captures=captures,
+                layer_outputs=layer_outputs,
+                start=prompt_tokenized_length,
+                end=prompt_tokenized_length + len(response_ids),
+            ).cpu()
+            response_positions = torch.arange(
+                prompt_tokenized_length - 1,
+                prompt_tokenized_length - 1 + len(response_ids),
+                dtype=torch.long,
+                device=out.logits.device,
+            )
+            response_logits = (
+                out.logits[0].index_select(0, response_positions)
+                if response_ids
+                else torch.empty((0, int(out.logits.shape[-1])), device=out.logits.device)
+            )
+            shared_baseline_capture.update(
+                compact_response_logit_statistics(
+                    response_logits,
+                    response_token_ids=response_ids,
+                )
+            )
+            del response_logits
+        out.logits = None
+        if not keep_attention:
+            out.attentions = None
+
         dgst_results = None
-        dgst_raws = None
-        if cfg_dgst_t is not None:
+        if use_dgst:
+            support_prompt_positions = resolve_prompt_support_positions(
+                tokenizer=self.tokenizer,
+                full_input_ids=input_ids[0].tolist(),
+                prompt_tokenized_length=prompt_tokenized_length,
+                image_token_id=int(self._img_ctx_id),
+                visual_start=img_start,
+                visual_end=img_end,
+                cfg_dgst_t=cfg_dgst_t,
+                model_name="InternVL",
+            )
             dgst_results = compute_dgst_t_batch_from_captures(
                 model=self.model,
                 full_input_ids=input_ids[0].tolist(),
@@ -378,22 +593,8 @@ class InternVLWrapper(BaseLVLMWrapper):
                     "dgst_t_dual_scope",
                     cfg_dgst_t.get("compute_dual_scope", False),
                 ),
-            )
-        else:
-            dgst_raws = build_dgst_t_raw_batch(
-                model=self.model,
-                full_input_ids=input_ids[0].tolist(),
-                prompt_tokenized_length=prompt_tokenized_length,
-                captures=captures,
-                visual_start=img_start,
-                visual_end=img_end,
-                image_token_id=int(self._img_ctx_id),
-                target_token_ids=targets,
-                prediction_positions=prediction_positions,
-                support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
-                semantic_chunk_size=64,
-                relative_vll_logit_source="h_mid",
-                prompt_positions_override=support_prompt_positions,
+                four_gate_methods=cfg_dgst_t.get("four_gate_methods"),
+                release_layer_captures=(not keep_attention and not keep_hidden),
             )
 
         outputs: List[ModelOutput] = []
@@ -401,12 +602,7 @@ class InternVLWrapper(BaseLVLMWrapper):
             requested_indices,
             prediction_positions,
         )):
-            if compact_costvariant:
-                text_to_patch_attn = torch.empty(0)
-                text_to_text_attn = torch.empty(0)
-                token_hidden_states = torch.empty(0)
-                patch_hidden_states = torch.empty(0)
-            else:
+            if keep_attention:
                 text_to_patch_attn, text_to_text_attn = _extract_attention_features_at_position(
                     out.attentions,
                     img_start,
@@ -414,14 +610,45 @@ class InternVLWrapper(BaseLVLMWrapper):
                     seq_len,
                     int(prediction_position),
                 )
-                token_hidden_states, patch_hidden_states = hidden_states_from_captures(
-                    captures,
-                    token_position=int(prediction_position),
-                    visual_start=img_start,
-                    visual_end=img_end,
-                )
+                if requirements.attention is AttentionRequirement.HEAD_MEAN:
+                    text_to_patch_attn = text_to_patch_attn.mean(dim=1, keepdim=True)
+                    text_to_text_attn = text_to_text_attn.mean(dim=1, keepdim=True)
+            else:
+                text_to_patch_attn = torch.empty(0)
+                text_to_text_attn = torch.empty(0)
+            if keep_hidden:
+                if captures is not None:
+                    token_hidden_states, patch_hidden_states = hidden_states_from_captures(
+                        captures,
+                        token_position=int(prediction_position),
+                        visual_start=img_start,
+                        visual_end=img_end,
+                    )
+                elif layer_outputs is not None:
+                    token_hidden_states, patch_hidden_states = hidden_states_from_layer_outputs(
+                        layer_outputs,
+                        token_position=int(prediction_position),
+                        visual_start=img_start,
+                        visual_end=img_end,
+                    )
+                elif out.hidden_states is not None:
+                    token_hidden_states, patch_hidden_states = _extract_hidden_states_at_position(
+                        out.hidden_states,
+                        img_start,
+                        img_end,
+                        int(prediction_position),
+                    )
+                else:
+                    raise RuntimeError("InternVL hidden states were requested but not returned.")
+                if not requirements.token_hidden_states:
+                    token_hidden_states = torch.empty(0, device=patch_hidden_states.device)
+                if not requirements.patch_hidden_states:
+                    patch_hidden_states = torch.empty(0, device=token_hidden_states.device)
+            else:
+                token_hidden_states = torch.empty(0)
+                patch_hidden_states = torch.empty(0)
             logits = position_logits[offset]
-            pred_token_id = int(logits.argmax().item())
+            pred_token_id = position_pred_ids[offset]
             pred_token_str = self.tokenizer.decode([pred_token_id], skip_special_tokens=False)
             outputs.append(
                 ModelOutput(
@@ -433,10 +660,25 @@ class InternVLWrapper(BaseLVLMWrapper):
                     patch_hidden_states=patch_hidden_states.cpu(),
                     response_token_idx=int(response_index),
                     token_logits=logits,
-                    dgst_t_raw=dgst_raws[offset] if dgst_raws is not None else None,
+                    dgst_t_raw=None,
                     dgst_t_result=dgst_results[offset] if dgst_results is not None else None,
+                    visual_grid=(
+                        _square_visual_grid(img_end - img_start)
+                        if requirements.visual_layout
+                        else None
+                    ),
+                    response_hidden_states=shared_response_hidden,
+                    baseline_capture={
+                        **shared_baseline_capture,
+                        "prediction_position": int(prediction_position),
+                    },
                 )
             )
+        out.attentions = None
+        if compact_profile and not requirements_were_explicit:
+            del out
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return outputs
 
 
@@ -542,6 +784,19 @@ def _extract_hidden_states(
     return torch.stack(token_list, 0), torch.stack(patch_list, 0)
 
 
+def _extract_hidden_states_at_position(
+    hidden_states: tuple,
+    img_start: int,
+    img_end: int,
+    token_position: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    token_list, patch_list = [], []
+    for hs in hidden_states[1:]:
+        token_list.append(hs[0, int(token_position), :])
+        patch_list.append(hs[0, img_start:img_end, :])
+    return torch.stack(token_list, 0), torch.stack(patch_list, 0)
+
+
 def _as_token_id_list(token_id_or_ids) -> list[int]:
     if token_id_or_ids is None:
         return []
@@ -576,3 +831,35 @@ def _extract_attention_features_at_position(
         torch.stack(patch_layers, dim=0),
         torch.stack(text_layers, dim=0),
     )
+
+
+def _is_compact_profile(cfg_dgst_t: Optional[dict]) -> bool:
+    return bool(
+        cfg_dgst_t is not None
+        and cfg_dgst_t.get("feature_output_profile")
+        in {"costvariant_vv", "gate_comparison_vv", "four_gate_vv"}
+    )
+
+
+def _is_four_gate_mode(cfg_dgst_t: Optional[dict]) -> bool:
+    return bool(
+        cfg_dgst_t is not None
+        and str(cfg_dgst_t.get("target_gate_mode", "")).strip().lower()
+        in {"four_gate", "four_gates", "four_gate_vv", "four_branch"}
+    )
+
+
+def _require_attentions(out: Any, *, model_name: str) -> None:
+    attentions = getattr(out, "attentions", None)
+    if attentions is None or len(attentions) == 0 or attentions[0] is None:
+        raise RuntimeError(
+            f"{model_name} attention features were requested but no attention "
+            "weights were returned; load the model with eager attention."
+        )
+
+
+def _square_visual_grid(visual_token_count: int) -> Optional[Tuple[int, int]]:
+    side = int(round(int(visual_token_count) ** 0.5))
+    if side * side != int(visual_token_count):
+        return None
+    return side, side

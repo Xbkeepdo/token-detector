@@ -1,5 +1,28 @@
 # Current Task
 
+## 2026-07-15 四分支 DGST、baseline 与统一流水线
+
+- Active DGST profile is now the compact four-gate path: hpre/hmid raw target logits and vocabulary-softmax probabilities each share one chunked vocabulary projection, then independently produce Gaussian-MAD gate, exact-EMD sqrt-hpre risk, top-32 hpre target cosine, and EV. Only the eight compact capture inputs and final matrices/curves survive; full vocabulary matrices and decoder captures are released promptly.
+- All five wrappers accept the shared prompt and automatic `ExtractionRequirements`. Qwen2.5/Qwen3/OneVision use sequential object-prefix extraction, while LLaVA1.5/InternVL reuse a full-caption forward. Qwen3 DeepStack residual reconstruction was corrected, and all/standalone hidden/attention parity was verified exactly.
+- The active YAML keeps the original processor preprocessing and contains no `max_pixels`. `run.sh` exposes an optional runtime `MAX_PIXELS` override and passes it consistently to generation/extraction. On the largest sampled COCO image (P=529), uncapped four-branch method-only extraction OOMed on a 32 GiB GPU, while a single uncapped branch passed at about 17.6/18.4 GiB for Qwen2.5/OneVision; reducing image count alone does not lower this per-image peak.
+- Added isolated MetaToken, SVAR, DHCP, ProjectAway, and HalLoc feature/training paths under `OUTPUT/baseline/`; joint all-mode shares wrapper outputs, while baseline-only never rewrites root `features.pkl`. ProjectAway projects raw intermediate hidden states; HalLoc uses frozen pretrained CLIP ViT-B/32, pretrained VisualBERT, one object head, AdamW and cosine scheduling.
+- `run.sh` directly orchestrates the historical three stages (generation+labeling, feature extraction, train+eval). Model/output/devices/prompt/stage/mode choices remain shell variables; YAML keeps experiment definitions. To fit uncapped Qwen3 on 32 GiB, the safe default is `method_only` plus `hpre_raw_logit_gauss`; `DGST_BRANCHES=""` explicitly selects all four. Modes are `all`, `method_only`, `ads_cgc_only`, and `baseline_only`. A sidecar manifest fingerprints generation/root/baseline inputs, and pre-manifest outputs require one explicit `ADOPT_LEGACY_ARTIFACTS=true` registration before resume.
+- Strict shared seed-42 image splits are 3200/400/400, mutually exclusive across train/val/test and across models. Train fits only, val selects checkpoints/thresholds, and test is final evaluation only; replaced legacy splits are backed up.
+- Validation: full compile, 54 unit tests, four-mode dry-runs, five real wrapper smokes, three dynamic-model maximum-image smokes, and final read-only integration audit all passed. Known protocol limits are explicit: DHCP is the cross-backbone object-step/fixed-grid adaptation, and labels use local CHAIR object spans without the paper's GPT-4o semantic review.
+
+## 2026-07-15 COCO100 softmax-relative-vll / legacy_prob 三模型实验
+- 新增 `gate_comparison` / `gate_comparison_vv` 匹配对比路径。三种 target gate 共享 VV source、exact EMD、top-k union=64 与 `sqrt((1-cos(h_pre))/2)` ground cost；target cosine 统一使用 h_pre、top-k=32，relative logit source 为 h_mid。
+- `relative-vll` 对各视觉 token 的目标词 raw logit 跨视觉 token 做 median/MAD；`softmax-relative-vll` 先在每个视觉 token 的 vocabulary 维 softmax、取目标词概率，再跨视觉 token 做 median/MAD；两者均使用 `1.4826*MAD` 和 sigmoid。`legacy_prob` 使用相同目标词概率直接乘 attention，不做 MAD/sigmoid。产物元数据明确记录 `softmax_axis=vocabulary`、`mad_axis=visual_tokens`；“gauss”只描述前两种 MAD gate，legacy 本身没有 Gaussian/MAD。
+- 新增配置 `configs/model_configs_coco100_gate_comparison.yaml`、入口 `scripts/run_coco100_gate_comparison.py`、单模型与三模型绘图脚本。runner 支持 `prepare/extract/probe_split/train/plot/summarize`、模型子集、多 devices 和 resume。
+- 从三模型 `outputs/{model}/COCO4000/labeling.json` 完全一致的 ID 顺序取 canonical 前 100 张，generation 按该顺序重排，seed=42 共享 80/10/10 split。提取完成：LLaVA 696 rows（H/N=`97/599`，99 张有效图，32 层）；InternVL 899 rows（`71/828`，99 张，32 层）；Qwen 424 rows（`32/392`，92 张，28 层）。少数图片没有可用 object-token span，因此不会产生 feature row，并非漏跑。
+- 风险曲线以 `H-N = hallucination mean - non-hallucination mean` 统计。全层 signed avg：LLaVA relative/softmax/legacy=`+0.01913/+0.01639/+0.01446`；InternVL=`-0.00110/+0.00146/-0.00518`；Qwen=`+0.01291/+0.01639/-0.00453`。对应 mean absolute gap：LLaVA=`0.02223/0.02249/0.02117`，InternVL=`0.00883/0.00745/0.01104`，Qwen=`0.02059/0.02202/0.02785`。softmax+MAD 在 Qwen 的 signed 分离略好；LLaVA 与 raw-logit MAD 接近但 signed avg 稍低；InternVL 三者分离均弱。Qwen/InternVL 的 legacy 平均方向反转；鉴于 COCO100 且 Qwen 只有 32 个 hallucination token，只解释为小样本趋势。
+- 三模型 relative 与 softmax-relative 的 H-N gap 曲线高度相关：LLaVA/InternVL/Qwen Pearson `r=0.9525/0.8997/0.9337`。三模型三方法的 h_pre target-cosine H-N 全层均值均为负：LLaVA=`-0.05375/-0.05446/-0.06388`，InternVL=`-0.02360/-0.02544/-0.02185`，Qwen=`-0.03501/-0.03369/-0.02857`。
+- 已补做标准 Torch MLP probe：三种 gate 各训练 risk-only、对应 h_pre target-cosine-only、同 gate risk+cosine concat，共 9 个 feature sets；架构 `128/64/32`、dropout=0.3、batch=256、100 epochs、positive class=real，probe seeds=`42/43/44`，按最低 validation loss 选 checkpoint。`scripts/train_feature_sets.py` 新增 6 个不与旧 relative-VLL alias 混淆的 `gate_*` blocks。
+- 原 seed=42 图像 split 的 Qwen validation 为 H/N=`0/38`，会触发训练器 train-as-validation fallback，因此没有用于 probe。另存三模型共享、同一 canonical 100 张、严格 80/10/10 的 `probe_image_splits.json`；使用 canonical 顺序的首个三模型 val/test 均双类随机 seed=1。probe train/val/test H/N：LLaVA=`81/484, 7/67, 9/48`，InternVL=`53/648, 11/108, 7/72`，Qwen=`27/303, 3/47, 2/42`，训练日志未出现 fallback、NaN 或单类告警。
+- 三 seed test AUC 最佳：LLaVA 为 softmax-relative hpre-cosine-only `0.8279+/-0.0244`；InternVL 为 relative risk+cosine `0.8783+/-0.0160`；Qwen 为 legacy hpre-cosine-only `0.7262+/-0.1146`，softmax risk+cosine 为 `0.7103+/-0.0780`。risk-only AUC（relative/softmax/legacy）：LLaVA=`0.4915/0.5802/0.5633`，InternVL=`0.6792/0.5589/0.5205`，Qwen=`0.4921/0.5476/0.6349`。LLaVA/InternVL 的主要信号来自 h_pre cosine 或与其拼接；risk-only 整体较弱。PR/RC/F1/AUPR 以多数类 non-hallucination 为正类，不能用高 F1 声称幻觉检测好，主比较只看 AUC。Qwen test 仅 2 个幻觉 token且来自同一张图；三个 seed 共用同一 split，std 只反映训练初始化而非抽样不确定性；汇总中的 test-AUC 排名只能作为 smoke/exploratory 结果，不能当无偏模型选择或最终性能结论。
+- 主产物位于 `outputs/{model}/COCO100-gate-comparison/`，单模型 PNG/PDF/CSV 在各自 `results/`，probe seed 产物在 `torchmlp-seed3-probe-split1-811/`；合并曲线为 `outputs/coco100-gate-comparison-summary/three_model_coco100_gate_risk_by_label.{png,pdf,csv}`，probe 汇总为同目录 `three_model_seed3_probe_split1_summary.{md,csv,json}`。首版误将 softmax 用在视觉位置维，已归档到三模型的 `COCO100-position-softmax-gate-comparison-archived/` 及 `coco100-position-softmax-gate-comparison-summary-archived/`，不作为主结果。
+- 验证：`py_compile` 覆盖修改模块、三个 wrapper、四个相关脚本和测试；`/opt/conda/private/envs/vicr/bin/python -m unittest discover -v tests` 共 12 项通过；三个 `features.pkl` 的 22 字段、label、32/32/28 层、六组 risk/cosine key、axis/cost/top-k 元数据及所有数值 finite 检查通过；9 个 probe run 均含 9 个 feature sets，PR/RC/F1/Acc/AUC/AUPR 全部 finite，模型/history/config artifacts 和 seed/维度元数据检查通过；`git diff --check` 通过；四张 PNG 已目视检查。中途首次 `py_compile` 因 `_link_input` 被补丁误插入列表推导式报 `SyntaxError: invalid syntax`，修正函数位置后相同命令及 12 项测试通过。特征提取主进程均 exit 0；多进程退出时出现一次 `resource_tracker` leaked semaphore warning，但合并产物和完整性校验均正常。系统默认 `python` 的配置加载检查曾因缺少 PyYAML 报 `ModuleNotFoundError: No module named 'yaml'`，未修改环境，随后使用已有 Conda 环境重跑通过。
+
 ## 2026-07-15 合并 `-zccocochair` 到 `cocochair`
 - 合并前先将当前 Qwen3 caption、Attention-TK32 JS/KL 与空间热力图工作提交为 `475e647` 并确认已推送到远端 `cocochair`；随后合并远端 `-zccocochair` 的 `ba9b74c`。
 - 合并仅在 `docs/CURRENT_TASK.md` 与 `scripts/train_feature_sets.py` 出现内容冲突；交接文档两侧章节全部保留。
@@ -1265,3 +1288,28 @@
 - 按用户要求将同一 Markdown 扩展为完整结果文档：新增原模型 GT/source/error/question-family 分组表，并列出六个模型/数据集下全部 231 个 feature-set 聚合结果。每项包含 seeds 42/43/44 的 Accuracy、Balanced Accuracy、Macro-F1、AUROC、hallucination/real Precision、Recall、F1 与 AUPR 的 mean +/- std。
 - 五折诊断确认：3850 个 LLaVA Yes-response 中 298 个 hallucination（7.74%）；ADS/CGC 层均值相关系数为 -0.023，跨 block 层对绝对相关均值为 0.041。
 - 重要限制：当前论文式五折按问题行划分而非按 image 分组；各折 99.5%-100% 的测试图片也存在于训练折，因此 0.703 的 ADS+CGC MLP Hall-F1 不能视为严格 image-disjoint 结果。
+
+## 2026-07-15 Beyond Global Scores baseline 子系统
+
+- 新增独立 `features/baseline/`：实现 MetaToken（LR/GB 所需 10+H 特征）、SVAR、DHCP、ProjectAway detection 与 HalLoc；根特征仍保持原 schema，baseline 产物写入各实验的 `baseline/`。
+- `BaselineRuntime` 可由联合抽取与 baseline-only 共用：自动合并 capture requirements，每张图共享一次 LVLM 输出、ProjectAway 目标 token union 投影和 HalLoc CLIP cache；DHCP 使用 float16 原子 shard，并在 `features.pkl` 提交前按图 flush，保证断点恢复不出现悬空引用。
+- MetaToken 使用 wrapper 返回的六条 compact caption statistics，不保存 `[T,V]`；ProjectAway 同时按 visual row 与 vocabulary 分块做 exact softmax denominator，不生成或持久化 `[L,P,V]`，也不复制整张 fp16/bf16 LM head 为 fp32。
+- HalLoc 使用预训练 `openai/clip-vit-base-patch32`（抽取阶段冻结并缓存）与预训练 `uclanlp/visualbert-vqa-coco-pre`，训练 text/visual projection、VisualBERT 与单 object head；存储标签仍为 `0=hallucination, 1=real`，所有 detector 显式转换为 `1=hallucination` 后训练和评估。
+- 新增 `scripts/extract_baselines.py` 与 `scripts/train_baselines.py`；训练只用 train 拟合、val 选 checkpoint/阈值、test 最终报告，并验证 image-level strict 80/10/10 split。
+- 合成单元测试覆盖精确公式、compact MetaToken 等价性、ProjectAway 双向分块 exact softmax、DHCP 保质量 resize/shard/resume、HalLoc 冻结与融合、标签方向、分类器结构、最小 capture requirements 和联合 runtime；`python -m unittest -v tests.test_baselines` 当前 11/11 通过；全仓 `unittest discover` 当前 40/40 通过。
+
+## 2026-07-16 DGST target-comparison 显存修复与 raw-attention 对照
+
+- 定位到四分支 OOM 的实际原因：hpre/hmid 的完整词表投影在启用 softmax 分支时仍处于 autograd，逐层保存 compact probability 会把 LM-head 计算图和完整词表中间量一并保留。现将 joint raw/prob 投影、target-row raw 投影和整个 compact target-comparison 路径置于 no-grad/inference-mode，并显式 detach。
+- 词表投影改为按启用分支执行：`raw_attention` 不做词表投影；raw-only 只乘目标词 unembedding；同一 state 的 raw+softmax 共用一次分块完整词表投影；hpre/hmid 未启用时完全跳过。
+- 新增 `raw_attention` 对照：target distribution 直接采用模型 post-softmax attention 的 head mean，截取视觉 key 后在视觉区域重新归一化；不使用 Gaussian gate，保存全 1 gate 仅用于矩阵 schema 对齐。它独立输出 sqrt-hpre risk、top-32 hpre target-cosine 和 EV，并写入 `dgst-target-comparison-v2` 特征 schema。
+- YAML、`scripts/extract_features.py`、pipeline 分支过滤和 probe alias 已全部支持 `raw_attention`；活动 YAML 默认不设置 `max_pixels`，需要时可直接在模型配置中显式添加。
+- 验证：全仓 `unittest discover` 59/59 通过，覆盖 ambient grad 下无计算图、按需 projection 次数、raw-attention 手算 target/top-K/cosine/EV、CLI/config/training 集成；`git diff --check` 与 `bash -n run.sh` 通过。
+- Qwen3-VL-8B 真机一图 smoke（RTX 5090，COCO 640x480，未设置 max/min pixels）：原生 `grid_thw=[1,30,40]`、合并后 P=300，四个 Gaussian 分支加 raw-attention 同时完成；所有 `[36,300]` 矩阵与 `[36]` 曲线 finite、CPU、无 grad graph。峰值 allocated/reserved 为 17.012/17.121 GiB，模型加载后的抽取增量约 0.671/0.748 GiB。
+
+## 2026-07-15 run.sh 三阶段薄入口
+
+- 参考 `token-grounding-detector/run.sh`，当前 `run.sh` 只顺序执行三条清晰命令：`generate_and_label.py`、`extract_features.py`、`train_and_eval.py`。Shell 只保留 model、output、config、device、cache 和 `--resume` 等运行参数。
+- `run.prompt`、`run.extraction_mode`、DGST branches、baseline 开关、训练器、正类方向、probe 参数和 feature sets 全部由 `configs/model_configs_unified.yaml` 管理，不再出现在 `run.sh`。
+- `extract_features.py` 根据 YAML 自动路由 `all | method_only | ads_cgc_only | baseline_only`；`train_and_eval.py` 使用同一模式和 family switches，训练根 `features.pkl` 中选定特征及独立 `baseline/` 特征。
+- 严格 8:1:1 仍由 generation/labeling 阶段建立并供所有方法共享；抽取的 `--resume` 与 baseline 目录隔离保持不变。

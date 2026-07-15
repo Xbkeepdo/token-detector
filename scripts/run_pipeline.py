@@ -1,0 +1,947 @@
+#!/usr/bin/env python3
+"""Run generation, labeling, extraction, training, and plotting from one YAML."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Iterable, Mapping, Optional, Sequence
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from utils.config_utils import (  # noqa: E402
+    VALID_DGST_BRANCHES,
+    extraction_mode_flags,
+    load_config,
+    resolve_run_config,
+)
+from utils.split_utils import ensure_strict_811_split  # noqa: E402
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the token-detector pipeline from one unified YAML config."
+    )
+    parser.add_argument("--config", default="configs/model_configs_unified.yaml")
+    parser.add_argument("--model", default=None, help="Override run.model.")
+    parser.add_argument("--output-dir", default=None, help="Override run.output_dir.")
+    parser.add_argument("--prompt", default=None, help="Override run.prompt.")
+    parser.add_argument(
+        "--extraction-mode",
+        choices=["all", "method_only", "ads_cgc_only", "baseline_only"],
+        default=None,
+    )
+    parser.add_argument(
+        "--stages",
+        nargs="+",
+        choices=["generation", "labeling", "feature_extraction", "training", "plotting"],
+        default=None,
+        help="Run only these stages, overriding run.stages.",
+    )
+    parser.add_argument("--resume", dest="resume", action="store_true", default=None)
+    parser.add_argument("--no-resume", dest="resume", action="store_false")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and print commands without creating or changing artifacts.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config_path = _repo_path(args.config)
+    config = load_config(str(config_path))
+    environ = dict(os.environ)
+    _apply_cli_overrides(environ, args)
+    run = resolve_run_config(config, environ=environ)
+    config["run"] = run
+    _apply_runtime_overrides(config, run)
+    _apply_effective_feature_switches(config, run["extraction_mode"])
+
+    output_dir = _repo_path(run["output_dir"])
+    resolved_config_path = output_dir / "resolved_pipeline_config.yaml"
+    if args.dry_run:
+        command_config_path = config_path
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if not bool(run.get("resume")):
+            _prepare_fresh_artifacts(output_dir, run, config)
+        _validate_or_write_manifest(output_dir, run, config)
+        _atomic_write_yaml(resolved_config_path, config)
+        command_config_path = resolved_config_path
+
+    print(f"[Pipeline] model={run['model']}")
+    print(f"[Pipeline] output={output_dir}")
+    print(f"[Pipeline] prompt={run['prompt']!r}")
+    print(f"[Pipeline] extraction_mode={run['extraction_mode']}")
+    print(
+        "[Pipeline] stages="
+        + ", ".join(name for name, enabled in run["stages"].items() if enabled)
+    )
+
+    generation_enabled = bool(run["stages"]["generation"])
+    labeling_enabled = bool(run["stages"]["labeling"])
+    if generation_enabled or labeling_enabled:
+        if labeling_enabled and not generation_enabled:
+            _require_complete_generations(output_dir, int(config["dataset"]["num_images"]))
+        label_command = build_label_command(
+            run=run,
+            config_path=command_config_path,
+            output_dir=output_dir,
+            force_resume=(labeling_enabled and not generation_enabled),
+        )
+        _run(label_command, dry_run=args.dry_run)
+        if generation_enabled and not labeling_enabled:
+            print(
+                "[Pipeline] NOTE: label_coco.py combines generation and labeling; "
+                "label artifacts were refreshed with generation."
+            )
+
+    needs_split = any(
+        bool(run["stages"][name])
+        for name in ("feature_extraction", "training", "plotting")
+    ) or generation_enabled or labeling_enabled
+    if needs_split and not args.dry_run:
+        image_ids = _selected_image_ids(config, output_dir)
+        expected_count = int(config["dataset"]["num_images"])
+        if len(image_ids) != expected_count:
+            raise ValueError(
+                f"Strict split requires {expected_count} selected image IDs, "
+                f"found {len(image_ids)}"
+            )
+        shared_path_value = config["dataset"].get("shared_split_path")
+        shared_path = _repo_path(shared_path_value) if shared_path_value else None
+        splits, backup = ensure_strict_811_split(
+            output_dir / "image_splits.json",
+            image_ids,
+            seed=int(config["dataset"].get("seed", 42)),
+            shared_splits_path=shared_path,
+        )
+        if backup is not None:
+            print(f"[Pipeline] Backed up previous split to {backup}")
+        print(
+            "[Pipeline] Strict image split: "
+            f"train={len(splits['train'])}, val={len(splits['val'])}, "
+            f"test={len(splits['test'])}"
+        )
+
+    flags = _effective_feature_flags(config)
+    if run["stages"]["feature_extraction"]:
+        if flags["method"] or flags["ads_cgc"]:
+            # In ``all`` mode the root extractor owns BaselineRuntime and writes
+            # OUTPUT/baseline from the same wrapper outputs.  The standalone
+            # extractor is reserved for baseline_only.
+            _run(
+                build_root_extract_command(run, command_config_path, output_dir),
+                dry_run=args.dry_run,
+            )
+        elif flags["baseline"]:
+            _run(
+                build_baseline_extract_command(run, command_config_path, output_dir),
+                dry_run=args.dry_run,
+                require_script=not args.dry_run,
+            )
+
+    if run["stages"]["training"]:
+        if flags["method"] or flags["ads_cgc"]:
+            _run(
+                build_root_train_command(config, run, command_config_path, output_dir),
+                dry_run=args.dry_run,
+            )
+        if flags["baseline"]:
+            _run(
+                build_baseline_train_command(run, command_config_path, output_dir),
+                dry_run=args.dry_run,
+                require_script=not args.dry_run,
+            )
+
+    if run["stages"]["plotting"]:
+        if not (flags["method"] or flags["ads_cgc"]):
+            print("[Pipeline] Plotting skipped: baseline_only has no root feature curves.")
+        else:
+            _run(
+                build_plot_command(config, run, output_dir),
+                dry_run=args.dry_run,
+            )
+
+    print("[Pipeline] Completed requested stages.")
+
+
+def build_label_command(
+    *,
+    run: Mapping[str, object],
+    config_path: Path,
+    output_dir: Path,
+    force_resume: bool = False,
+) -> list[str]:
+    devices = run["devices"]
+    assert isinstance(devices, Mapping)
+    command = [
+        sys.executable,
+        "coco-labeling/label_coco.py",
+        "--model",
+        str(run["model"]),
+        "--config",
+        str(config_path),
+        "--output-dir",
+        str(output_dir),
+        "--prompt",
+        str(run["prompt"]),
+        "--device",
+        str(devices["primary"]),
+        "--generation-devices",
+        *[str(value) for value in devices["generation"]],
+    ]
+    if run.get("chair_cache"):
+        command.extend(["--chair-cache", str(run["chair_cache"])])
+    if run.get("max_pixels") is not None:
+        command.extend(["--max-pixels", str(run["max_pixels"])])
+    if bool(run.get("resume")) or force_resume:
+        command.append("--resume")
+    return command
+
+
+def build_root_extract_command(
+    run: Mapping[str, object],
+    config_path: Path,
+    output_dir: Path,
+) -> list[str]:
+    devices = run["devices"]
+    assert isinstance(devices, Mapping)
+    command = [
+        sys.executable,
+        "scripts/extract_features.py",
+        "--model",
+        str(run["model"]),
+        "--config",
+        str(config_path),
+        "--output-dir",
+        str(output_dir),
+        "--prompt",
+        str(run["prompt"]),
+        "--extraction-mode",
+        str(run["extraction_mode"]),
+        "--device",
+        str(devices["primary"]),
+        "--feature-devices",
+        *[str(value) for value in devices["feature_extraction"]],
+    ]
+    branches = run.get("dgst_branches")
+    if branches:
+        command.extend(["--dgst-branches", *[str(value) for value in branches]])
+    if run.get("max_pixels") is not None:
+        command.extend(["--max-pixels", str(run["max_pixels"])])
+    if bool(run.get("resume")):
+        command.append("--resume")
+    return command
+
+
+def build_baseline_extract_command(
+    run: Mapping[str, object],
+    config_path: Path,
+    output_dir: Path,
+) -> list[str]:
+    devices = run["devices"]
+    assert isinstance(devices, Mapping)
+    command = [
+        sys.executable,
+        "scripts/extract_baselines.py",
+        "--model",
+        str(run["model"]),
+        "--config",
+        str(config_path),
+        "--output-dir",
+        str(output_dir),
+        "--prompt",
+        str(run["prompt"]),
+        "--device",
+        str(devices["primary"]),
+        "--feature-devices",
+        *[str(value) for value in devices["feature_extraction"]],
+    ]
+    if run.get("max_pixels") is not None:
+        command.extend(["--max-pixels", str(run["max_pixels"])])
+    if bool(run.get("resume")):
+        command.append("--resume")
+    return command
+
+
+def build_root_train_command(
+    config: Mapping[str, object],
+    run: Mapping[str, object],
+    config_path: Path,
+    output_dir: Path,
+) -> list[str]:
+    feature_sets = _feature_sets(config, run)
+    common = [
+        "--model",
+        str(run["model"]),
+        "--config",
+        str(config_path),
+        "--output-dir",
+        str(output_dir),
+        "--feature-sets",
+        *feature_sets,
+    ]
+    trainer = str(run.get("trainer", "torch_mlp"))
+    if trainer in {"torch_mlp", "torch_probe"}:
+        devices = run["devices"]
+        assert isinstance(devices, Mapping)
+        command = [
+            sys.executable,
+            "scripts/train_torch_probe_feature_sets.py",
+            *common,
+            "--device",
+            str(devices["training"]),
+            "--positive-class",
+            str(run.get("positive_class", "real")),
+        ]
+        command.extend(shlex.split(str(run.get("torch_probe_args", ""))))
+        return command
+    return [sys.executable, "scripts/train_feature_sets.py", *common]
+
+
+def build_baseline_train_command(
+    run: Mapping[str, object],
+    config_path: Path,
+    output_dir: Path,
+) -> list[str]:
+    devices = run["devices"]
+    assert isinstance(devices, Mapping)
+    return [
+        sys.executable,
+        "scripts/train_baselines.py",
+        "--model",
+        str(run["model"]),
+        "--config",
+        str(config_path),
+        "--output-dir",
+        str(output_dir),
+        "--device",
+        str(devices["training"]),
+    ]
+
+
+def build_plot_command(
+    config: Mapping[str, object],
+    run: Mapping[str, object],
+    output_dir: Path,
+) -> list[str]:
+    plotting = config.get("plotting") or {}
+    if not isinstance(plotting, Mapping) or not plotting.get("script"):
+        raise ValueError("plotting stage is enabled but plotting.script is not configured")
+    command = [
+        sys.executable,
+        str(plotting["script"]),
+        "--model",
+        str(run["model"]),
+        "--output-dir",
+        str(output_dir),
+    ]
+    features = plotting.get("features") or []
+    labels = plotting.get("labels") or []
+    if features:
+        command.extend(["--features", *[str(item) for item in features]])
+    if labels:
+        command.extend(["--labels", *[str(item) for item in labels]])
+    if plotting.get("name"):
+        command.extend(["--name", str(plotting["name"])])
+    return command
+
+
+def _feature_sets(
+    config: Mapping[str, object],
+    run: Mapping[str, object],
+) -> list[str]:
+    values = run.get("feature_sets")
+    if not values:
+        training = config.get("training") or {}
+        if isinstance(training, Mapping):
+            values = training.get("feature_sets")
+            if isinstance(values, Mapping):
+                mode = str(run.get("extraction_mode", "all"))
+                if "method" in values or "ads_cgc" in values:
+                    method_values = _enabled_method_feature_sets(
+                        config,
+                        list(values.get("method") or []),
+                    )
+                    ads_cgc_values = list(values.get("ads_cgc") or [])
+                    if mode == "method_only":
+                        values = method_values
+                    elif mode == "ads_cgc_only":
+                        values = ads_cgc_values
+                    elif mode == "all":
+                        values = [*method_values, *ads_cgc_values]
+                    else:
+                        values = values.get("default")
+                else:
+                    values = values.get(mode) or values.get("default")
+    if not values:
+        experiment = config.get("experiment") or {}
+        if isinstance(experiment, Mapping):
+            configured = experiment.get("feature_sets")
+            if isinstance(configured, Mapping):
+                values = configured.get(str(experiment.get("mode", ""))) or configured.get(
+                    "default"
+                )
+            elif isinstance(configured, list):
+                values = configured
+    if not values:
+        values = ["risk", "target_cosine", "risk+target_cosine"]
+    resolved = [str(item) for item in values]
+    if str(run.get("extraction_mode", "all")) in {"all", "method_only"}:
+        resolved = _enabled_method_feature_sets(config, resolved)
+    if not resolved:
+        raise ValueError(
+            "No trainable root feature sets remain after applying DGST branch switches."
+        )
+    return resolved
+
+
+def _enabled_method_feature_sets(
+    config: Mapping[str, object],
+    feature_sets: Sequence[object],
+) -> list[str]:
+    """Drop training blocks belonging to a disabled DGST target branch."""
+    extraction = config.get("feature_extraction") or {}
+    dgst = extraction.get("dgst_t") or {} if isinstance(extraction, Mapping) else {}
+    if not isinstance(dgst, Mapping):
+        return [str(value) for value in feature_sets]
+    known = {
+        "hpre_raw_logit_gauss",
+        "hpre_softmax_prob_gauss",
+        "hmid_raw_logit_gauss",
+        "hmid_softmax_prob_gauss",
+        "raw_attention",
+    }
+    configured = dgst.get("four_gate_methods")
+    active = (
+        {str(method) for method in configured}
+        if isinstance(configured, (list, tuple))
+        else set(known)
+    )
+    branches = dgst.get("branches") or {}
+    if isinstance(branches, Mapping):
+        active = {
+            method for method in active if bool(branches.get(method, True))
+        }
+    disabled = known - active
+    return [
+        str(value)
+        for value in feature_sets
+        if not any(
+            component.strip().startswith(f"{method}_")
+            for component in str(value).split("+")
+            for method in disabled
+        )
+    ]
+
+
+def _apply_runtime_overrides(config: dict, run: Mapping[str, object]) -> None:
+    """Apply lightweight shell overrides before fingerprinting/resolution."""
+    model = str(run["model"])
+    max_pixels = run.get("max_pixels")
+    if max_pixels is not None:
+        models = config.get("models") or {}
+        model_config = models.get(model)
+        if not isinstance(model_config, dict):
+            raise ValueError(f"Missing model config for runtime override: {model}")
+        model_config["max_pixels"] = int(max_pixels)
+
+    selected = run.get("dgst_branches")
+    if selected:
+        extraction = config.setdefault("feature_extraction", {})
+        dgst = extraction.setdefault("dgst_t", {})
+        selected_set = {str(value) for value in selected}
+        dgst["four_gate_methods"] = [
+            method for method in VALID_DGST_BRANCHES if method in selected_set
+        ]
+        dgst["branches"] = {
+            method: method in selected_set for method in VALID_DGST_BRANCHES
+        }
+
+
+def _apply_effective_feature_switches(config: dict, mode: str) -> None:
+    flags = extraction_mode_flags(mode)
+    extraction = config.setdefault("feature_extraction", {})
+    for family, enabled in flags.items():
+        section = extraction.setdefault(family, {})
+        configured = bool(section.get("enabled", True))
+        section["enabled"] = bool(enabled and configured)
+
+
+def _effective_feature_flags(config: Mapping[str, object]) -> dict[str, bool]:
+    extraction = config.get("feature_extraction") or {}
+    if not isinstance(extraction, Mapping):
+        raise ValueError("feature_extraction must be a mapping")
+    result = {}
+    for family in ("method", "ads_cgc", "baseline"):
+        section = extraction.get(family) or {}
+        if not isinstance(section, Mapping):
+            raise ValueError(f"feature_extraction.{family} must be a mapping")
+        result[family] = bool(section.get("enabled", False))
+    return result
+
+
+def _selected_image_ids(config: dict, output_dir: Path) -> list[int]:
+    expected_count = int(config["dataset"]["num_images"])
+    labeling_path = output_dir / "labeling.json"
+    if labeling_path.exists():
+        rows = _load_json(labeling_path)
+        ids = sorted(int(value) for value in rows)
+        if len(ids) == expected_count:
+            return ids
+
+    generations_path = output_dir / "generations.json"
+    if generations_path.exists():
+        rows = _load_json(generations_path)
+        ids = sorted(
+            int(image_id)
+            for image_id, row in rows.items()
+            if isinstance(row, Mapping) and row.get("generated_text")
+        )
+        if len(ids) == expected_count:
+            return ids
+
+    from data.coco_loader import load_coco_samples
+
+    dataset = config["dataset"]
+    samples = load_coco_samples(
+        images_dir=os.path.join(dataset["coco_root"], "val2014"),
+        instances_file=dataset["annotation_file"],
+        captions_file=dataset["captions_file"],
+        num_images=expected_count,
+        seed=int(dataset.get("seed", 42)),
+    )
+    return sorted(int(sample["image_id"]) for sample in samples)
+
+
+def _require_complete_generations(output_dir: Path, expected_count: int) -> None:
+    path = output_dir / "generations.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"labeling=true with generation=false requires existing {path}"
+        )
+    rows = _load_json(path)
+    complete = sum(
+        1
+        for row in rows.values()
+        if isinstance(row, Mapping) and row.get("generated_text")
+    )
+    if complete != expected_count:
+        raise ValueError(
+            "generation stage is disabled, but generations.json is incomplete: "
+            f"complete={complete}, expected={expected_count}"
+        )
+
+
+def _validate_or_write_manifest(output_dir: Path, run: dict, config: dict) -> None:
+    path = output_dir / "pipeline_manifest.json"
+    extraction = config.get("feature_extraction") or {}
+    baseline = (
+        (extraction.get("baseline") or {})
+        if isinstance(extraction, Mapping)
+        else {}
+    )
+    baseline_subdir = str(
+        baseline.get("output_subdir", "baseline")
+        if isinstance(baseline, Mapping)
+        else "baseline"
+    )
+    flags = _effective_feature_flags(config)
+    root_features_path = output_dir / "features.pkl"
+    baseline_features_path = output_dir / baseline_subdir / "features.pkl"
+    generations_path = output_dir / "generations.json"
+    labeling_path = output_dir / "labeling.json"
+    generation_artifacts_exist = generations_path.exists() or _directory_has_files(
+        output_dir / "generation_shards"
+    )
+    root_artifacts_exist = root_features_path.exists() or any(
+        output_dir.glob("features.part*.pkl")
+    )
+    baseline_dir = output_dir / baseline_subdir
+    baseline_artifacts_exist = any(
+        (
+            baseline_features_path.exists(),
+            any(baseline_dir.glob("features.part*.pkl")),
+            _directory_has_files(baseline_dir / "feature_parts"),
+            _directory_has_files(baseline_dir / "dhcp"),
+            _directory_has_files(baseline_dir / "halloc"),
+        )
+    )
+
+    previous = _load_json(path) if path.exists() else {}
+    root_hash = _root_features_config_sha256(config, run)
+    baseline_hash = _baseline_features_config_sha256(config, run)
+    # A mode that does not own one feature family must not overwrite that
+    # family's provenance.  This is what makes baseline-only genuinely
+    # isolated from the root feature file (and vice versa).
+    if not (flags["method"] or flags["ads_cgc"]):
+        root_hash = previous.get("root_features_config_sha256")
+    if not flags["baseline"]:
+        baseline_hash = previous.get("baseline_features_config_sha256")
+
+    current = {
+        "manifest_version": 2,
+        "model": str(run["model"]),
+        "prompt": str(run["prompt"]),
+        "num_images": int(config["dataset"]["num_images"]),
+        "dataset_seed": int(config["dataset"].get("seed", 42)),
+        "split_strategy": "strict_811",
+        # Informational only.  It is deliberately not a global resume key:
+        # method_only and baseline_only can safely populate the same output in
+        # separate invocations.
+        "last_extraction_mode": str(run["extraction_mode"]),
+        "chair_cache": str(run.get("chair_cache") or ""),
+        "generation_config_sha256": _generation_config_sha256(config, run),
+        "labeling_config_sha256": _labeling_config_sha256(config, run),
+        "root_features_config_sha256": root_hash,
+        "baseline_features_config_sha256": baseline_hash,
+    }
+    has_reusable_artifacts = (
+        labeling_path.exists()
+        or generation_artifacts_exist
+        or root_artifacts_exist
+        or baseline_artifacts_exist
+    )
+    if not path.exists() and has_reusable_artifacts:
+        if not bool(run.get("adopt_legacy_artifacts", False)):
+            raise ValueError(
+                "Existing artifacts have no pipeline_manifest.json, so their "
+                "model/prompt/feature configuration cannot be verified. Set "
+                "ADOPT_LEGACY_ARTIFACTS=true in run.sh (or "
+                "run.adopt_legacy_artifacts=true in the coordinator) once to "
+                "trust and register them, or use a new output_dir."
+            )
+        print(
+            "[Pipeline] WARNING: adopting legacy artifacts without a prior "
+            "manifest; subsequent resume runs will be fingerprint-checked."
+        )
+
+    if path.exists() and has_reusable_artifacts:
+        checks: dict[str, str | None] = {}
+        if generation_artifacts_exist:
+            checks["generation_config_sha256"] = current[
+                "generation_config_sha256"
+            ]
+        if labeling_path.exists():
+            checks["labeling_config_sha256"] = current[
+                "labeling_config_sha256"
+            ]
+        if root_artifacts_exist and (flags["method"] or flags["ads_cgc"]):
+            checks["root_features_config_sha256"] = current[
+                "root_features_config_sha256"
+            ]
+        if baseline_artifacts_exist and flags["baseline"]:
+            checks["baseline_features_config_sha256"] = current[
+                "baseline_features_config_sha256"
+            ]
+
+        # Upgrade the short-lived v1 manifest without weakening normal checks.
+        # Existing artifacts can be adopted only through the same explicit
+        # opt-in used for pre-manifest runs.
+        missing_family_keys = [
+            key
+            for key in checks
+            if key.endswith("features_config_sha256") and not previous.get(key)
+        ]
+        if missing_family_keys:
+            old_hash_matches = previous.get("artifact_config_sha256") == (
+                _artifact_config_sha256(config, run)
+            )
+            if not old_hash_matches and not bool(
+                run.get("adopt_legacy_artifacts", False)
+            ):
+                raise ValueError(
+                    "Existing feature artifacts use a legacy manifest without "
+                    "independent root/baseline fingerprints. Set "
+                    "ADOPT_LEGACY_ARTIFACTS=true in run.sh (or "
+                    "run.adopt_legacy_artifacts=true in the coordinator) once "
+                    "to register them, or use a new output_dir."
+                )
+            for key in missing_family_keys:
+                previous[key] = checks[key]
+            print(
+                "[Pipeline] WARNING: upgraded legacy feature provenance to "
+                "independent root/baseline fingerprints."
+            )
+
+        mismatches = {
+            key: (previous.get(key), value)
+            for key, value in checks.items()
+            if previous.get(key) != value
+        }
+        if mismatches:
+            action = "resume" if bool(run.get("resume")) else "reuse"
+            raise ValueError(
+                f"Refusing to {action} incompatible retained artifacts: "
+                f"{mismatches}. Re-run the stage that produces those "
+                "artifacts, or use a new output_dir."
+            )
+    _atomic_write_json(path, current)
+
+
+def _artifact_config_sha256(config: Mapping[str, object], run: Mapping[str, object]) -> str:
+    """Legacy v1 aggregate fingerprint (kept only for manifest migration)."""
+    models = config.get("models") or {}
+    model_key = str(run["model"])
+    payload = {
+        "model": model_key,
+        "model_config": models.get(model_key) if isinstance(models, Mapping) else None,
+        "prompt": str(run["prompt"]),
+        "chair_cache": str(run.get("chair_cache") or ""),
+        "extraction_mode": str(run["extraction_mode"]),
+        "feature_extraction": config.get("feature_extraction"),
+        "baselines": config.get("baselines"),
+        "dataset": config.get("dataset"),
+    }
+    return _stable_sha256(payload)
+
+
+def _root_features_config_sha256(
+    config: Mapping[str, object],
+    run: Mapping[str, object],
+) -> str:
+    """Fingerprint only inputs that change the root ``features.pkl``."""
+    extraction = config.get("feature_extraction") or {}
+    if not isinstance(extraction, Mapping):
+        extraction = {}
+    return _stable_sha256(
+        {
+            "labeling_config_sha256": _labeling_config_sha256(config, run),
+            "experiment": config.get("experiment"),
+            "method": extraction.get("method"),
+            "ads_cgc": extraction.get("ads_cgc"),
+            "dgst_t": extraction.get("dgst_t"),
+            "ads": extraction.get("ads"),
+            "cgc": extraction.get("cgc"),
+        }
+    )
+
+
+def _baseline_features_config_sha256(
+    config: Mapping[str, object],
+    run: Mapping[str, object],
+) -> str:
+    """Fingerprint only inputs that change ``baseline/features.pkl``."""
+    extraction = config.get("feature_extraction") or {}
+    if not isinstance(extraction, Mapping):
+        extraction = {}
+    return _stable_sha256(
+        {
+            "labeling_config_sha256": _labeling_config_sha256(config, run),
+            "baseline": extraction.get("baseline"),
+            # Older configs used a top-level section; runtime merges both.
+            "baselines": config.get("baselines"),
+        }
+    )
+
+
+def _generation_config_sha256(
+    config: Mapping[str, object],
+    run: Mapping[str, object],
+) -> str:
+    models = config.get("models") or {}
+    model_key = str(run["model"])
+    return _stable_sha256(
+        {
+            "model": model_key,
+            "model_config": (
+                models.get(model_key) if isinstance(models, Mapping) else None
+            ),
+            "prompt": str(run["prompt"]),
+            "dataset": config.get("dataset"),
+        }
+    )
+
+
+def _labeling_config_sha256(
+    config: Mapping[str, object],
+    run: Mapping[str, object],
+) -> str:
+    return _stable_sha256(
+        {
+            "generation_config_sha256": _generation_config_sha256(config, run),
+            "chair_cache": str(run.get("chair_cache") or ""),
+        }
+    )
+
+
+def _stable_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _prepare_fresh_artifacts(
+    output_dir: Path,
+    run: Mapping[str, object],
+    config: Mapping[str, object],
+) -> None:
+    """Honor --no-resume by removing only artifacts in requested stages."""
+    stages = run["stages"]
+    assert isinstance(stages, Mapping)
+    if bool(stages.get("generation")):
+        _remove_paths(
+            output_dir / "generations.json",
+            output_dir / "labeling.json",
+            output_dir / "generation_shards",
+        )
+    elif bool(stages.get("labeling")):
+        _remove_paths(output_dir / "labeling.json")
+
+    flags = _effective_feature_flags(config)
+    if bool(stages.get("feature_extraction")):
+        if flags["method"] or flags["ads_cgc"]:
+            _remove_paths(output_dir / "features.pkl")
+            for path in output_dir.glob("features.part*.pkl"):
+                _remove_paths(path)
+        if flags["baseline"]:
+            extraction = config.get("feature_extraction") or {}
+            baseline = extraction.get("baseline") or {} if isinstance(extraction, Mapping) else {}
+            subdir = str(
+                baseline.get("output_subdir", "baseline")
+                if isinstance(baseline, Mapping)
+                else "baseline"
+            )
+            baseline_dir = output_dir / subdir
+            _remove_paths(
+                baseline_dir / "features.pkl",
+                baseline_dir / "feature_parts",
+                baseline_dir / "dhcp",
+                baseline_dir / "halloc",
+            )
+            for path in baseline_dir.glob("features.part*.pkl"):
+                _remove_paths(path)
+
+    if bool(stages.get("training")):
+        if flags["method"] or flags["ads_cgc"]:
+            _remove_paths(output_dir / "results")
+        if flags["baseline"]:
+            extraction = config.get("feature_extraction") or {}
+            baseline = extraction.get("baseline") or {} if isinstance(extraction, Mapping) else {}
+            subdir = str(
+                baseline.get("output_subdir", "baseline")
+                if isinstance(baseline, Mapping)
+                else "baseline"
+            )
+            _remove_paths(output_dir / subdir / "results")
+            _remove_paths(output_dir / subdir / "checkpoints")
+
+
+def _remove_paths(*paths: Path) -> None:
+    for path in paths:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _directory_has_files(path: Path) -> bool:
+    """Return true for a non-empty shard/cache directory, not an empty shell."""
+    return path.is_dir() and any(candidate.is_file() for candidate in path.rglob("*"))
+
+
+def _apply_cli_overrides(environ: dict[str, str], args: argparse.Namespace) -> None:
+    overrides = {
+        "MODEL": args.model,
+        "OUTPUT": args.output_dir,
+        "PROMPT": args.prompt,
+        "EXTRACTION_MODE": args.extraction_mode,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            environ[key] = str(value)
+    if args.resume is not None:
+        environ["RESUME"] = "true" if args.resume else "false"
+    if args.stages is not None:
+        environ["STAGES"] = " ".join(args.stages)
+
+
+def _run(
+    command: Sequence[str],
+    *,
+    dry_run: bool,
+    require_script: bool = False,
+) -> None:
+    if require_script and len(command) > 1:
+        script_path = _repo_path(command[1])
+        if not script_path.exists():
+            raise FileNotFoundError(
+                f"Configured pipeline stage is not installed yet: {script_path}"
+            )
+    print("[Pipeline] $ " + shlex.join([str(item) for item in command]))
+    if not dry_run:
+        subprocess.run([str(item) for item in command], check=True, cwd=str(REPO_ROOT))
+
+
+def _repo_path(value: object) -> Path:
+    path = Path(str(value)).expanduser()
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _atomic_write_yaml(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(value, handle, sort_keys=False, allow_unicode=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _atomic_write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    return value
+
+
+if __name__ == "__main__":
+    main()
