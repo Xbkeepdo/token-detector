@@ -15,6 +15,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 from PIL import Image
+import torch
 
 from models.base_wrapper import ExtractionRequirements, ModelOutput
 from models.dgst_capture import resolve_output_embedding_layer
@@ -203,14 +204,15 @@ class BaselineRuntime:
             relative /= f"{int(image_id)}.npz"
             _atomic_npz(
                 self.baseline_dir / relative,
+                # NumPy cannot represent torch.bfloat16. Qwen-family wrappers
+                # return caption hidden states in bf16, so cast on the torch
+                # side before crossing the NumPy boundary.
                 lvlm_embeddings=response_hidden.detach()
-                .cpu()
-                .numpy()
-                .astype(np.float16),
+                .to(device="cpu", dtype=torch.float16)
+                .numpy(),
                 clip_visual_features=clip_features.detach()
-                .cpu()
-                .numpy()
-                .astype(np.float16),
+                .to(device="cpu", dtype=torch.float16)
+                .numpy(),
             )
             halloc_cache_file = str(relative)
 

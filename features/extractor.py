@@ -5,6 +5,7 @@ import os
 from typing import Dict, List, Optional
 
 import numpy as np
+import torch
 from tqdm import tqdm
 from PIL import Image
 
@@ -890,7 +891,13 @@ def _build_four_gate_feature_record(
 
 def _compact_numpy(value, *, dtype):
     if hasattr(value, "detach"):
-        value = value.detach().cpu().numpy()
+        value = value.detach().cpu()
+        # NumPy cannot consume torch.bfloat16 directly. DGST outputs normally
+        # already use fp16/fp32, but keep serialization safe for wrapper-native
+        # bf16 tensors as well.
+        if value.dtype == torch.bfloat16:
+            value = value.float()
+        value = value.numpy()
     return np.asarray(value, dtype=dtype)
 
 

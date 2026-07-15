@@ -78,7 +78,11 @@ class BaselineFeatureTests(unittest.TestCase):
         }
         attention = torch.full((2, 2, 4), 0.125)
         patch_hidden = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3) / 10
-        response_hidden = torch.arange(15, dtype=torch.float32).reshape(3, 5)
+        # Qwen-family wrappers expose response hidden states as bfloat16.
+        # The runtime must cast before NumPy serialization.
+        response_hidden = torch.arange(15, dtype=torch.float32).reshape(3, 5).to(
+            torch.bfloat16
+        )
         outputs = [
             ModelOutput(
                 token_id=response_ids[index],
@@ -142,6 +146,16 @@ class BaselineFeatureTests(unittest.TestCase):
                         )
                     )
                 )
+                with np.load(
+                    os.path.join(
+                        directory, record["baselines"]["halloc"]["cache_file"]
+                    )
+                ) as cache:
+                    self.assertEqual(cache["lvlm_embeddings"].dtype, np.float16)
+                    np.testing.assert_allclose(
+                        cache["lvlm_embeddings"],
+                        response_hidden.float().numpy(),
+                    )
             reader = DHCPShardReader(os.path.join(directory, "dhcp", "shards"))
             item = reader.load(
                 records[0]["baselines"]["dhcp"]["shard_reference"]

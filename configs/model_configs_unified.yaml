@@ -134,8 +134,8 @@ feature_extraction:
     projectaway:
       detection_only: true
     halloc:
-      clip_model: "openai/clip-vit-base-patch32"          # Pretrained CLIP ViT-B/32.
-      visualbert_model: "uclanlp/visualbert-vqa-coco-pre" # Pretrained VisualBERT.
+      clip_model: "/home/apulis-dev/userdata/models/clip-vit-base-patch32"          # Local pretrained CLIP ViT-B/32.
+      visualbert_model: "/home/apulis-dev/userdata/models/visualbert-vqa-coco-pre" # Local pretrained VisualBERT.
       freeze_clip: true
       learning_rate: 1.0e-6
       weight_decay: 1.0e-2

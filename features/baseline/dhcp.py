@@ -272,7 +272,8 @@ def _validated_grid(grid: Sequence[int], *, name: str) -> tuple[int, int]:
 
 def _as_float16_array(value: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
     if torch.is_tensor(value):
-        value = value.detach().cpu().numpy()
+        # Cast before NumPy conversion because NumPy has no bfloat16 dtype.
+        value = value.detach().to(device="cpu", dtype=torch.float16).numpy()
     array = np.asarray(value)
     if array.size == 0 or not np.isfinite(array).all():
         raise ValueError("DHCP tensor is empty or contains non-finite values")

@@ -246,13 +246,11 @@ def compute_baseline_record(
         ):
             payload = {
                 "lvlm_embeddings": model_out.response_hidden_states.detach()
-                .cpu()
-                .numpy()
-                .astype(np.float16),
+                .to(device="cpu", dtype=torch.float16)
+                .numpy(),
                 "clip_visual_features": context.clip_visual_features.detach()
-                .cpu()
-                .numpy()
-                .astype(np.float16),
+                .to(device="cpu", dtype=torch.float16)
+                .numpy(),
                 "object_index": object_index,
             }
         else:
