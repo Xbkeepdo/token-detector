@@ -84,6 +84,20 @@ def main() -> None:
     if args.num_images is not None:
         samples = samples[: int(args.num_images)]
     generations = _load_generations(output_dir)
+    labeled_sample_count = len(samples)
+    samples = [
+        sample
+        for sample in samples
+        if _has_extractable_object_spans(
+            labeling[int(sample["image_id"])],
+            generations.get(int(sample["image_id"])),
+        )
+    ]
+    skipped = labeled_sample_count - len(samples)
+    print(
+        f"[BaselineExtract] Using {len(samples)} extractable labeled images"
+        + (f" ({skipped} have no valid object-token span)." if skipped else ".")
+    )
     devices = args.feature_devices or [args.device]
     output_path = baseline_dir / "features.pkl"
     if output_path.exists() and not args.resume:
@@ -91,6 +105,26 @@ def main() -> None:
             f"Baseline feature file already exists: {output_path}. "
             "Use --resume to reuse it."
         )
+    if args.resume:
+        parts_dir = baseline_dir / "feature_parts"
+        part_paths = sorted(parts_dir.glob("worker_*.pkl"))
+        done = _done_image_ids([output_path, *part_paths])
+        pending = [
+            sample
+            for sample in samples
+            if int(sample["image_id"]) not in done
+        ]
+        if not pending:
+            print(
+                "[BaselineExtract] Resume — baseline features already cover "
+                f"all {len(samples)} extractable images; skipping model loading."
+            )
+            return
+        print(
+            f"[BaselineExtract] Resume — {len(samples) - len(pending)} images "
+            f"complete, {len(pending)} pending."
+        )
+        samples = pending
     if len(devices) == 1:
         _extract_worker(
             worker_id=0,
@@ -151,8 +185,9 @@ def _parallel_extract(
                 "Baseline worker parts already exist; use --resume: "
                 + ", ".join(existing_parts)
             )
-    done = _done_image_ids([output_path, *part_paths]) if resume else set()
-    pending = [sample for sample in samples if int(sample["image_id"]) not in done]
+    pending = samples
+    if not pending:
+        return
     chunks = [[] for _ in devices]
     for index, sample in enumerate(pending):
         chunks[index % len(devices)].append(sample)
@@ -311,6 +346,27 @@ def _done_image_ids(paths) -> set[int]:
         if os.path.exists(path):
             done.update(int(row["image_id"]) for row in load_pkl(str(path)))
     return done
+
+
+def _has_extractable_object_spans(label_info: dict, generation=None) -> bool:
+    if not isinstance(label_info, dict) or not label_info.get("generated_text"):
+        return False
+    response_ids = []
+    if isinstance(generation, dict):
+        response_ids = generation.get("response_token_ids") or []
+    response_length = len(response_ids)
+    for span in label_info.get("object_token_spans") or []:
+        if not isinstance(span, dict):
+            continue
+        token_indices = span.get("token_indices") or []
+        if not token_indices:
+            continue
+        if response_length and not all(
+            0 <= int(index) < response_length for index in token_indices
+        ):
+            continue
+        return True
+    return False
 
 
 def _merge_parts(output_path: Path, part_paths: Sequence[Path], *, resume: bool) -> None:

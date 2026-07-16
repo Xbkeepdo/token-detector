@@ -1,5 +1,14 @@
 # Current Task
 
+## 2026-07-16 run.sh 阶段级 resume 修复
+
+- `coco-labeling/label_coco.py` 现在会核对当前 4000 image IDs、generation caption 与完整 labeling schema；全部一致时直接跳过 tokenizer/model、CHAIR evaluator 和逐图 labeling，不再每次重算 `labeling.json`。
+- 只有主 `generations.json` 不完整时才扫描 generation shards；正常完整续跑不会重复合并 4000 条 shard。
+- 联合特征抽取与 baseline-only 抽取都会先排除无 object-token span 或 token index 越界、因此不可能产生特征的图片；这些图片不再永久显示为 pending。
+- `--resume` 会在加载 LVLM、CLIP/VisualBERT 或启动多 GPU worker 之前检查 root/baseline 已完成 image IDs；全部可提取图片均覆盖时直接退出特征阶段。
+- 当前 Qwen3 `COCO4000-512` 实测：4000 条 generation/labeling 直接复用；3948 张可提取图片的 root+baseline 特征全部覆盖，52 张无有效 object-token span 被正确排除，特征阶段未加载模型。
+- 新增 `tests/test_stage_resume.py`，覆盖完整 labeling、caption 不一致、空/越界 span 及 root+baseline 交集续跑；与 extraction mode 测试共 10 项通过。
+
 ## 2026-07-16 fj01 服务器统一配置同步
 
 - 将 `configs/model_configs_server_fj01.yaml` 从旧的 COCO4000 visual-prompt/cost-variant 配置升级为当前 `model_configs_unified.yaml` 的服务器路径镜像。

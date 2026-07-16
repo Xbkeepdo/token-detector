@@ -117,18 +117,46 @@ def main() -> None:
         shared_splits_path=dataset_cfg.get("shared_split_path"),
     )
 
+    generations_path = os.path.join(args.output_dir, "generations.json")
+    labeling_path = os.path.join(args.output_dir, "labeling.json")
+    generation_shard_dir = os.path.join(args.output_dir, "generation_shards")
+    generations = load_json(generations_path) if args.resume and os.path.exists(generations_path) else {}
+    existing_labeling = (
+        load_json(labeling_path)
+        if args.resume and os.path.exists(labeling_path)
+        else {}
+    )
+    can_resume_labels = args.resume and args.caption_file is None
+    if can_resume_labels and _reuse_complete_labeling(
+        samples=selected_samples,
+        generations=generations,
+        labeling=existing_labeling,
+        generations_path=generations_path,
+        summary_path=os.path.join(args.output_dir, "chair_summary.json"),
+    ):
+        return
+    if args.resume:
+        _merge_generation_shards(generations, generation_shard_dir)
+    if can_resume_labels and _reuse_complete_labeling(
+        samples=selected_samples,
+        generations=generations,
+        labeling=existing_labeling,
+        generations_path=generations_path,
+        summary_path=os.path.join(args.output_dir, "chair_summary.json"),
+        persist_generations=True,
+    ):
+        return
+    if args.resume and existing_labeling:
+        print(
+            "[COCO-CHAIR] Existing labeling is incomplete or does not match "
+            "the current generations; rebuilding labels."
+        )
+
     evaluator = CocoChairEvaluator.from_cache(
         instances_file=dataset_cfg["annotation_file"],
         captions_file=dataset_cfg.get("captions_file"),
         cache_path=args.chair_cache or os.path.join(args.output_dir, "chair.pkl"),
     )
-
-    generations_path = os.path.join(args.output_dir, "generations.json")
-    labeling_path = os.path.join(args.output_dir, "labeling.json")
-    generation_shard_dir = os.path.join(args.output_dir, "generation_shards")
-    generations = load_json(generations_path) if args.resume and os.path.exists(generations_path) else {}
-    if args.resume:
-        _merge_generation_shards(generations, generation_shard_dir)
 
     if args.caption_file:
         print(f"[COCO-CHAIR] Loading tokenizer for {model_cfg['hf_name']}")
@@ -378,6 +406,74 @@ def _all_generations_available(samples: list[dict], generations: dict) -> bool:
         generations.get(str(int(sample["image_id"])), {}).get("generated_text")
         for sample in samples
     )
+
+
+def _all_labeling_available(
+    samples: list[dict],
+    generations: dict,
+    labeling: dict,
+) -> bool:
+    """Return whether resume can safely skip the entire labeling stage."""
+    expected_ids = {str(int(sample["image_id"])) for sample in samples}
+    if not expected_ids or set(labeling) != expected_ids:
+        return False
+    if not _all_generations_available(samples, generations):
+        return False
+
+    required_keys = {
+        "image_id",
+        "generated_text",
+        "hallucinated_words",
+        "real_words",
+        "object_token_spans",
+        "chair_s",
+        "chair_i",
+    }
+    for image_id in expected_ids:
+        generation = generations.get(image_id)
+        label = labeling.get(image_id)
+        if not isinstance(generation, dict) or not isinstance(label, dict):
+            return False
+        if not required_keys.issubset(label):
+            return False
+        if int(label.get("image_id", -1)) != int(image_id):
+            return False
+        if str(label.get("generated_text", "")) != str(
+            generation.get("generated_text", "")
+        ):
+            return False
+        if not isinstance(label.get("object_token_spans"), list):
+            return False
+        if not isinstance(label.get("hallucinated_words"), list):
+            return False
+        if not isinstance(label.get("real_words"), list):
+            return False
+    return True
+
+
+def _reuse_complete_labeling(
+    *,
+    samples: list[dict],
+    generations: dict,
+    labeling: dict,
+    generations_path: str,
+    summary_path: str,
+    persist_generations: bool = False,
+) -> bool:
+    if not _all_labeling_available(samples, generations, labeling):
+        return False
+    if persist_generations:
+        # A previous process may have exited after writing worker shards but
+        # before merging them into generations.json.
+        save_json(generations, generations_path)
+    if not os.path.exists(summary_path):
+        save_json(chair_summary(labeling), summary_path)
+    print(
+        "[COCO-CHAIR] Resume — all "
+        f"{len(samples)} generations and labels already exist; "
+        "skipping model/tokenizer loading and CHAIR labeling."
+    )
+    return True
 
 
 def _rows_from_generations(samples: list[dict], generations: dict) -> list[dict]:

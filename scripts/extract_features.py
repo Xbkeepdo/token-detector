@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import glob
 import os
 import sys
 from typing import Optional
@@ -151,10 +152,61 @@ def main():
     samples = [sample for sample in samples if int(sample["image_id"]) in labeled_ids]
     if args.num_images is not None and args.num_images < len(samples):
         samples = samples[:args.num_images]
-    print(f"[Extract] Using {len(samples)} labeled COCO samples.")
+    generations_path = os.path.join(args.output_dir, "generations.json")
+    raw_generations = (
+        load_json(generations_path) if os.path.exists(generations_path) else {}
+    )
+    generation_results = {int(key): value for key, value in raw_generations.items()}
+    labeled_sample_count = len(samples)
+    samples = [
+        sample
+        for sample in samples
+        if _has_extractable_object_spans(
+            labeling_results[int(sample["image_id"])],
+            generation_results.get(int(sample["image_id"])),
+        )
+    ]
+    skipped = labeled_sample_count - len(samples)
+    print(
+        f"[Extract] Using {len(samples)} extractable labeled COCO samples"
+        + (f" ({skipped} have no valid object-token span)." if skipped else ".")
+    )
 
     output_path = os.path.join(args.output_dir, "features.pkl")
     devices = args.feature_devices or [args.device]
+    if args.resume:
+        root_part_paths = sorted(
+            glob.glob(os.path.join(args.output_dir, "features.part*.pkl"))
+        )
+        baseline_output_path = None
+        baseline_part_paths = []
+        if baseline_enabled:
+            baseline_dir = os.path.join(args.output_dir, baseline_subdir)
+            baseline_output_path = os.path.join(baseline_dir, "features.pkl")
+            baseline_part_paths = sorted(
+                glob.glob(os.path.join(baseline_dir, "features.part*.pkl"))
+            )
+        pending_samples, complete_count = _pending_samples_for_resume(
+            samples=samples,
+            root_output_path=output_path,
+            root_part_paths=root_part_paths,
+            baseline_output_path=baseline_output_path,
+            baseline_part_paths=baseline_part_paths,
+        )
+        if not pending_samples:
+            print(
+                "[Extract] Resume — root"
+                + (" and baseline" if baseline_enabled else "")
+                + f" features already cover all {len(samples)} extractable "
+                "images; skipping model loading."
+            )
+            return
+        print(
+            f"[Extract] Resume — {complete_count} images complete, "
+            f"{len(pending_samples)} pending."
+        )
+        samples = pending_samples
+
     if len(devices) > 1:
         print(
             f"[Extract] Running parallel feature extraction on "
@@ -286,19 +338,9 @@ def _parallel_extract(
         os.path.join(baseline_dir, f"features.part{worker_id}.pkl")
         for worker_id in range(len(devices))
     ]
-    root_done = _done_image_ids(output_path, part_paths) if resume else set()
-    if baseline_enabled and resume:
-        baseline_done = _done_image_ids(
-            baseline_output_path,
-            baseline_part_paths,
-        )
-        done_image_ids = root_done & baseline_done
-    else:
-        done_image_ids = root_done
-    pending_samples = [
-        sample for sample in samples
-        if int(sample["image_id"]) not in done_image_ids
-    ]
+    pending_samples = samples
+    if not pending_samples:
+        return
 
     chunks = [[] for _ in devices]
     for index, sample in enumerate(pending_samples):
@@ -455,6 +497,56 @@ def _done_image_ids(output_path: str, part_paths: list[str]) -> set[int]:
             if "image_id" in feat:
                 done.add(int(feat["image_id"]))
     return done
+
+
+def _pending_samples_for_resume(
+    *,
+    samples: list[dict],
+    root_output_path: str,
+    root_part_paths: list[str],
+    baseline_output_path: Optional[str] = None,
+    baseline_part_paths: Optional[list[str]] = None,
+) -> tuple[list[dict], int]:
+    root_done = _done_image_ids(root_output_path, root_part_paths)
+    if baseline_output_path is not None:
+        baseline_done = _done_image_ids(
+            baseline_output_path,
+            baseline_part_paths or [],
+        )
+        done_image_ids = root_done & baseline_done
+    else:
+        done_image_ids = root_done
+    pending = [
+        sample
+        for sample in samples
+        if int(sample["image_id"]) not in done_image_ids
+    ]
+    return pending, len(samples) - len(pending)
+
+
+def _has_extractable_object_spans(
+    label_info: dict,
+    generation: Optional[dict] = None,
+) -> bool:
+    """Ignore images that can never produce an object-token feature record."""
+    if not isinstance(label_info, dict) or not label_info.get("generated_text"):
+        return False
+    response_ids = []
+    if isinstance(generation, dict):
+        response_ids = generation.get("response_token_ids") or []
+    response_length = len(response_ids)
+    for span in label_info.get("object_token_spans") or []:
+        if not isinstance(span, dict):
+            continue
+        token_indices = span.get("token_indices") or []
+        if not token_indices:
+            continue
+        if response_length and not all(
+            0 <= int(index) < response_length for index in token_indices
+        ):
+            continue
+        return True
+    return False
 
 
 def _feature_key(feat: dict) -> tuple:
