@@ -89,17 +89,50 @@ def build_training_commands(
                     (config.get("run") or {}).get("positive_class", "real"),
                 )
             )
-            command = [
-                sys.executable,
-                "scripts/train_torch_probe_feature_sets.py",
-                *common,
-                "--device",
-                str(device),
-                "--positive-class",
-                positive_class,
-            ]
-            command.extend(_torch_probe_cli_args(training.get("torch_probe") or {}))
-            commands.append(command)
+            probe_config = training.get("torch_probe") or {}
+            seeds = _torch_probe_seeds(probe_config)
+            probe_options = _torch_probe_cli_args(probe_config)
+            for seed in seeds:
+                command = [
+                    sys.executable,
+                    "scripts/train_torch_probe_feature_sets.py",
+                    *common,
+                    "--device",
+                    str(device),
+                    "--positive-class",
+                    positive_class,
+                    *probe_options,
+                    "--seed",
+                    str(seed),
+                ]
+                if len(seeds) > 1:
+                    command.extend(["--run-name", f"seed{seed}"])
+                commands.append(command)
+            if len(seeds) > 1:
+                result_root = Path(output_dir) / "results"
+                commands.append(
+                    [
+                        sys.executable,
+                        "scripts/summarize_torch_probe_seed_runs.py",
+                        "--models",
+                        str(model),
+                        "--seeds",
+                        *[str(seed) for seed in seeds],
+                        "--run-template",
+                        str(
+                            result_root
+                            / "seed{seed}"
+                            / "{model}_selected_feature_sets.json"
+                        ),
+                        "--output-prefix",
+                        str(
+                            result_root
+                            / f"{model}_selected_feature_sets_{len(seeds)}seed_summary"
+                        ),
+                        "--title",
+                        f"{model} method + ADS/CGC {len(seeds)}-seed Torch MLP summary",
+                    ]
+                )
         elif trainer in {"sklearn", "xgb_rf"}:
             commands.append(
                 [sys.executable, "scripts/train_feature_sets.py", *common]
@@ -191,9 +224,8 @@ def _torch_probe_cli_args(config: object) -> list[str]:
         "lr_patience": "--lr-patience",
         "early_stopping_patience": "--early-stopping-patience",
         "dropout": "--dropout",
-        "seed": "--seed",
     }
-    allowed = {*scalar_options, "hidden_sizes", "paper_config"}
+    allowed = {*scalar_options, "hidden_sizes", "paper_config", "seed", "seeds"}
     unknown = sorted(set(config) - allowed)
     if unknown:
         raise ValueError(f"Unknown training.torch_probe options: {unknown}")
@@ -209,6 +241,20 @@ def _torch_probe_cli_args(config: object) -> list[str]:
     if bool(config.get("paper_config", False)):
         result.append("--paper-config")
     return result
+
+
+def _torch_probe_seeds(config: object) -> list[int]:
+    if not isinstance(config, Mapping):
+        raise ValueError("training.torch_probe must be a YAML mapping")
+    values = config.get("seeds")
+    if values is None:
+        values = [config.get("seed", 42)]
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValueError("training.torch_probe.seeds must be a non-empty list")
+    seeds = list(dict.fromkeys(int(value) for value in values))
+    if not seeds:
+        raise ValueError("At least one torch probe seed is required")
+    return seeds
 
 
 if __name__ == "__main__":

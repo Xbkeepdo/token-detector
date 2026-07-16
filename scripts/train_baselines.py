@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import random
 import sys
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -46,6 +46,15 @@ from utils.split_utils import validate_strict_811_split
 
 
 DEFAULT_METHODS = ("metatoken", "svar", "dhcp", "projectaway", "halloc")
+SUMMARY_METRICS = (
+    "accuracy",
+    "precision",
+    "recall",
+    "f1",
+    "auc",
+    "aupr",
+    "real_f1",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,11 +63,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="auto")
-    parser.add_argument(
+    seed_group = parser.add_mutually_exclusive_group()
+    seed_group.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Override feature_extraction.baseline.seed for this training run.",
+        help="Run one seed, overriding training.baseline.seeds.",
+    )
+    seed_group.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Run multiple seeds, overriding training.baseline.seeds.",
     )
     parser.add_argument(
         "--methods",
@@ -78,8 +95,7 @@ def main() -> None:
     args = parse_args()
     config = load_config(args.config)
     baseline_cfg = baseline_config(config)
-    if args.seed is not None:
-        baseline_cfg["seed"] = int(args.seed)
+    training_cfg = _baseline_training_config(config)
     baseline_dir = Path(args.output_dir) / str(
         baseline_cfg.get("output_subdir", "baseline")
     )
@@ -106,30 +122,76 @@ def main() -> None:
     methods = normalize_baseline_methods(
         args.methods
         if args.methods is not None
-        else baseline_cfg.get("methods", DEFAULT_METHODS)
+        else training_cfg.get(
+            "methods", baseline_cfg.get("methods", DEFAULT_METHODS)
+        )
     )
     if not methods:
         raise ValueError("No baseline methods selected for training")
 
+    seeds = _configured_training_seeds(args, training_cfg, baseline_cfg)
+    if args.run_name is not None and len(seeds) != 1:
+        raise ValueError("--run-name can only be used with one effective seed")
     device = _resolve_device(args.device)
+    run_outputs: list[dict[str, Any]] = []
+    run_paths: list[Path] = []
+    for seed in seeds:
+        seed_cfg = dict(baseline_cfg)
+        seed_cfg["seed"] = int(seed)
+        run_name = args.run_name
+        if run_name is None and len(seeds) > 1:
+            run_name = f"seed{seed}"
+        output, result_path = _train_one_seed(
+            model=args.model,
+            seed=int(seed),
+            methods=methods,
+            split_records=split_records,
+            image_split_counts=image_split_counts,
+            feature_path=feature_path,
+            split_path=split_path,
+            baseline_dir=baseline_dir,
+            baseline_cfg=seed_cfg,
+            device=device,
+            run_name=run_name,
+        )
+        run_outputs.append(output)
+        run_paths.append(result_path)
+
+    if bool(training_cfg.get("write_summary", True)):
+        _write_training_summaries(
+            model=args.model,
+            baseline_dir=baseline_dir,
+            outputs=run_outputs,
+            result_paths=run_paths,
+        )
+
+
+def _train_one_seed(
+    *,
+    model: str,
+    seed: int,
+    methods: Sequence[str],
+    split_records: Mapping[str, Sequence[Mapping[str, Any]]],
+    image_split_counts: Mapping[str, int],
+    feature_path: Path,
+    split_path: Path,
+    baseline_dir: Path,
+    baseline_cfg: Mapping[str, Any],
+    device: str,
+    run_name: Optional[str],
+) -> tuple[dict[str, Any], Path]:
     result_dir = baseline_dir / "results"
     checkpoint_dir = baseline_dir / "checkpoints"
-    if args.run_name is not None:
-        run_name = str(args.run_name).strip()
-        if (
-            not run_name
-            or Path(run_name).name != run_name
-            or run_name in {".", ".."}
-        ):
-            raise ValueError("--run-name must be one safe path component")
+    if run_name is not None:
+        run_name = _safe_run_name(run_name)
         result_dir = result_dir / run_name
         checkpoint_dir = checkpoint_dir / run_name
     result_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    result_path = result_dir / f"{args.model}_baselines.json"
+    result_path = result_dir / f"{model}_baselines.json"
     output: dict[str, Any] = {
-        "model": args.model,
-        "seed": int(baseline_cfg.get("seed", 42)),
+        "model": model,
+        "seed": int(seed),
         "configured_methods": list(methods),
         "feature_path": str(feature_path),
         "split_path": str(split_path),
@@ -143,7 +205,7 @@ def main() -> None:
     }
 
     for method in methods:
-        print(f"[BaselineTrain] method={method} device={device}")
+        print(f"[BaselineTrain] seed={seed} method={method} device={device}")
         if method == "metatoken":
             result = _train_metatoken(split_records, checkpoint_dir, baseline_cfg)
         elif method == "svar":
@@ -162,6 +224,312 @@ def main() -> None:
         save_json(output, str(result_path))
 
     print(f"[BaselineTrain] saved {result_path}")
+    return output, result_path
+
+
+def _baseline_training_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    training = config.get("training") or {}
+    if not isinstance(training, Mapping):
+        raise ValueError("training must be a YAML mapping")
+    baseline = training.get("baseline") or {}
+    if not isinstance(baseline, Mapping):
+        raise ValueError("training.baseline must be a YAML mapping")
+    allowed = {"methods", "seeds", "write_summary"}
+    unknown = sorted(set(baseline) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown training.baseline options: {unknown}")
+    return dict(baseline)
+
+
+def _configured_training_seeds(
+    args: argparse.Namespace,
+    training_cfg: Mapping[str, Any],
+    baseline_cfg: Mapping[str, Any],
+) -> list[int]:
+    if args.seed is not None:
+        values = [args.seed]
+    elif args.seeds is not None:
+        values = args.seeds
+    else:
+        values = training_cfg.get(
+            "seeds", [int(baseline_cfg.get("seed", 42))]
+        )
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValueError("training.baseline.seeds must be a non-empty list")
+    seeds = list(dict.fromkeys(int(value) for value in values))
+    if not seeds:
+        raise ValueError("At least one baseline training seed is required")
+    return seeds
+
+
+def _safe_run_name(value: str) -> str:
+    run_name = str(value).strip()
+    if (
+        not run_name
+        or Path(run_name).name != run_name
+        or run_name in {".", ".."}
+    ):
+        raise ValueError("--run-name must be one safe path component")
+    return run_name
+
+
+def _write_training_summaries(
+    *,
+    model: str,
+    baseline_dir: Path,
+    outputs: Sequence[Mapping[str, Any]],
+    result_paths: Sequence[Path],
+) -> None:
+    if len(outputs) != len(result_paths):
+        raise ValueError("Baseline outputs and result paths must have equal length")
+    for output, result_path in zip(outputs, result_paths):
+        summary = aggregate_baseline_outputs([output])
+        markdown_path = result_path.with_name(f"{model}_baselines_summary.md")
+        _write_baseline_markdown(
+            markdown_path,
+            summary,
+            source_paths=[result_path],
+        )
+        print(f"[BaselineTrain] saved {markdown_path}")
+
+    if len(outputs) > 1:
+        summary = aggregate_baseline_outputs(outputs)
+        result_dir = baseline_dir / "results"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{model}_baselines_{len(outputs)}seed"
+        json_path = result_dir / f"{stem}.json"
+        markdown_path = result_dir / f"{stem}_summary.md"
+        summary["seed_result_paths"] = [str(path) for path in result_paths]
+        save_json(summary, str(json_path))
+        _write_baseline_markdown(
+            markdown_path,
+            summary,
+            source_paths=result_paths,
+        )
+        print(f"[BaselineTrain] saved {json_path}")
+        print(f"[BaselineTrain] saved {markdown_path}")
+
+
+def aggregate_baseline_outputs(
+    outputs: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    if not outputs:
+        raise ValueError("At least one baseline output is required")
+    model = str(outputs[0]["model"])
+    seeds = [int(output["seed"]) for output in outputs]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"Baseline seeds must be unique, got {seeds}")
+    first_variants = _baseline_method_variants(outputs[0])
+    expected = list(first_variants)
+    for output in outputs:
+        if str(output["model"]) != model:
+            raise ValueError("Cannot aggregate baseline outputs from different models")
+        actual = list(_baseline_method_variants(output))
+        if actual != expected:
+            raise ValueError(
+                "All seeds must contain the same ordered baseline methods: "
+                f"expected {expected}, got {actual}"
+            )
+
+    rows: dict[str, Any] = {}
+    for key in expected:
+        display_name = first_variants[key][0]
+        row: dict[str, Any] = {"display_name": display_name}
+        for split in ("val", "test"):
+            seed_metrics = [
+                _headline_metrics(_baseline_method_variants(output)[key][1], split)
+                for output in outputs
+            ]
+            row[f"{split}_metrics"] = {
+                metric: _metric_statistics(
+                    [float(values[metric]) for values in seed_metrics]
+                )
+                for metric in SUMMARY_METRICS
+            }
+        rows[key] = row
+
+    return {
+        "model": model,
+        "seeds": seeds,
+        "num_seeds": len(seeds),
+        "std_definition": "population",
+        "headline_positive_class": "hallucination",
+        "stored_label_semantics": outputs[0].get("stored_label_semantics"),
+        "detector_target_semantics": outputs[0].get("detector_target_semantics"),
+        "label_protocol": outputs[0].get("label_protocol"),
+        "counts": outputs[0].get("counts"),
+        "image_split_counts": outputs[0].get("image_split_counts"),
+        "configured_methods": outputs[0].get("configured_methods"),
+        "methods": rows,
+    }
+
+
+def _baseline_method_variants(
+    output: Mapping[str, Any],
+) -> dict[str, tuple[str, Mapping[str, Any]]]:
+    variants: dict[str, tuple[str, Mapping[str, Any]]] = {}
+    methods = output.get("methods") or {}
+    if not isinstance(methods, Mapping):
+        raise ValueError("Baseline output methods must be a mapping")
+    for method, result in methods.items():
+        normalized = str(method).lower()
+        if normalized == "metatoken":
+            if not isinstance(result, Mapping):
+                raise ValueError("MetaToken result must be a mapping")
+            for classifier, classifier_result in result.items():
+                key = f"metatoken_{str(classifier).lower()}"
+                variants[key] = (
+                    f"MetaToken-{str(classifier).upper()}",
+                    classifier_result,
+                )
+        else:
+            labels = {
+                "svar": "SVAR",
+                "dhcp": "DHCP",
+                "projectaway": "ProjectAway",
+                "halloc": "HalLoc",
+            }
+            variants[normalized] = (labels.get(normalized, str(method)), result)
+    return variants
+
+
+def _headline_metrics(result: Mapping[str, Any], split: str) -> dict[str, float]:
+    metrics = result.get(f"{split}_metrics") or {}
+    hallucination = metrics.get("hallucination_positive") or {}
+    real = metrics.get("real_positive") or {}
+    return {
+        "accuracy": float(metrics["accuracy"]),
+        "precision": float(hallucination["precision"]),
+        "recall": float(hallucination["recall"]),
+        "f1": float(hallucination["f1"]),
+        "auc": float(hallucination["auc"]),
+        "aupr": float(hallucination["aupr"]),
+        "real_f1": float(real["f1"]),
+    }
+
+
+def _metric_statistics(values: Sequence[float]) -> dict[str, Any]:
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(array.mean()),
+        "std": float(array.std(ddof=0)),
+        "values": [float(value) for value in array],
+    }
+
+
+def _write_baseline_markdown(
+    path: Path,
+    summary: Mapping[str, Any],
+    *,
+    source_paths: Sequence[Path],
+) -> None:
+    seeds = [int(seed) for seed in summary["seeds"]]
+    multi_seed = len(seeds) > 1
+    counts = summary.get("counts") or {}
+    image_counts = summary.get("image_split_counts") or {}
+    methods = summary.get("methods") or {}
+    lines = [
+        f"# {summary['model']} Baseline 结果汇总",
+        "",
+        "## 实验协议",
+        "",
+        f"- 随机种子：`{', '.join(str(seed) for seed in seeds)}`。",
+        "- headline 正类：hallucination。",
+        "- 阈值只在 validation set 上选择，test set 只用于最终评估。",
+        f"- image split：train/val/test = "
+        f"{image_counts.get('train', '?')}/{image_counts.get('val', '?')}/"
+        f"{image_counts.get('test', '?')}。",
+        f"- token 样本：train/val/test = "
+        f"{counts.get('train', '?')}/{counts.get('val', '?')}/"
+        f"{counts.get('test', '?')}。",
+    ]
+    if multi_seed:
+        lines.append(
+            f"- 表中数值为 {len(seeds)} 个随机种子的总体均值 ± 总体标准差。"
+        )
+    else:
+        lines.append("- 表中数值来自单次随机种子运行，不是多 seed 平均。")
+    lines.extend(
+        [
+            "- 原始结果："
+            + "、".join(f"`{source}`" for source in source_paths)
+            + "。",
+            "",
+            "## Test 结果",
+            "",
+            "| 方法 | Accuracy | Hall. Precision | Hall. Recall | Hall. F1 | AUROC | AUPR | Real F1 |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in methods.values():
+        metrics = row["test_metrics"]
+        lines.append(
+            f"| {row['display_name']} | "
+            + " | ".join(
+                _format_summary_value(metrics[metric], multi_seed)
+                for metric in SUMMARY_METRICS
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Validation 结果",
+            "",
+            "| 方法 | Accuracy | Hall. Precision | Hall. Recall | Hall. F1 | AUROC | AUPR | Real F1 |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in methods.values():
+        metrics = row["val_metrics"]
+        lines.append(
+            f"| {row['display_name']} | "
+            + " | ".join(
+                _format_summary_value(metrics[metric], multi_seed)
+                for metric in SUMMARY_METRICS
+            )
+            + " |"
+        )
+    if multi_seed:
+        lines.extend(
+            [
+                "",
+                "## 各随机种子的 Test Hallucination F1",
+                "",
+                "| 方法 | " + " | ".join(f"seed {seed}" for seed in seeds) + " |",
+                "|---|" + "---:|" * len(seeds),
+            ]
+        )
+        for row in methods.values():
+            values = row["test_metrics"]["f1"]["values"]
+            lines.append(
+                f"| {row['display_name']} | "
+                + " | ".join(f"{float(value):.4f}" for value in values)
+                + " |"
+            )
+    if methods:
+        best = max(
+            methods.values(),
+            key=lambda row: float(row["test_metrics"]["f1"]["mean"]),
+        )
+        lines.extend(
+            [
+                "",
+                "## 简要结论",
+                "",
+                f"- Test Hallucination F1 最高的方法是 **{best['display_name']}**："
+                f"{_format_summary_value(best['test_metrics']['f1'], multi_seed)}。",
+            ]
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _format_summary_value(statistics: Mapping[str, Any], multi_seed: bool) -> str:
+    mean = float(statistics["mean"])
+    if not multi_seed:
+        return f"{mean:.4f}"
+    return f"{mean:.4f} ± {float(statistics['std']):.4f}"
 
 
 def _train_metatoken(split_records, checkpoint_dir, cfg) -> dict[str, Any]:
@@ -418,6 +786,8 @@ def _evaluate_projectaway(split_records) -> dict[str, Any]:
 
 
 def _train_halloc(split_records, baseline_dir, checkpoint_dir, cfg, device):
+    seed = int(cfg.get("seed", 42))
+    _seed_everything(seed)
     datasets = {
         split: HalLocCachedDataset(split_records[split], baseline_dir)
         for split in ("train", "val", "test")
@@ -455,6 +825,9 @@ def _train_halloc(split_records, baseline_dir, checkpoint_dir, cfg, device):
             shuffle=split == "train",
             collate_fn=_collate_halloc,
             num_workers=0,
+            generator=(
+                torch.Generator().manual_seed(seed) if split == "train" else None
+            ),
         )
         for split, dataset in datasets.items()
     }

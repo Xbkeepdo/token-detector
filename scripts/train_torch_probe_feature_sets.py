@@ -127,6 +127,14 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument(
+        "--run-name",
+        default=None,
+        help=(
+            "Store results/checkpoints below OUTPUT/results/RUN_NAME while "
+            "continuing to read OUTPUT/features.pkl and image_splits.json."
+        ),
+    )
+    parser.add_argument(
         "--positive-class",
         choices=["real", "non_hallucination", "hallucination"],
         default="real",
@@ -167,6 +175,8 @@ def main() -> None:
     feature_path = os.path.join(args.output_dir, "features.pkl")
     splits_path = os.path.join(args.output_dir, "image_splits.json")
     results_dir = os.path.join(args.output_dir, "results")
+    if args.run_name is not None:
+        results_dir = os.path.join(results_dir, _safe_run_name(args.run_name))
     probe_dir = os.path.join(results_dir, "torch_probe")
     os.makedirs(probe_dir, exist_ok=True)
 
@@ -197,6 +207,14 @@ def main() -> None:
 
     out_path = os.path.join(results_dir, f"{args.model}_selected_feature_sets.json")
     results = load_json(out_path) if os.path.exists(out_path) else {}
+    if args.run_name is not None:
+        # Seed-isolated runs must contain exactly the feature sets selected by
+        # the current YAML. This prevents stale keys from an older experiment
+        # leaking into the cross-seed intersection and aggregate report.
+        selected = {str(value) for value in args.feature_sets}
+        results = {
+            name: value for name, value in results.items() if name in selected
+        }
     device = _resolve_device(args.device)
 
     print(
@@ -259,6 +277,17 @@ def main() -> None:
 
     print(f"\n[TorchProbe] Saved results to {out_path}")
     _write_summary_table(out_path)
+
+
+def _safe_run_name(value: str) -> str:
+    run_name = str(value).strip()
+    if (
+        not run_name
+        or Path(run_name).name != run_name
+        or run_name in {".", ".."}
+    ):
+        raise ValueError("--run-name must be one safe path component")
+    return run_name
 
 
 def train_and_evaluate_probe(

@@ -213,33 +213,44 @@ dataset:
 training:
   trainer: "torch_mlp"                     # torch_mlp | sklearn
   positive_class: "hallucination"          # hallucination | real
+  baseline:
+    # Training-only selection: this does not change/re-extract baseline/features.pkl.
+    # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
+    methods: ["metatoken", "svar", "dhcp", "projectaway"]
+    seeds: [42, 43, 44]                     # Use [42] for a quick single-seed run.
+    write_summary: true                     # Per-seed MD + aggregate mean/std MD.
   torch_probe:
     batch_size: 256
     num_epochs: 100
     early_stopping_patience: 10
-    seed: 42
+    seeds: [42, 43, 44]                     # Shared by method and ADS+CGC probes.
   feature_sets:
     method:
       - "hpre_raw_logit_gauss_risk"
       - "hpre_raw_logit_gauss_target_cosine"
       - "hpre_raw_logit_gauss_ev"
-      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_target_cosine+hpre_raw_logit_gauss_ev"
+      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_target_cosine"
+      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_ev"
       - "hpre_softmax_prob_gauss_risk"
       - "hpre_softmax_prob_gauss_target_cosine"
       - "hpre_softmax_prob_gauss_ev"
-      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_target_cosine+hpre_softmax_prob_gauss_ev"
+      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_target_cosine"
+      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev"
       - "hmid_raw_logit_gauss_risk"
       - "hmid_raw_logit_gauss_target_cosine"
       - "hmid_raw_logit_gauss_ev"
-      - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_target_cosine+hmid_raw_logit_gauss_ev"
+      - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_target_cosine"
+      - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_ev"
       - "hmid_softmax_prob_gauss_risk"
       - "hmid_softmax_prob_gauss_target_cosine"
       - "hmid_softmax_prob_gauss_ev"
-      - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_target_cosine+hmid_softmax_prob_gauss_ev"
+      - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_target_cosine"
+      - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev"
       - "raw_attention_risk"
       - "raw_attention_target_cosine"
       - "raw_attention_ev"
-      - "raw_attention_risk+raw_attention_target_cosine+raw_attention_ev"
+      - "raw_attention_risk+raw_attention_target_cosine"
+      - "raw_attention_risk+raw_attention_ev"
     ads_cgc:
       - "ads"
       - "cgc"
