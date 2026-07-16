@@ -232,6 +232,10 @@ class DHCPShardReader:
 
     def __init__(self, root: Union[str, os.PathLike[str]]) -> None:
         self.root = Path(root).resolve()
+        # A training epoch revisits the same image-level shards for many token
+        # rows. Keep read-only mmap handles open so __getitem__ does not repeat
+        # thousands of np.load/open calls; mmap still loads pages on demand.
+        self._mmap_cache: dict[Path, np.ndarray] = {}
 
     def load(
         self,
@@ -248,7 +252,13 @@ class DHCPShardReader:
         path = (self.root / ref.shard).resolve()
         if self.root != path and self.root not in path.parents:
             raise ValueError(f"Shard reference escapes root: {ref.shard!r}")
-        array = np.load(path, mmap_mode=mmap_mode)
+        if mmap_mode == "r":
+            array = self._mmap_cache.get(path)
+            if array is None:
+                array = np.load(path, mmap_mode="r")
+                self._mmap_cache[path] = array
+        else:
+            array = np.load(path, mmap_mode=mmap_mode)
         if array.dtype != np.float16:
             raise ValueError(f"Expected float16 DHCP shard, got {array.dtype}")
         if not 0 <= ref.index < len(array):

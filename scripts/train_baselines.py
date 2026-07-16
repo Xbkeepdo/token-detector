@@ -54,6 +54,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Override feature_extraction.baseline.seed for this training run.",
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        default=None,
+        help="Override the configured baseline methods (for example, omit halloc).",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Store results/checkpoints in isolated subdirectories such as seed42.",
+    )
     return parser.parse_args()
 
 
@@ -61,6 +78,8 @@ def main() -> None:
     args = parse_args()
     config = load_config(args.config)
     baseline_cfg = baseline_config(config)
+    if args.seed is not None:
+        baseline_cfg["seed"] = int(args.seed)
     baseline_dir = Path(args.output_dir) / str(
         baseline_cfg.get("output_subdir", "baseline")
     )
@@ -85,7 +104,9 @@ def main() -> None:
     split_records = split_records_by_image(records, image_splits)
     _require_strict_splits(split_records)
     methods = normalize_baseline_methods(
-        baseline_cfg.get("methods", DEFAULT_METHODS)
+        args.methods
+        if args.methods is not None
+        else baseline_cfg.get("methods", DEFAULT_METHODS)
     )
     if not methods:
         raise ValueError("No baseline methods selected for training")
@@ -93,10 +114,23 @@ def main() -> None:
     device = _resolve_device(args.device)
     result_dir = baseline_dir / "results"
     checkpoint_dir = baseline_dir / "checkpoints"
+    if args.run_name is not None:
+        run_name = str(args.run_name).strip()
+        if (
+            not run_name
+            or Path(run_name).name != run_name
+            or run_name in {".", ".."}
+        ):
+            raise ValueError("--run-name must be one safe path component")
+        result_dir = result_dir / run_name
+        checkpoint_dir = checkpoint_dir / run_name
     result_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    result_path = result_dir / f"{args.model}_baselines.json"
     output: dict[str, Any] = {
         "model": args.model,
+        "seed": int(baseline_cfg.get("seed", 42)),
+        "configured_methods": list(methods),
         "feature_path": str(feature_path),
         "split_path": str(split_path),
         "stored_label_semantics": {"0": "hallucination", "1": "real"},
@@ -125,9 +159,9 @@ def main() -> None:
                 split_records, baseline_dir, checkpoint_dir, baseline_cfg, device
             )
         output["methods"][method] = result
-        save_json(output, str(result_dir / f"{args.model}_baselines.json"))
+        save_json(output, str(result_path))
 
-    print(f"[BaselineTrain] saved {result_dir / f'{args.model}_baselines.json'}")
+    print(f"[BaselineTrain] saved {result_path}")
 
 
 def _train_metatoken(split_records, checkpoint_dir, cfg) -> dict[str, Any]:
@@ -188,6 +222,10 @@ def _train_svar(split_records, checkpoint_dir, cfg, device) -> dict[str, Any]:
         for split in ("train", "val", "test")
     }
     svar_cfg = dict(cfg.get("svar") or {})
+    seed = int(cfg.get("seed", 42))
+    # Seed before module construction so the requested run seed controls both
+    # SVAR's initial weights and the subsequent minibatch order.
+    _seed_everything(seed)
     model = SVARMLP(
         matrices["train"][0].shape[1],
         hidden_dim=int(_setting(svar_cfg, "hidden_dim", "hidden_size", default=248)),
@@ -209,7 +247,7 @@ def _train_svar(split_records, checkpoint_dir, cfg, device) -> dict[str, Any]:
         early_stopping_patience=int(
             svar_cfg.get("early_stopping_patience", 5)
         ),
-        seed=int(cfg.get("seed", 42)),
+        seed=seed,
     )
     path = checkpoint_dir / "svar.pt"
     _atomic_torch_save(
