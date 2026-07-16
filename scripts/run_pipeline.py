@@ -493,6 +493,7 @@ def _enabled_method_feature_sets(
         "hpre_softmax_prob_gauss",
         "hmid_raw_logit_gauss",
         "hmid_softmax_prob_gauss",
+        "hpre_softmax_prob_direct",
         "raw_attention",
     }
     configured = dgst.get("four_gate_methods")

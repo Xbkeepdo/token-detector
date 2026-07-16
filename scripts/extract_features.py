@@ -24,6 +24,7 @@ FOUR_GATE_METHODS = (
     "hpre_softmax_prob_gauss",
     "hmid_raw_logit_gauss",
     "hmid_softmax_prob_gauss",
+    "hpre_softmax_prob_direct",
     "raw_attention",
 )
 

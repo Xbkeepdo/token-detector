@@ -37,8 +37,13 @@ FOUR_GATE_METHODS = (
     "hmid_raw_logit_gauss",
     "hmid_softmax_prob_gauss",
 )
+DIRECT_HPRE_SOFTMAX_METHOD = "hpre_softmax_prob_direct"
 RAW_ATTENTION_METHOD = "raw_attention"
-TARGET_COMPARISON_METHODS = (*FOUR_GATE_METHODS, RAW_ATTENTION_METHOD)
+TARGET_COMPARISON_METHODS = (
+    *FOUR_GATE_METHODS,
+    DIRECT_HPRE_SOFTMAX_METHOD,
+    RAW_ATTENTION_METHOD,
+)
 FOUR_GATE_CAPTURE_FIELDS = (
     "prediction_hpre",
     "visual_hpre",
@@ -3984,7 +3989,13 @@ def compute_four_gate_dgst_batch_from_captures(
             {
                 "attention": [],
                 "source": [],
-                "gates": {method: [] for method in methods},
+                "gates": {
+                    method: []
+                    for method in methods
+                    if method != DIRECT_HPRE_SOFTMAX_METHOD
+                },
+                "direct_hpre_target_probs": [],
+                "direct_hpre_target_dist": [],
                 "problems": {method: [] for method in methods},
                 "cosines": {method: [] for method in methods},
                 "ev": {method: [] for method in methods},
@@ -4015,6 +4026,9 @@ def compute_four_gate_dgst_batch_from_captures(
         if tuple(compact_capture) != FOUR_GATE_CAPTURE_FIELDS:
             raise AssertionError("Unexpected fields in compact four-gate capture.")
         visual_hpre = compact_capture["visual_hpre"]
+        visual_hmid = capture["h_mid"][
+            0, int(visual_start) : int(visual_end)
+        ].float()
         sequence_length = int(capture["h_prev"].shape[1])
 
         for target_offset, prediction_position in enumerate(pred_positions):
@@ -4026,14 +4040,21 @@ def compute_four_gate_dgst_batch_from_captures(
             attention_support = compact_capture["attention_support"][target_offset]
             source_dist = compact_capture["source_dist"][target_offset]
             prediction_hpre = compact_capture["prediction_hpre"][target_offset]
-            cosine_map = F.cosine_similarity(
-                prediction_hpre.unsqueeze(0),
-                visual_hpre,
-                dim=-1,
-            )
-            cosine_map = torch.nan_to_num(
-                cosine_map.float(), nan=0.0, posinf=1.0, neginf=-1.0
-            ).clamp(-1.0, 1.0)
+            prediction_hmid = capture["h_mid"][0, prediction_position].float()
+            state_views = {
+                "hpre": (prediction_hpre, visual_hpre),
+                "hmid": (prediction_hmid, visual_hmid),
+            }
+            cosine_maps = {}
+            for state_name, (prediction_state, visual_states) in state_views.items():
+                cosine_map = F.cosine_similarity(
+                    prediction_state.unsqueeze(0),
+                    visual_states,
+                    dim=-1,
+                )
+                cosine_maps[state_name] = torch.nan_to_num(
+                    cosine_map.float(), nan=0.0, posinf=1.0, neginf=-1.0
+                ).clamp(-1.0, 1.0)
             gate_input_fields = {
                 "hpre_raw_logit_gauss": "hpre_raw_target_logits",
                 "hpre_softmax_prob_gauss": "hpre_softmax_target_probs",
@@ -4045,12 +4066,32 @@ def compute_four_gate_dgst_batch_from_captures(
             record["attention"].append(attention_support)
             record["source"].append(source_dist)
             for method in methods:
+                state_name = _target_comparison_state(method)
+                _prediction_state, cost_states = state_views[state_name]
+                cosine_map = cosine_maps[state_name]
                 if method == RAW_ATTENTION_METHOD:
                     # This baseline uses the model's post-softmax attention
                     # weights directly.  The all-ones gate keeps the stored
                     # matrix schema aligned with the Gaussian-gated methods.
                     gate = torch.ones_like(attention_support).detach()
                     target_dist = attention_support.detach()
+                elif method == DIRECT_HPRE_SOFTMAX_METHOD:
+                    target_probs = compact_capture["hpre_softmax_target_probs"]
+                    if target_probs is None:
+                        raise RuntimeError(
+                            "Direct hpre-softmax target distribution requires "
+                            "vocabulary-softmax target probabilities."
+                        )
+                    # The vocabulary softmax is performed independently at every
+                    # visual token.  Its target-token probabilities are then
+                    # normalized across visual positions to form the OT marginal.
+                    target_dist = _renormalize(
+                        target_probs[target_offset]
+                    ).detach()
+                    record["direct_hpre_target_probs"].append(
+                        target_probs[target_offset].detach()
+                    )
+                    record["direct_hpre_target_dist"].append(target_dist)
                 else:
                     gate_values = compact_capture[gate_input_fields[method]]
                     if gate_values is None:
@@ -4070,7 +4111,7 @@ def compute_four_gate_dgst_batch_from_captures(
                 problem = _prepare_transport_problem_for_state_cost(
                     source_dist=source_dist,
                     target_dist=target_dist,
-                    states=visual_hpre,
+                    states=cost_states,
                     support=support,
                     sqrt_cosine=True,
                     keep_on_device=False,
@@ -4089,16 +4130,17 @@ def compute_four_gate_dgst_batch_from_captures(
                     evidence_value = float(
                         (local_attention * ((1.0 + local_cosine) / 2.0)).sum().item()
                     )
-                record["gates"][method].append(gate)
+                if method != DIRECT_HPRE_SOFTMAX_METHOD:
+                    record["gates"][method].append(gate)
                 record["problems"][method].append(problem)
                 record["cosines"][method].append(target_cosine)
                 record["ev"][method].append(evidence_value)
 
-        del compact_capture, visual_hpre
+        del compact_capture, visual_hpre, visual_hmid
         if release_layer_captures:
             # Method-only extraction has no downstream consumer for the hook
             # tensors.  Drop every large decoder reference as soon as this
-            # layer has been reduced to the eight compact inputs/results.
+            # layer has been reduced to the compact inputs/results.
             for key in (
                 "h_prev",
                 "o_attn",
@@ -4114,9 +4156,13 @@ def compute_four_gate_dgst_batch_from_captures(
         risk_series = _solve_exact_emd_problem_series(record["problems"])
         result: dict[str, Any] = {
             "dgst_t_profile": (
-                "target_comparison_v2"
-                if RAW_ATTENTION_METHOD in methods
-                else "four_gate_vv_v1"
+                "target_comparison_v3"
+                if DIRECT_HPRE_SOFTMAX_METHOD in methods
+                else (
+                    "target_comparison_v2"
+                    if RAW_ATTENTION_METHOD in methods
+                    else "four_gate_vv_v1"
+                )
             ),
             "dgst_t_target_token_id": int(target_ids[target_offset]),
             "dgst_t_prediction_position": int(pred_positions[target_offset]),
@@ -4125,32 +4171,57 @@ def compute_four_gate_dgst_batch_from_captures(
             "dgst_t_mad_scale": float(GAUSSIAN_MAD_SCALE),
             "dgst_t_softmax_axis": "vocabulary",
             "dgst_t_source_distribution_mode": "softmax",
+            "dgst_t_state_by_method": {
+                method: _target_comparison_state(method)
+                for method in methods
+            },
             "dgst_t_transport_top_k": int(transport_top_k),
             "dgst_t_target_region_top_k": int(target_region_top_k),
-            "dgst_t_cost": "sqrt_cosine_hpre",
+            "dgst_t_cost": "sqrt_cosine_matched_state",
             "dgst_t_ot_solver": "emd",
             "dgst_t_attention_support_per_layer": torch.stack(
                 record["attention"], dim=0
-            ).detach().to(device="cpu", dtype=torch.float16),
+            ).detach().to(device="cpu", dtype=torch.float32),
             "dgst_t_source_dist_per_layer": torch.stack(
                 record["source"], dim=0
-            ).detach().to(device="cpu", dtype=torch.float16),
+            ).detach().to(device="cpu", dtype=torch.float32),
         }
         if RAW_ATTENTION_METHOD in methods:
             result["dgst_t_raw_attention_definition"] = (
                 "post_softmax_head_mean_visual_support_renormalized"
             )
+        if DIRECT_HPRE_SOFTMAX_METHOD in methods:
+            result["dgst_t_hpre_softmax_prob_direct_definition"] = (
+                "visual_hpre_vocabulary_softmax_target_probability_"
+                "renormalized_over_visual_tokens"
+            )
+            result[
+                "dgst_t_hpre_softmax_prob_direct_target_prob_matrix_per_layer"
+            ] = torch.stack(
+                record["direct_hpre_target_probs"], dim=0
+            ).detach().to(device="cpu", dtype=torch.float32)
+            result[
+                "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer"
+            ] = torch.stack(
+                record["direct_hpre_target_dist"], dim=0
+            ).detach().to(device="cpu", dtype=torch.float32)
         for method in methods:
-            result[f"dgst_t_{method}_gate_per_layer"] = torch.stack(
-                record["gates"][method], dim=0
-            ).detach().to(device="cpu", dtype=torch.float16)
-            result[f"dgst_t_{method}_risk_sqrt_hpre_per_layer"] = torch.tensor(
+            state_name = _target_comparison_state(method)
+            if method != DIRECT_HPRE_SOFTMAX_METHOD:
+                result[f"dgst_t_{method}_gate_per_layer"] = torch.stack(
+                    record["gates"][method], dim=0
+                ).detach().to(device="cpu", dtype=torch.float32)
+            result[
+                f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
+            ] = torch.tensor(
                 risk_series[method], dtype=torch.float32
             )
             result[
-                f"dgst_t_{method}_target_cosine_topk32_hpre_per_layer"
+                f"dgst_t_{method}_target_cosine_topk32_{state_name}_per_layer"
             ] = torch.tensor(record["cosines"][method], dtype=torch.float32)
-            result[f"dgst_t_{method}_ev_topk32_hpre_per_layer"] = torch.tensor(
+            result[
+                f"dgst_t_{method}_ev_topk32_{state_name}_per_layer"
+            ] = torch.tensor(
                 record["ev"][method], dtype=torch.float32
             )
         results.append(result)
@@ -4170,7 +4241,7 @@ def build_compact_four_gate_layer_capture(
     tau: float = 0.07,
     enabled_methods: Sequence[str] | None = None,
 ) -> dict[str, torch.Tensor | None]:
-    """Reduce one hook capture to the eight active four-gate inputs.
+    """Reduce one hook capture to the compact active-profile inputs.
 
     ``visual_hmid`` and the two full-vocabulary chunk matrices are deliberately
     transient.  Target raw logits and target vocabulary-softmax probabilities
@@ -4206,7 +4277,10 @@ def build_compact_four_gate_layer_capture(
 
     hpre_raw = hpre_prob = hmid_raw = hmid_prob = None
     needs_hpre_raw = "hpre_raw_logit_gauss" in methods
-    needs_hpre_prob = "hpre_softmax_prob_gauss" in methods
+    needs_hpre_prob = (
+        "hpre_softmax_prob_gauss" in methods
+        or DIRECT_HPRE_SOFTMAX_METHOD in methods
+    )
     needs_hmid_raw = "hmid_raw_logit_gauss" in methods
     needs_hmid_prob = "hmid_softmax_prob_gauss" in methods
 
@@ -4292,7 +4366,13 @@ def build_compact_four_gate_layer_capture(
             if hmid_prob is not None else None
         ),
     }
-    del visual_hmid, hpre_raw, hpre_prob, hmid_raw, hmid_prob
+    del (
+        visual_hmid,
+        hpre_raw,
+        hpre_prob,
+        hmid_raw,
+        hmid_prob,
+    )
     return result
 
 
@@ -4314,6 +4394,21 @@ def _normalize_four_gate_methods(
     if not selected:
         raise ValueError("At least one four-gate method must be enabled.")
     return selected
+
+
+def _target_comparison_state(method: str) -> str:
+    """Return the hidden-state family paired with one target construction."""
+    name = str(method).strip().lower()
+    if name in {"hmid_raw_logit_gauss", "hmid_softmax_prob_gauss"}:
+        return "hmid"
+    if name in {
+        "hpre_raw_logit_gauss",
+        "hpre_softmax_prob_gauss",
+        DIRECT_HPRE_SOFTMAX_METHOD,
+        RAW_ATTENTION_METHOD,
+    }:
+        return "hpre"
+    raise ValueError(f"Unknown target-comparison method: {method!r}")
 
 
 def _solve_exact_emd_problem_series(

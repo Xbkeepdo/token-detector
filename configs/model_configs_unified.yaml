@@ -3,7 +3,7 @@
 # `run.sh` only selects model/output/devices and invokes the three stages.
 # Prompt, extraction families, DGST branches and training behavior live here.
 # The active DGST profile is visual-only and contains four Gaussian-MAD
-# branches plus one raw-attention control. Historical VP/legacy/topmass/FFN/
+# branches plus direct probability and raw-attention controls. Historical VP/legacy/topmass/FFN/
 # Sinkhorn experiments remain in their older config files and are intentionally
 # absent from this active YAML.
 
@@ -167,7 +167,7 @@ feature_extraction:
 
   dgst_t:
     enabled: true
-    feature_output_profile: "four_gate_vv"   # Four Gaussian gates plus the raw-attention control.
+    feature_output_profile: "four_gate_vv"   # Four Gaussian gates plus two direct controls.
     target_gate_mode: "four_gate"
     save_raw_capture: false                   # Only final matrices/curves are serialized.
     # raw_logit is the target-word unembedding dot product; softmax_prob applies
@@ -177,6 +177,9 @@ feature_extraction:
       - "hpre_softmax_prob_gauss"
       - "hmid_raw_logit_gauss"
       - "hmid_softmax_prob_gauss"
+      # Direct control: visual_hpre -> vocabulary softmax -> target-token
+      # probability, normalized over visual tokens. No MAD and no attention gate.
+      - "hpre_softmax_prob_direct"
       # Control: use post-softmax visual support-attention directly as the
       # target distribution; do not multiply it by a Gaussian gate.
       - "raw_attention"
@@ -186,20 +189,21 @@ feature_extraction:
       hpre_softmax_prob_gauss: true
       hmid_raw_logit_gauss: true
       hmid_softmax_prob_gauss: true
+      hpre_softmax_prob_direct: true
       raw_attention: true
 
-    # Shared transport math for all four gates and the raw-attention control.
+    # Shared transport math for all four gates and both direct controls.
     tau: 0.07
     source_distribution_mode: "softmax"
     support_scope: "visual"
     transport_top_k: 64
-    cost_mode: "sqrt_hpre"
+    cost_mode: "sqrt_matched_state"          # hpre branches use hpre; hmid branches use hmid.
     ot_solver: "emd"
     atarget_visual_top_k: 32
     relative_vll_mad_epsilon: 1.0e-6
     target_attention_epsilon: 1.0e-12
-    matrix_dtype: "float16"                  # attention/source/gates [L,P].
-    curve_dtype: "float32"                   # risk/target-cosine/EV [L].
+    matrix_dtype: "float32"                  # All saved [L,P] DGST matrices.
+    curve_dtype: "float32"                   # All saved [L] DGST curves.
 
     # Deprecated VP, legacy-probability, cost-sweep, topmass, FFN-diagnostic,
     # and Sinkhorn switches intentionally do not appear in the active config.
@@ -255,6 +259,11 @@ training:
       - "hmid_softmax_prob_gauss_ev"
       - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_target_cosine"
       - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev"
+      - "hpre_softmax_prob_direct_risk"
+      - "hpre_softmax_prob_direct_target_cosine"
+      - "hpre_softmax_prob_direct_ev"
+      - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_target_cosine"
+      - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_ev"
       - "raw_attention_risk"
       - "raw_attention_target_cosine"
       - "raw_attention_ev"

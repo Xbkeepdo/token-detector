@@ -18,7 +18,7 @@ from models.base_wrapper import (
 from features.attention import compute_alpha_img_alpha_text
 from features.ads import compute_ads
 from features.cgc import compute_cgc
-from features.dgst_t import compute_dgst_t
+from features.dgst_t import compute_dgst_t, _target_comparison_state
 from utils.io_utils import append_pkl, load_json, load_pkl, save_pkl
 
 
@@ -1073,6 +1073,7 @@ def _build_four_gate_feature_record(
         "dgst_t_mad_scale",
         "dgst_t_softmax_axis",
         "dgst_t_source_distribution_mode",
+        "dgst_t_state_by_method",
         "dgst_t_transport_top_k",
         "dgst_t_target_region_top_k",
         "dgst_t_cost",
@@ -1082,14 +1083,25 @@ def _build_four_gate_feature_record(
         "dgst_t_attention_support_per_layer",
         "dgst_t_source_dist_per_layer",
     )
+    direct_softmax_method = "hpre_softmax_prob_direct"
     method_keys = []
     for method in methods:
+        state_name = _target_comparison_state(method)
+        if method == direct_softmax_method:
+            method_keys.extend(
+                [
+                    "dgst_t_hpre_softmax_prob_direct_"
+                    "target_prob_matrix_per_layer",
+                    "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer",
+                ]
+            )
+        else:
+            method_keys.append(f"dgst_t_{method}_gate_per_layer")
         method_keys.extend(
             [
-                f"dgst_t_{method}_gate_per_layer",
-                f"dgst_t_{method}_risk_sqrt_hpre_per_layer",
-                f"dgst_t_{method}_target_cosine_topk32_hpre_per_layer",
-                f"dgst_t_{method}_ev_topk32_hpre_per_layer",
+                f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer",
+                f"dgst_t_{method}_target_cosine_topk32_{state_name}_per_layer",
+                f"dgst_t_{method}_ev_topk32_{state_name}_per_layer",
             ]
         )
     missing = [
@@ -1101,11 +1113,16 @@ def _build_four_gate_feature_record(
         raise KeyError(f"Missing four-gate DGST fields: {missing}")
 
     has_raw_attention = "raw_attention" in methods
+    has_direct_softmax = direct_softmax_method in methods
     feat = {
         "feature_schema_version": (
-            "dgst-target-comparison-v2"
-            if has_raw_attention
-            else "dgst-four-gate-v1"
+            "dgst-target-comparison-v3"
+            if has_direct_softmax
+            else (
+                "dgst-target-comparison-v2"
+                if has_raw_attention
+                else "dgst-four-gate-v1"
+            )
         ),
         "image_id": int(image_id),
         "token_str": span["word"],
@@ -1122,15 +1139,40 @@ def _build_four_gate_feature_record(
             "dgst_t_raw_attention_definition",
             "post_softmax_head_mean_visual_support_renormalized",
         )
+    if has_direct_softmax:
+        feat["dgst_t_hpre_softmax_prob_direct_definition"] = dgst_t.get(
+            "dgst_t_hpre_softmax_prob_direct_definition",
+            "visual_hpre_vocabulary_softmax_target_probability_"
+            "renormalized_over_visual_tokens",
+        )
     for key in required_matrices:
-        feat[key] = _compact_numpy(dgst_t[key], dtype=np.float16)
+        feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
+    if has_direct_softmax:
+        feat[
+            "dgst_t_hpre_softmax_prob_direct_target_prob_matrix_per_layer"
+        ] = _compact_numpy(
+            dgst_t[
+                "dgst_t_hpre_softmax_prob_direct_target_prob_matrix_per_layer"
+            ],
+            dtype=np.float32,
+        )
+        feat[
+            "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer"
+        ] = _compact_numpy(
+            dgst_t[
+                "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer"
+            ],
+            dtype=np.float32,
+        )
     for method in methods:
-        gate_key = f"dgst_t_{method}_gate_per_layer"
-        feat[gate_key] = _compact_numpy(dgst_t[gate_key], dtype=np.float16)
+        state_name = _target_comparison_state(method)
+        if method != direct_softmax_method:
+            gate_key = f"dgst_t_{method}_gate_per_layer"
+            feat[gate_key] = _compact_numpy(dgst_t[gate_key], dtype=np.float32)
         for suffix in (
-            "risk_sqrt_hpre_per_layer",
-            "target_cosine_topk32_hpre_per_layer",
-            "ev_topk32_hpre_per_layer",
+            f"risk_sqrt_{state_name}_per_layer",
+            f"target_cosine_topk32_{state_name}_per_layer",
+            f"ev_topk32_{state_name}_per_layer",
         ):
             key = f"dgst_t_{method}_{suffix}"
             feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
@@ -1140,9 +1182,8 @@ def _build_four_gate_feature_record(
 def _compact_numpy(value, *, dtype):
     if hasattr(value, "detach"):
         value = value.detach().cpu()
-        # NumPy cannot consume torch.bfloat16 directly. DGST outputs normally
-        # already use fp16/fp32, but keep serialization safe for wrapper-native
-        # bf16 tensors as well.
+        # NumPy cannot consume torch.bfloat16 directly. Active DGST outputs use
+        # fp32, but keep serialization safe for wrapper-native bf16 tensors.
         if value.dtype == torch.bfloat16:
             value = value.float()
         value = value.numpy()

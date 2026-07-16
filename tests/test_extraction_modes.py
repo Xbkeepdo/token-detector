@@ -43,9 +43,13 @@ def _dgst_result(layers: int = 2, patches: int = 6) -> dict:
         "dgst_t_mad_scale": 1.4826,
         "dgst_t_softmax_axis": "vocabulary",
         "dgst_t_source_distribution_mode": "softmax",
+        "dgst_t_state_by_method": {
+            method: "hmid" if method.startswith("hmid_") else "hpre"
+            for method in FOUR_GATE_METHODS
+        },
         "dgst_t_transport_top_k": 64,
         "dgst_t_target_region_top_k": 32,
-        "dgst_t_cost": "sqrt_cosine_hpre",
+        "dgst_t_cost": "sqrt_cosine_matched_state",
         "dgst_t_ot_solver": "emd",
         "dgst_t_attention_support_per_layer": torch.full(
             (layers, patches), 1.0 / patches
@@ -55,16 +59,19 @@ def _dgst_result(layers: int = 2, patches: int = 6) -> dict:
         ),
     }
     for offset, method in enumerate(FOUR_GATE_METHODS):
+        state_name = "hmid" if method.startswith("hmid_") else "hpre"
         value[f"dgst_t_{method}_gate_per_layer"] = torch.full(
             (layers, patches), 0.25 + 0.1 * offset
         )
-        value[f"dgst_t_{method}_risk_sqrt_hpre_per_layer"] = torch.arange(
+        value[f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"] = torch.arange(
             layers, dtype=torch.float32
         ) + offset
-        value[f"dgst_t_{method}_target_cosine_topk32_hpre_per_layer"] = torch.full(
+        value[
+            f"dgst_t_{method}_target_cosine_topk32_{state_name}_per_layer"
+        ] = torch.full(
             (layers,), 0.1 * offset
         )
-        value[f"dgst_t_{method}_ev_topk32_hpre_per_layer"] = torch.full(
+        value[f"dgst_t_{method}_ev_topk32_{state_name}_per_layer"] = torch.full(
             (layers,), 0.2 * offset
         )
     return value

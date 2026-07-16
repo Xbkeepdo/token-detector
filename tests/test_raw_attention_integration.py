@@ -86,8 +86,11 @@ class RawAttentionIntegrationTests(unittest.TestCase):
         dgst = config["feature_extraction"]["dgst_t"]
         self.assertIn("raw_attention", dgst["four_gate_methods"])
         self.assertTrue(dgst["branches"]["raw_attention"])
+        self.assertIn("hpre_softmax_prob_direct", dgst["four_gate_methods"])
+        self.assertTrue(dgst["branches"]["hpre_softmax_prob_direct"])
         method_sets = config["training"]["feature_sets"]["method"]
         self.assertIn("raw_attention_risk", method_sets)
+        self.assertIn("hpre_softmax_prob_direct_risk", method_sets)
         self.assertIn(
             "raw_attention_risk+raw_attention_target_cosine+raw_attention_ev",
             method_sets,

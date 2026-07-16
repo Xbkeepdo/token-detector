@@ -601,15 +601,21 @@ def _register_four_gate_aliases() -> None:
         "hpre_softmax_prob_gauss",
         "hmid_raw_logit_gauss",
         "hmid_softmax_prob_gauss",
+        "hpre_softmax_prob_direct",
         "raw_attention",
     )
     for method in methods:
+        state_name = "hmid" if method.startswith("hmid_") else "hpre"
         specs = {
-            f"{method}_risk": f"dgst_t_{method}_risk_sqrt_hpre_per_layer",
-            f"{method}_target_cosine": (
-                f"dgst_t_{method}_target_cosine_topk32_hpre_per_layer"
+            f"{method}_risk": (
+                f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
             ),
-            f"{method}_ev": f"dgst_t_{method}_ev_topk32_hpre_per_layer",
+            f"{method}_target_cosine": (
+                f"dgst_t_{method}_target_cosine_topk32_{state_name}_per_layer"
+            ),
+            f"{method}_ev": (
+                f"dgst_t_{method}_ev_topk32_{state_name}_per_layer"
+            ),
         }
         for block, feature_key in specs.items():
             FEATURE_ALIASES[block] = block

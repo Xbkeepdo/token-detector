@@ -19,6 +19,7 @@ VALID_DGST_BRANCHES = (
     "hpre_softmax_prob_gauss",
     "hmid_raw_logit_gauss",
     "hmid_softmax_prob_gauss",
+    "hpre_softmax_prob_direct",
     "raw_attention",
 )
 VALID_LABEL_SAMPLE_UNITS = {"first_canonical_mention"}

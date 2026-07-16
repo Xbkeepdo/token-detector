@@ -14,6 +14,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from features.dgst_t import (
+    DIRECT_HPRE_SOFTMAX_METHOD,
     FOUR_GATE_CAPTURE_FIELDS,
     FOUR_GATE_METHODS,
     RAW_ATTENTION_METHOD,
@@ -23,6 +24,7 @@ from features.dgst_t import (
     _prepare_transport_problem_for_state_cost,
     _solve_transport_problem,
     _stable_topk_indices,
+    _topk_union_indices,
 )
 from features.extractor import _build_four_gate_feature_record
 from models.dgst_capture import (
@@ -145,6 +147,23 @@ class FourGateDGSTTests(unittest.TestCase):
         self.assertIsNone(hpre_raw["hmid_raw_target_logits"])
         self.assertIsNone(hpre_raw["hmid_softmax_target_probs"])
 
+        with mock.patch("torch.nn.functional.linear", wraps=F.linear) as linear:
+            direct_softmax = build_compact_four_gate_layer_capture(
+                output_layer=layer,
+                capture=capture,
+                visual_start=0,
+                visual_end=patches,
+                target_token_ids=[0],
+                prediction_positions=[patches],
+                semantic_chunk_size=chunk_size,
+                enabled_methods=[DIRECT_HPRE_SOFTMAX_METHOD],
+            )
+        self.assertEqual(linear.call_count, expected_chunks)
+        self.assertIsNone(direct_softmax["hpre_raw_target_logits"])
+        self.assertIsNotNone(direct_softmax["hpre_softmax_target_probs"])
+        self.assertIsNone(direct_softmax["hmid_raw_target_logits"])
+        self.assertIsNone(direct_softmax["hmid_softmax_target_probs"])
+
     def test_compact_capture_projects_each_state_chunk_once(self) -> None:
         layer = self._output_layer()
         patches, chunk_size = 5, 2
@@ -172,7 +191,12 @@ class FourGateDGSTTests(unittest.TestCase):
         # softmax columns share those calls rather than projecting twice.
         self.assertEqual(linear.call_count, 2 * ((patches + chunk_size - 1) // chunk_size))
         self.assertEqual(tuple(compact), FOUR_GATE_CAPTURE_FIELDS)
-        self.assertFalse(any(value.shape[-1] == layer.out_features for value in compact.values()))
+        self.assertFalse(
+            any(
+                value is not None and value.shape[-1] == layer.out_features
+                for value in compact.values()
+            )
+        )
 
     def test_manual_gaussian_mad_and_known_exact_emd(self) -> None:
         values = torch.tensor([-3.0, -1.0, 2.0, 8.0])
@@ -245,6 +269,11 @@ class FourGateDGSTTests(unittest.TestCase):
             compact["visual_hpre"],
             dim=-1,
         )
+        hmid_cosine_map = F.cosine_similarity(
+            capture["h_mid"][0, patches].unsqueeze(0),
+            capture["h_mid"][0, :patches],
+            dim=-1,
+        )
         input_keys = {
             "hpre_raw_logit_gauss": "hpre_raw_target_logits",
             "hpre_softmax_prob_gauss": "hpre_softmax_target_probs",
@@ -258,9 +287,42 @@ class FourGateDGSTTests(unittest.TestCase):
             target_dist = target_dist / target_dist.sum()
             region = _stable_topk_indices(target_dist, 32)
             regions.append(tuple(region.tolist()))
-            expected_cosine = cosine_map.index_select(0, region).mean()
-            key = f"dgst_t_{method}_target_cosine_topk32_hpre_per_layer"
+            state_name = "hmid" if method.startswith("hmid_") else "hpre"
+            branch_cosine = (
+                hmid_cosine_map if state_name == "hmid" else cosine_map
+            )
+            expected_cosine = branch_cosine.index_select(0, region).mean()
+            key = (
+                f"dgst_t_{method}_target_cosine_topk32_"
+                f"{state_name}_per_layer"
+            )
             self.assertAlmostEqual(float(result[key][0]), float(expected_cosine), places=6)
+            cost_states = (
+                capture["h_mid"][0, :patches]
+                if state_name == "hmid"
+                else capture["h_prev"][0, :patches]
+            )
+            support = _topk_union_indices(
+                compact["source_dist"][0],
+                target_dist,
+                64,
+            )
+            expected_problem = _prepare_transport_problem_for_state_cost(
+                source_dist=compact["source_dist"][0],
+                target_dist=target_dist,
+                states=cost_states,
+                support=support,
+                sqrt_cosine=True,
+            )
+            expected_risk = _solve_transport_problem(expected_problem, "emd")
+            risk_key = (
+                f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
+            )
+            self.assertAlmostEqual(
+                float(result[risk_key][0]),
+                expected_risk,
+                places=6,
+            )
         self.assertGreater(len(set(regions)), 1)
 
     def test_four_methods_emit_distinct_named_matrices_and_curves(self) -> None:
@@ -303,7 +365,8 @@ class FourGateDGSTTests(unittest.TestCase):
         self.assertEqual(tuple(compact["prediction_hpre"].shape), (1, 2))
         self.assertEqual(tuple(compact["visual_hpre"].shape), (3, 2))
         for key in FOUR_GATE_CAPTURE_FIELDS[2:]:
-            self.assertEqual(tuple(compact[key].shape), (1, 3))
+            if compact[key] is not None:
+                self.assertEqual(tuple(compact[key].shape), (1, 3))
         self.assertFalse(any("vocab" in key for key in compact))
 
         results = compute_four_gate_dgst_batch_from_captures(
@@ -323,34 +386,48 @@ class FourGateDGSTTests(unittest.TestCase):
         self.assertFalse(any("logits" in key or "probs" in key for key in result))
         self.assertEqual(result["dgst_t_four_gate_methods"], list(FOUR_GATE_METHODS))
         self.assertEqual(
-            result["dgst_t_attention_support_per_layer"].dtype, torch.float16
+            result["dgst_t_attention_support_per_layer"].dtype, torch.float32
         )
-        self.assertEqual(result["dgst_t_source_dist_per_layer"].dtype, torch.float16)
+        self.assertEqual(result["dgst_t_source_dist_per_layer"].dtype, torch.float32)
         self.assertEqual(
             tuple(result["dgst_t_attention_support_per_layer"].shape), (1, 3)
         )
 
-        visual_hpre = h_prev[0, :3].float()
-        prediction_hpre = h_prev[0, 3].float()
-        cosine = torch.nn.functional.cosine_similarity(
-            prediction_hpre.unsqueeze(0), visual_hpre, dim=-1
-        )
         normalized_attention = attention[0, :, 3, :3].mean(dim=0)
         normalized_attention = normalized_attention / normalized_attention.sum()
-        expected_ev = float(
-            (normalized_attention * ((1.0 + cosine) / 2.0)).sum().item()
-        )
-        expected_cosine = float(cosine.mean().item())
 
         for method in FOUR_GATE_METHODS:
-            gate_key = f"dgst_t_{method}_gate_per_layer"
-            risk_key = f"dgst_t_{method}_risk_sqrt_hpre_per_layer"
-            cosine_key = (
-                f"dgst_t_{method}_target_cosine_topk32_hpre_per_layer"
+            state_name = "hmid" if method.startswith("hmid_") else "hpre"
+            branch_states = (
+                captures[0]["h_mid"][0]
+                if state_name == "hmid"
+                else captures[0]["h_prev"][0]
             )
-            ev_key = f"dgst_t_{method}_ev_topk32_hpre_per_layer"
+            cosine = torch.nn.functional.cosine_similarity(
+                branch_states[3].unsqueeze(0),
+                branch_states[:3],
+                dim=-1,
+            )
+            expected_ev = float(
+                (
+                    normalized_attention
+                    * ((1.0 + cosine) / 2.0)
+                ).sum().item()
+            )
+            expected_cosine = float(cosine.mean().item())
+            gate_key = f"dgst_t_{method}_gate_per_layer"
+            risk_key = (
+                f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
+            )
+            cosine_key = (
+                f"dgst_t_{method}_target_cosine_topk32_"
+                f"{state_name}_per_layer"
+            )
+            ev_key = (
+                f"dgst_t_{method}_ev_topk32_{state_name}_per_layer"
+            )
             self.assertEqual(tuple(result[gate_key].shape), (1, 3))
-            self.assertEqual(result[gate_key].dtype, torch.float16)
+            self.assertEqual(result[gate_key].dtype, torch.float32)
             self.assertEqual(tuple(result[risk_key].shape), (1,))
             self.assertEqual(result[risk_key].dtype, torch.float32)
             self.assertTrue(torch.isfinite(result[risk_key]).all())
@@ -368,7 +445,7 @@ class FourGateDGSTTests(unittest.TestCase):
             dgst_t=result,
         )
         self.assertEqual(record["feature_schema_version"], "dgst-four-gate-v1")
-        self.assertEqual(str(record["dgst_t_attention_support_per_layer"].dtype), "float16")
+        self.assertEqual(str(record["dgst_t_attention_support_per_layer"].dtype), "float32")
         self.assertEqual(
             str(record["dgst_t_hpre_raw_logit_gauss_risk_sqrt_hpre_per_layer"].dtype),
             "float32",
@@ -435,7 +512,7 @@ class FourGateDGSTTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 result["dgst_t_raw_attention_gate_per_layer"],
-                torch.ones(1, 3, dtype=torch.float16),
+                torch.ones(1, 3, dtype=torch.float32),
             )
         )
         cosine = F.cosine_similarity(h_prev[0, 3].unsqueeze(0), h_prev[0, :3], dim=-1)
@@ -468,6 +545,107 @@ class FourGateDGSTTests(unittest.TestCase):
             record["dgst_t_raw_attention_definition"],
             "post_softmax_head_mean_visual_support_renormalized",
         )
+
+    def test_direct_hpre_softmax_uses_target_probability_without_gate(self) -> None:
+        layer = self._output_layer()
+        model = SimpleNamespace(get_output_embeddings=lambda: layer)
+        h_prev = torch.tensor(
+            [[[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [1.0, 1.0]]],
+            dtype=torch.float32,
+        )
+        o_ffn = torch.zeros_like(h_prev)
+        o_ffn[0, 3] = torch.tensor([0.2, -0.1])
+        attention = torch.zeros(1, 2, 4, 4, dtype=torch.float32)
+        attention[0, 0, 3, :3] = torch.tensor([0.7, 0.2, 0.1])
+        attention[0, 1, 3, :3] = torch.tensor([0.1, 0.4, 0.5])
+        capture = {
+            "h_prev": h_prev,
+            "h_mid": h_prev,
+            "o_attn": torch.zeros_like(h_prev),
+            "o_ffn": o_ffn,
+            "attn_weights": attention,
+        }
+        result = compute_four_gate_dgst_batch_from_captures(
+            model=model,
+            captures=[capture],
+            visual_start=0,
+            visual_end=3,
+            target_token_ids=[1],
+            prediction_positions=[3],
+            transport_top_k=3,
+            target_region_top_k=32,
+            enabled_methods=[DIRECT_HPRE_SOFTMAX_METHOD],
+        )[0]
+
+        vocab_logits = F.linear(h_prev[0, :3], layer.weight, layer.bias)
+        expected_probs = torch.softmax(vocab_logits, dim=-1)[:, 1]
+        expected_target_dist = expected_probs / expected_probs.sum()
+
+        self.assertEqual(result["dgst_t_profile"], "target_comparison_v3")
+        self.assertEqual(
+            result["dgst_t_four_gate_methods"],
+            [DIRECT_HPRE_SOFTMAX_METHOD],
+        )
+        self.assertNotIn(
+            f"dgst_t_{DIRECT_HPRE_SOFTMAX_METHOD}_gate_per_layer",
+            result,
+        )
+        self.assertTrue(
+            torch.allclose(
+                result[
+                    "dgst_t_hpre_softmax_prob_direct_"
+                    "target_prob_matrix_per_layer"
+                ][0].float(),
+                expected_probs,
+                atol=5e-4,
+            )
+        )
+        self.assertEqual(
+            result[
+                "dgst_t_hpre_softmax_prob_direct_target_prob_matrix_per_layer"
+            ].dtype,
+            torch.float32,
+        )
+        self.assertTrue(
+            torch.allclose(
+                result[
+                    "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer"
+                ][0].float(),
+                expected_target_dist,
+                atol=5e-4,
+            )
+        )
+        risk_key = (
+            "dgst_t_hpre_softmax_prob_direct_risk_sqrt_hpre_per_layer"
+        )
+        self.assertTrue(torch.isfinite(result[risk_key]).all())
+
+        record = _build_four_gate_feature_record(
+            image_id=9,
+            span={"word": "phone", "label": 0},
+            response_index=3,
+            target_token_id=1,
+            model_out=SimpleNamespace(token_id=1),
+            dgst_t=result,
+        )
+        self.assertEqual(
+            record["feature_schema_version"],
+            "dgst-target-comparison-v3",
+        )
+        self.assertNotIn(
+            f"dgst_t_{DIRECT_HPRE_SOFTMAX_METHOD}_gate_per_layer",
+            record,
+        )
+        matrix, labels = build_selected_matrix(
+            [record],
+            parse_feature_set(
+                "hpre_softmax_prob_direct_risk+"
+                "hpre_softmax_prob_direct_target_cosine+"
+                "hpre_softmax_prob_direct_ev"
+            ),
+        )
+        self.assertEqual(matrix.shape, (1, 3))
+        self.assertEqual(labels.tolist(), [0])
 
     def test_method_only_can_release_full_hook_captures_layerwise(self) -> None:
         layer = self._output_layer()
