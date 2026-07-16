@@ -1,30 +1,18 @@
-# fj01 server config for COCO4000 all feature extraction.
+# Unified COCO hallucination-detection experiment settings.
 #
-# Runtime:
-#   /root/rivermind-data/envs/token-detector/bin/python
-# Data:
-#   /root/rivermind-data/dataset/coco
-# Models:
-#   /root/rivermind-fs/xiongbo/models
+# `run.sh` only selects model/output/devices and invokes the three stages.
+# Prompt, extraction families, DGST branches and training behavior live here.
+# The active DGST profile is visual-only and contains four Gaussian-MAD
+# branches plus one raw-attention control. Historical VP/legacy/topmass/FFN/
+# Sinkhorn experiments remain in their older config files and are intentionally
+# absent from this active YAML.
+
+run:
+  prompt: "Describe this image."
+  extraction_mode: "all"                   # all | method_only | ads_cgc_only | baseline_only
 
 experiment:
-  mode: "coco4000_all"
-  dgst_t_support_scope: "visual_prompt"
-  feature_sets:
-    default:
-      - "risk_geo_raw"
-      - "c_vp"
-      - "r_es"
-      - "target_cosine"
-      - "cosine16"
-      - "vv_source_entropy"
-      - "vv_target_entropy"
-      - "vv_evidence_entropy"
-      - "vv_source_topk_entropy"
-      - "vp_source_entropy"
-      - "vp_target_entropy"
-      - "vp_evidence_entropy"
-      - "vp_source_topk_entropy"
+  mode: "vv"                               # Fixed visual-only support for this profile.
 
 models:
   llava_1_5_7b:
@@ -38,6 +26,36 @@ models:
     temperature: 0.1
     top_p: 0.5
     prompt_template: "USER: <image>\nDescribe this image.\nASSISTANT:"
+
+  llava_onevision_1_5_8b:
+    hf_name: "/root/rivermind-fs/xiongbo/models/LLaVA-OneVision-1.5-8B-Instruct"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    image_size: 336
+    patch_size: 14
+    num_layers: 36
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    image_token: "<|image_pad|>"
+    prompt_template: null
+
+  llava_onevision_1_5_8b_instruct:
+    hf_name: "/root/rivermind-fs/xiongbo/models/LLaVA-OneVision-1.5-8B-Instruct"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    image_size: 336
+    patch_size: 14
+    num_layers: 36
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    image_token: "<|image_pad|>"
+    prompt_template: null
 
   internvl_2_5_8b:
     hf_name: "/root/rivermind-fs/xiongbo/models/InternVL2_5-8B"
@@ -66,7 +84,67 @@ models:
     vision_end_token: "<|vision_end|>"
     prompt_template: null
 
+  qwen3_vl_8b:
+    hf_name: "/root/rivermind-fs/xiongbo/models/Qwen3-VL-8B-Instruct"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    image_size: 448
+    patch_size: 16
+    num_layers: 36
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    prompt_template: null
+
 feature_extraction:
+  # Family switches define what is available; run.extraction_mode selects the
+  # active subset without adding method switches to run.sh.
+  method:
+    enabled: true
+  ads_cgc:
+    enabled: true
+  baseline:
+    enabled: true
+    output_subdir: "baseline"
+    methods: ["metatoken", "svar", "dhcp", "projectaway", "halloc"]
+    seed: 42
+    metatoken:
+      classifiers: ["lr", "gb"]             # LR(lbfgs), GB(100 estimators).
+      gb_n_estimators: 100
+    svar:
+      layer_start: 5                         # Inclusive; official LLaVA range is 5..18.
+      layer_end: 19                          # Exclusive.
+      hidden_dim: 248
+      learning_rate: 0.001
+      batch_size: 32
+      epochs: 50
+      early_stopping_patience: 5             # Validation loss only.
+    dhcp:
+      # Cross-backbone adaptation: dynamic visual grids are mass-preservingly
+      # resized to a fixed shape. The original LLaVA DHCP uses native P=576.
+      spatial_size: [12, 12]
+      hidden_dim: 128
+      learning_rate: 0.001
+      batch_size: 1024
+      epochs: 30
+      early_stopping_patience: 5
+      shard_dtype: "float16"
+    projectaway:
+      detection_only: true
+    halloc:
+      clip_model: "/root/rivermind-fs/xiongbo/models/clip-vit-base-patch32"          # Local pretrained CLIP ViT-B/32.
+      visualbert_model: "/root/rivermind-fs/xiongbo/models/visualbert-vqa-coco-pre" # Local pretrained VisualBERT.
+      freeze_clip: true
+      learning_rate: 1.0e-6
+      weight_decay: 1.0e-2
+      betas: [0.9, 0.999]
+      batch_size: 16
+      epochs: 25
+      scheduler: "cosine"
+      early_stopping_patience: 3
+
   ads:
     top_patch_pct: 0.10
     connectivity: 8
@@ -79,46 +157,104 @@ feature_extraction:
     use_attn_weighting: false
 
   dgst_t:
+    enabled: true
+    feature_output_profile: "four_gate_vv"   # Four Gaussian gates plus the raw-attention control.
+    target_gate_mode: "four_gate"
+    save_raw_capture: false                   # Only final matrices/curves are serialized.
+    # raw_logit is the target-word unembedding dot product; softmax_prob applies
+    # vocabulary softmax first.  Methods can also be removed from this list.
+    four_gate_methods:
+      - "hpre_raw_logit_gauss"
+      - "hpre_softmax_prob_gauss"
+      - "hmid_raw_logit_gauss"
+      - "hmid_softmax_prob_gauss"
+      # Control: use post-softmax visual support-attention directly as the
+      # target distribution; do not multiply it by a Gaussian gate.
+      - "raw_attention"
+    # Boolean form retained for convenient one-line switches.
+    branches:
+      hpre_raw_logit_gauss: true
+      hpre_softmax_prob_gauss: true
+      hmid_raw_logit_gauss: true
+      hmid_softmax_prob_gauss: true
+      raw_attention: true
+
+    # Shared transport math for all four gates and the raw-attention control.
     tau: 0.07
     source_distribution_mode: "softmax"
+    support_scope: "visual"
     transport_top_k: 64
-    cost_mode: "decomposed"
-    lambda_d: 1.0
-    lambda_s: 1.0
-    lambda_t: 1.0
-    lambda_int: 1.0
-    baseline_layers: 10
-    risk_start_layer: 15
-    alpha: 2.0
+    cost_mode: "sqrt_hpre"
     ot_solver: "emd"
     atarget_visual_top_k: 32
-    compute_topmass_085: false
-    compute_capped_topmass_085: true
-    topmass_085_alpha: 0.85
-    capped_topmass_085_alpha: 0.85
-    capped_topmass_085_min_k: 32
-    capped_topmass_085_max_k: 64
-    target_gate_mode: "relative"
     relative_vll_mad_epsilon: 1.0e-6
-    relative_vll_logit_source: "h_mid"
-    relative_cost_mode: "geo"
-    relative_cost_modes: ["geo", "semantic_match_geo"]
-    relative_cost_state_modes: ["state_update"]
-    relative_cost_update_lambdas: [1.0]
-    source_modes: ["legacy_ffn", "hmid_proj", "hprev_cos", "hprev_proj"]
-    relative_barrier_lambda: 1.0
-    relative_barrier_margin: 0.5
-    relative_barrier_max: 3.0
-    compute_ffn_injection_features: false
-    dgst_t_dual_scope: true
+    target_attention_epsilon: 1.0e-12
+    matrix_dtype: "float16"                  # attention/source/gates [L,P].
+    curve_dtype: "float32"                   # risk/target-cosine/EV [L].
+
+    # Deprecated VP, legacy-probability, cost-sweep, topmass, FFN-diagnostic,
+    # and Sinkhorn switches intentionally do not appear in the active config.
 
 dataset:
   coco_root: "/root/rivermind-data/dataset/coco"
   annotation_file: "/root/rivermind-data/dataset/coco/annotations/instances_val2014.json"
   captions_file: "/root/rivermind-data/dataset/coco/annotations/captions_val2014.json"
   num_images: 4000
-  train_ratio: 0.90
+  split_strategy: "strict_811"               # Mutually exclusive image-level split.
+  train_ratio: 0.80
+  val_ratio: 0.10
+  test_ratio: 0.10
   seed: 42
+  # Cross-model master split.  A different 4,000-image cohort is rejected.
+  shared_split_path: "outputs/shared/COCO4000_seed42_image_splits_811.json"
+
+# Root features.pkl probe settings. Names are aliases registered by the
+# feature-training implementation and are read directly by train_and_eval.py.
+training:
+  trainer: "torch_mlp"                     # torch_mlp | sklearn
+  positive_class: "hallucination"          # hallucination | real
+  baseline:
+    # Training-only selection: this does not change/re-extract baseline/features.pkl.
+    # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
+    methods: ["metatoken", "svar", "dhcp", "projectaway"]
+    seeds: [42, 43, 44]                     # Use [42] for a quick single-seed run.
+    write_summary: true                     # Per-seed MD + aggregate mean/std MD.
+  torch_probe:
+    batch_size: 256
+    num_epochs: 100
+    early_stopping_patience: 10
+    seeds: [42, 43, 44]                     # Shared by method and ADS+CGC probes.
+  feature_sets:
+    method:
+      - "hpre_raw_logit_gauss_risk"
+      - "hpre_raw_logit_gauss_target_cosine"
+      - "hpre_raw_logit_gauss_ev"
+      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_target_cosine"
+      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_ev"
+      - "hpre_softmax_prob_gauss_risk"
+      - "hpre_softmax_prob_gauss_target_cosine"
+      - "hpre_softmax_prob_gauss_ev"
+      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_target_cosine"
+      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev"
+      - "hmid_raw_logit_gauss_risk"
+      - "hmid_raw_logit_gauss_target_cosine"
+      - "hmid_raw_logit_gauss_ev"
+      - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_target_cosine"
+      - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_ev"
+      - "hmid_softmax_prob_gauss_risk"
+      - "hmid_softmax_prob_gauss_target_cosine"
+      - "hmid_softmax_prob_gauss_ev"
+      - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_target_cosine"
+      - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev"
+      - "raw_attention_risk"
+      - "raw_attention_target_cosine"
+      - "raw_attention_ev"
+      - "raw_attention_risk+raw_attention_target_cosine"
+      - "raw_attention_risk+raw_attention_ev"
+    ads_cgc:
+      - "ads"
+      - "cgc"
+      - "ads+cgc"
 
 classifiers:
   xgb:
@@ -139,6 +275,8 @@ pope:
   splits: ["random", "popular", "adversarial"]
   prompt_templates:
     llava_1_5_7b: "USER: <image>\n{question}\nAnswer the question using a single word or phrase.\nASSISTANT:"
+    llava_onevision_1_5_8b: "{question}\nAnswer the question using a single word or phrase."
+    llava_onevision_1_5_8b_instruct: "{question}\nAnswer the question using a single word or phrase."
     internvl_2_5_8b: "{question}\nAnswer the question using a single word or phrase."
     qwen2_5_vl_7b: "{question}\nAnswer the question using a single word or phrase."
     _default: "{question}\nAnswer the question using a single word or phrase."

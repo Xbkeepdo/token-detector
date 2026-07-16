@@ -1,5 +1,11 @@
 # Current Task
 
+## 2026-07-16 fj01 服务器统一配置同步
+
+- 将 `configs/model_configs_server_fj01.yaml` 从旧的 COCO4000 visual-prompt/cost-variant 配置升级为当前 `model_configs_unified.yaml` 的服务器路径镜像。
+- 两份配置的实验逻辑、五模型参数、四分支 DGST + raw-attention、baseline、ADS+CGC、严格 8:1:1、三随机种子训练和自动汇总设置完全一致。
+- fj01 专属配置只替换模型路径为 `/root/rivermind-fs/xiongbo/models/...`，COCO 路径为 `/root/rivermind-data/dataset/coco`；相对输出和 shared split 路径保持不变。
+
 ## 2026-07-15 四分支 DGST、baseline 与统一流水线
 
 - Active DGST profile is now the compact four-gate path: hpre/hmid raw target logits and vocabulary-softmax probabilities each share one chunked vocabulary projection, then independently produce Gaussian-MAD gate, exact-EMD sqrt-hpre risk, top-32 hpre target cosine, and EV. Only the eight compact capture inputs and final matrices/curves survive; full vocabulary matrices and decoder captures are released promptly.
