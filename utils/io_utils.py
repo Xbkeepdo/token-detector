@@ -55,8 +55,25 @@ def load_pkl(path):
 
 
 def save_json(obj, path):
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=2, default=str)
+    """Atomically persist JSON so an interrupted write cannot truncate it."""
+
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".tmp-", suffix=".json", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def load_json(path):

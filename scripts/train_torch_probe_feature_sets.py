@@ -39,7 +39,8 @@ from train_feature_sets import (
     build_selected_matrix,
     parse_feature_set,
 )
-from utils.io_utils import load_json, load_pkl, save_json
+from scripts.training_provenance import load_validated_training_features
+from utils.io_utils import load_json, save_json
 
 
 DEFAULT_FEATURE_SETS = [
@@ -185,7 +186,6 @@ def main() -> None:
     if not os.path.exists(splits_path):
         raise FileNotFoundError(splits_path)
 
-    all_features = load_pkl(feature_path)
     splits = load_json(splits_path)
     from utils.split_utils import validate_strict_811_split
 
@@ -198,6 +198,14 @@ def main() -> None:
             "Strict split size differs from dataset.num_images: "
             f"{sum(split_counts.values())} != {configured_count}"
         )
+    all_features = load_validated_training_features(
+        feature_path=feature_path,
+        artifact_family="root",
+        model_key=args.model,
+        config=yaml_config,
+        output_dir=args.output_dir,
+        image_splits=splits,
+    )
     train_feats, val_feats, test_feats = split_by_image_id(
         all_features,
         train_image_ids={int(x) for x in splits["train"]},

@@ -44,13 +44,20 @@ from .schema import (
     make_baseline_record,
     validate_baseline_record,
 )
-from .svar import SVARFeatures, compute_svar_features
+from .svar import (
+    SUPPORTED_SVAR_PROTOCOLS,
+    SVARFeatures,
+    compute_svar_features,
+    normalize_svar_protocols,
+    prepare_official_svar_spans,
+)
 
 __all__ = [
     "BASELINE_SCHEMA_VERSION",
     "BaselineExtractionContext",
     "BaselineRuntime",
     "SUPPORTED_BASELINES",
+    "SUPPORTED_SVAR_PROTOCOLS",
     "DEFAULT_CLIP_MODEL",
     "DEFAULT_VISUALBERT_MODEL",
     "DHCPShardReader",
@@ -77,6 +84,8 @@ __all__ = [
     "infer_patch_grid",
     "make_baseline_record",
     "normalize_baseline_methods",
+    "normalize_svar_protocols",
+    "prepare_official_svar_spans",
     "resize_attention_preserve_mass",
     "validate_baseline_record",
 ]

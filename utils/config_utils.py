@@ -21,6 +21,9 @@ VALID_DGST_BRANCHES = (
     "hmid_softmax_prob_gauss",
     "raw_attention",
 )
+VALID_LABEL_SAMPLE_UNITS = {"first_canonical_mention"}
+VALID_LABEL_LOCATORS = {"exact_response_offsets"}
+VALID_ALIGNMENT_FAILURE_POLICIES = {"error", "skip"}
 PIPELINE_STAGES = (
     "generation",
     "labeling",
@@ -28,6 +31,15 @@ PIPELINE_STAGES = (
     "training",
     "plotting",
 )
+
+_LABELING_DEFAULTS = {
+    "schema_version": 2,
+    "sample_unit": "first_canonical_mention",
+    "primary_locator": "exact_response_offsets",
+    "save_all_mentions": True,
+    "save_svar_official_samples": True,
+    "alignment_failure_policy": "error",
+}
 
 _RUN_DEFAULTS = {
     "prompt": "Describe this image.",
@@ -218,6 +230,56 @@ def get_dgst_t_cfg(config: dict) -> dict:
 
 def get_dataset_cfg(config: dict) -> dict:
     return config["dataset"]
+
+
+def get_labeling_cfg(config: Mapping[str, object]) -> dict:
+    """Return and validate the schema-v2 COCO labeling protocol."""
+
+    raw = config.get("labeling") or {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("labeling must be a YAML mapping")
+    unknown = sorted(set(raw) - set(_LABELING_DEFAULTS))
+    if unknown:
+        raise ValueError(f"Unknown labeling options: {unknown}")
+    result = _deep_merge(_LABELING_DEFAULTS, dict(raw))
+    try:
+        result["schema_version"] = int(result["schema_version"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("labeling.schema_version must be 2") from exc
+    if result["schema_version"] != 2:
+        raise ValueError("Only labeling.schema_version=2 is supported")
+
+    sample_unit = str(result["sample_unit"]).strip().lower()
+    if sample_unit not in VALID_LABEL_SAMPLE_UNITS:
+        raise ValueError(
+            "labeling.sample_unit must be one of "
+            f"{sorted(VALID_LABEL_SAMPLE_UNITS)}"
+        )
+    result["sample_unit"] = sample_unit
+
+    locator = str(result["primary_locator"]).strip().lower()
+    if locator not in VALID_LABEL_LOCATORS:
+        raise ValueError(
+            "labeling.primary_locator must be one of "
+            f"{sorted(VALID_LABEL_LOCATORS)}"
+        )
+    result["primary_locator"] = locator
+
+    for key in ("save_all_mentions", "save_svar_official_samples"):
+        result[key] = _parse_bool(result[key], name=f"labeling.{key}")
+    if not result["save_all_mentions"]:
+        raise ValueError(
+            "labeling.save_all_mentions must remain true in schema v2 so "
+            "standard occurrence-level CHAIRs/CHAIRi can be reproduced"
+        )
+    failure_policy = str(result["alignment_failure_policy"]).strip().lower()
+    if failure_policy not in VALID_ALIGNMENT_FAILURE_POLICIES:
+        raise ValueError(
+            "labeling.alignment_failure_policy must be one of "
+            f"{sorted(VALID_ALIGNMENT_FAILURE_POLICIES)}"
+        )
+    result["alignment_failure_policy"] = failure_policy
+    return result
 
 
 def get_classifier_cfgs(config: dict) -> dict:

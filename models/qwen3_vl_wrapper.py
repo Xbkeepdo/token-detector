@@ -411,17 +411,13 @@ class Qwen3VLWrapper(BaseLVLMWrapper):
         requirements: Optional[ExtractionRequirements] = None,
     ) -> List[ModelOutput]:
         """Sequential-prefix extraction keeps full attentions within GPU limits."""
-        requested_indices = [int(index) for index in response_token_indices]
+        response_ids, requested_indices, targets = self.validate_causal_batch_request(
+            response_token_ids=response_token_ids,
+            response_token_indices=response_token_indices,
+            target_token_ids=target_token_ids,
+        )
         if not requested_indices:
             return []
-        response_ids = [int(token_id) for token_id in response_token_ids]
-        targets = (
-            [int(token_id) for token_id in target_token_ids]
-            if target_token_ids is not None
-            else [response_ids[index] for index in requested_indices]
-        )
-        if len(targets) != len(requested_indices):
-            raise ValueError("target_token_ids and response_token_indices must match in length.")
 
         per_prefix_requirements = requirements
         if requirements is not None and requirements.response_hidden_states:

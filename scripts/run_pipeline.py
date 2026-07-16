@@ -23,10 +23,21 @@ sys.path.insert(0, str(REPO_ROOT))
 from utils.config_utils import (  # noqa: E402
     VALID_DGST_BRANCHES,
     extraction_mode_flags,
+    get_model_cfg,
     load_config,
     resolve_run_config,
 )
-from utils.split_utils import ensure_strict_811_split  # noqa: E402
+from utils.generation_provenance import (  # noqa: E402
+    GENERATION_MANIFEST_NAME,
+    build_generation_manifest,
+    canonical_generation_payload,
+    stable_sha256 as stable_generation_sha256,
+    validate_generation_manifest,
+)
+from utils.split_utils import (  # noqa: E402
+    ensure_strict_811_split,
+    validate_strict_811_split,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +63,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", dest="resume", action="store_true", default=None)
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.add_argument(
+        "--reuse-generations-from",
+        default=None,
+        help=(
+            "Seed a new output directory from another experiment's "
+            "generations.json and image_splits.json. Labeling/features are "
+            "never copied."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Resolve and print commands without creating or changing artifacts.",
@@ -74,8 +94,34 @@ def main() -> None:
     resolved_config_path = output_dir / "resolved_pipeline_config.yaml"
     if args.dry_run:
         command_config_path = config_path
+        if args.reuse_generations_from:
+            print(
+                "[Pipeline] DRY RUN: would reuse generations from "
+                f"{_repo_path(args.reuse_generations_from)}"
+            )
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
+        if args.reuse_generations_from:
+            if bool(run["stages"]["generation"]):
+                raise ValueError(
+                    "--reuse-generations-from requires the generation stage "
+                    "to be disabled; the reused captions are the generation "
+                    "artifact for this experiment."
+                )
+            source = _repo_path(args.reuse_generations_from)
+            expected_image_ids = _dataset_selected_image_ids(config)
+            model_cfg = get_model_cfg(config, str(run["model"]))
+            _reuse_generation_artifacts(
+                source,
+                output_dir,
+                model=str(run["model"]),
+                model_cfg=model_cfg,
+                prompt=str(run["prompt"]),
+                expected_image_ids=expected_image_ids,
+                resume=bool(run.get("resume")),
+                adopt_legacy=bool(run.get("adopt_legacy_artifacts", False)),
+            )
+            run["reuse_generations_from"] = str(source.resolve())
         if not bool(run.get("resume")):
             _prepare_fresh_artifacts(output_dir, run, config)
         _validate_or_write_manifest(output_dir, run, config)
@@ -95,7 +141,12 @@ def main() -> None:
     labeling_enabled = bool(run["stages"]["labeling"])
     if generation_enabled or labeling_enabled:
         if labeling_enabled and not generation_enabled:
-            _require_complete_generations(output_dir, int(config["dataset"]["num_images"]))
+            _require_complete_generations(
+                output_dir,
+                config=config,
+                run=run,
+                expected_image_ids=_dataset_selected_image_ids(config),
+            )
         label_command = build_label_command(
             run=run,
             config_path=command_config_path,
@@ -103,6 +154,22 @@ def main() -> None:
             force_resume=(labeling_enabled and not generation_enabled),
         )
         _run(label_command, dry_run=args.dry_run)
+        if not args.dry_run:
+            _require_complete_generations(
+                output_dir,
+                config=config,
+                run=run,
+                expected_image_ids=_dataset_selected_image_ids(config),
+            )
+            # Labeling is produced by the combined generation/label command.
+            # Refresh the artifact-level provenance only after the atomic JSON
+            # has landed.
+            _validate_or_write_manifest(
+                output_dir,
+                run,
+                config,
+                allow_labeling_update=True,
+            )
         if generation_enabled and not labeling_enabled:
             print(
                 "[Pipeline] NOTE: label_coco.py combines generation and labeling; "
@@ -257,7 +324,7 @@ def build_baseline_extract_command(
     assert isinstance(devices, Mapping)
     command = [
         sys.executable,
-        "scripts/extract_baselines.py",
+        "scripts/extract_features.py",
         "--model",
         str(run["model"]),
         "--config",
@@ -266,6 +333,8 @@ def build_baseline_extract_command(
         str(output_dir),
         "--prompt",
         str(run["prompt"]),
+        "--extraction-mode",
+        "baseline_only",
         "--device",
         str(devices["primary"]),
         "--feature-devices",
@@ -495,59 +564,123 @@ def _effective_feature_flags(config: Mapping[str, object]) -> dict[str, bool]:
     return result
 
 
-def _selected_image_ids(config: dict, output_dir: Path) -> list[int]:
-    expected_count = int(config["dataset"]["num_images"])
-    labeling_path = output_dir / "labeling.json"
-    if labeling_path.exists():
-        rows = _load_json(labeling_path)
-        ids = sorted(int(value) for value in rows)
-        if len(ids) == expected_count:
-            return ids
-
-    generations_path = output_dir / "generations.json"
-    if generations_path.exists():
-        rows = _load_json(generations_path)
-        ids = sorted(
-            int(image_id)
-            for image_id, row in rows.items()
-            if isinstance(row, Mapping) and row.get("generated_text")
-        )
-        if len(ids) == expected_count:
-            return ids
+def _dataset_selected_image_ids(config: Mapping[str, object]) -> list[int]:
+    """Load the deterministic COCO cohort independently of retained artifacts."""
 
     from data.coco_loader import load_coco_samples
 
-    dataset = config["dataset"]
+    dataset = config.get("dataset") or {}
+    if not isinstance(dataset, Mapping):
+        raise ValueError("dataset must be a mapping")
+    expected_count = int(dataset["num_images"])
     samples = load_coco_samples(
-        images_dir=os.path.join(dataset["coco_root"], "val2014"),
-        instances_file=dataset["annotation_file"],
-        captions_file=dataset["captions_file"],
+        images_dir=os.path.join(str(dataset["coco_root"]), "val2014"),
+        instances_file=str(dataset["annotation_file"]),
+        captions_file=str(dataset["captions_file"]),
         num_images=expected_count,
         seed=int(dataset.get("seed", 42)),
     )
-    return sorted(int(sample["image_id"]) for sample in samples)
+    image_ids = [int(sample["image_id"]) for sample in samples]
+    if len(image_ids) != expected_count or len(set(image_ids)) != expected_count:
+        raise ValueError(
+            "Selected COCO cohort is incomplete or contains duplicate image IDs: "
+            f"selected={len(image_ids)}, unique={len(set(image_ids))}, "
+            f"expected={expected_count}"
+        )
+    return sorted(image_ids)
 
 
-def _require_complete_generations(output_dir: Path, expected_count: int) -> None:
+def _selected_image_ids(config: dict, output_dir: Path) -> list[int]:
+    """Return the canonical cohort after checking every retained ID universe."""
+
+    expected_ids = _dataset_selected_image_ids(config)
+    expected_set = set(expected_ids)
+    labeling_path = output_dir / "labeling.json"
+    if labeling_path.exists():
+        rows = _load_json(labeling_path)
+        try:
+            actual_ids = [int(value) for value in rows]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid image ID in {labeling_path}") from exc
+        if len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != expected_set:
+            raise ValueError(
+                f"{labeling_path} does not match the selected COCO cohort; "
+                f"missing={len(expected_set - set(actual_ids))}, "
+                f"extra={len(set(actual_ids) - expected_set)}"
+            )
+
+    generations_path = output_dir / "generations.json"
+    if generations_path.exists():
+        canonical_generation_payload(
+            _load_json(generations_path),
+            expected_image_ids=expected_ids,
+        )
+    return expected_ids
+
+
+def _require_complete_generations(
+    output_dir: Path,
+    *,
+    config: dict,
+    run: Mapping[str, object],
+    expected_image_ids: Optional[Sequence[int]] = None,
+) -> dict[str, object]:
+    """Validate complete captions, actual response IDs, and generation identity."""
+
     path = output_dir / "generations.json"
+    if path.is_symlink():
+        raise ValueError(f"Refusing a symlinked generation artifact: {path}")
     if not path.exists():
         raise FileNotFoundError(
             f"labeling=true with generation=false requires existing {path}"
         )
-    rows = _load_json(path)
-    complete = sum(
-        1
-        for row in rows.values()
-        if isinstance(row, Mapping) and row.get("generated_text")
+    image_ids = list(expected_image_ids or _dataset_selected_image_ids(config))
+    generations = _load_json(path)
+    canonical_generation_payload(
+        generations,
+        expected_image_ids=image_ids,
     )
-    if complete != expected_count:
-        raise ValueError(
-            "generation stage is disabled, but generations.json is incomplete: "
-            f"complete={complete}, expected={expected_count}"
+
+    model = str(run["model"])
+    prompt = str(run["prompt"])
+    model_cfg = get_model_cfg(config, model)
+    manifest_path = output_dir / GENERATION_MANIFEST_NAME
+    if manifest_path.is_symlink():
+        raise ValueError(f"Refusing a symlinked generation manifest: {manifest_path}")
+    if manifest_path.exists():
+        manifest = _load_json(manifest_path)
+        validate_generation_manifest(
+            manifest,
+            model=model,
+            model_cfg=model_cfg,
+            prompt=prompt,
+            generations=generations,
+            expected_image_ids=image_ids,
         )
+        return dict(manifest)
+
+    manifest = build_generation_manifest(
+        model=model,
+        model_cfg=model_cfg,
+        prompt=prompt,
+        generations=generations,
+        expected_image_ids=image_ids,
+    )
+    _atomic_write_json(manifest_path, manifest)
+    print(
+        f"[Pipeline] Complete generations.json validated; wrote "
+        f"{GENERATION_MANIFEST_NAME} automatically."
+    )
+    return manifest
 
 
-def _validate_or_write_manifest(output_dir: Path, run: dict, config: dict) -> None:
+def _validate_or_write_manifest(
+    output_dir: Path,
+    run: dict,
+    config: dict,
+    *,
+    allow_labeling_update: bool = False,
+) -> None:
     path = output_dir / "pipeline_manifest.json"
     extraction = config.get("feature_extraction") or {}
     baseline = (
@@ -579,12 +712,19 @@ def _validate_or_write_manifest(output_dir: Path, run: dict, config: dict) -> No
             _directory_has_files(baseline_dir / "feature_parts"),
             _directory_has_files(baseline_dir / "dhcp"),
             _directory_has_files(baseline_dir / "halloc"),
+            _directory_has_files(baseline_dir / "svar_official"),
         )
+    )
+    safe_labeling_update = bool(
+        allow_labeling_update
+        and not root_artifacts_exist
+        and not baseline_artifacts_exist
     )
 
     previous = _load_json(path) if path.exists() else {}
     root_hash = _root_features_config_sha256(config, run)
     baseline_hash = _baseline_features_config_sha256(config, run)
+    labeling_artifact = _labeling_artifact_metadata(output_dir, config)
     # A mode that does not own one feature family must not overwrite that
     # family's provenance.  This is what makes baseline-only genuinely
     # isolated from the root feature file (and vice versa).
@@ -593,8 +733,15 @@ def _validate_or_write_manifest(output_dir: Path, run: dict, config: dict) -> No
     if not flags["baseline"]:
         baseline_hash = previous.get("baseline_features_config_sha256")
 
+    labeling_provenance_keys = (
+        "labeling_sha256",
+        "labeling_manifest_sha256",
+        "labeling_schema_version",
+        "labeling_primary_locator",
+        "labeling_sample_unit",
+    )
     current = {
-        "manifest_version": 2,
+        "manifest_version": 3,
         "model": str(run["model"]),
         "prompt": str(run["prompt"]),
         "num_images": int(config["dataset"]["num_images"]),
@@ -607,17 +754,51 @@ def _validate_or_write_manifest(output_dir: Path, run: dict, config: dict) -> No
         "chair_cache": str(run.get("chair_cache") or ""),
         "generation_config_sha256": _generation_config_sha256(config, run),
         "labeling_config_sha256": _labeling_config_sha256(config, run),
+        **labeling_artifact,
         "root_features_config_sha256": root_hash,
         "baseline_features_config_sha256": baseline_hash,
     }
+    if (
+        not labeling_path.exists()
+        and (root_artifacts_exist or baseline_artifacts_exist)
+        and previous
+    ):
+        # A fresh generation/labeling stage must not erase the provenance of
+        # retained features before the replacement labels can be compared.
+        for key in labeling_provenance_keys:
+            current[key] = previous.get(key)
+    if run.get("reuse_generations_from"):
+        current["generation_reuse_source"] = str(run["reuse_generations_from"])
     has_reusable_artifacts = (
         labeling_path.exists()
         or generation_artifacts_exist
         or root_artifacts_exist
         or baseline_artifacts_exist
     )
+    generation_only_seed = False
+    if (
+        generations_path.is_file()
+        and not labeling_path.exists()
+        and not root_artifacts_exist
+        and not baseline_artifacts_exist
+    ):
+        generation_payload = canonical_generation_payload(
+            _load_json(generations_path)
+        )
+        dataset_cfg = config.get("dataset") or {}
+        expected_count = int(
+            dataset_cfg.get("num_images", len(generation_payload))
+        )
+        generation_only_seed = bool(generation_payload) and (
+            len(generation_payload) == expected_count
+        )
     if not path.exists() and has_reusable_artifacts:
-        if not bool(run.get("adopt_legacy_artifacts", False)):
+        if generation_only_seed:
+            print(
+                "[Pipeline] Registering generation-only artifacts in the new "
+                "output manifest."
+            )
+        elif not bool(run.get("adopt_legacy_artifacts", False)):
             raise ValueError(
                 "Existing artifacts have no pipeline_manifest.json, so their "
                 "model/prompt/feature configuration cannot be verified. Set "
@@ -625,10 +806,11 @@ def _validate_or_write_manifest(output_dir: Path, run: dict, config: dict) -> No
                 "run.adopt_legacy_artifacts=true in the coordinator) once to "
                 "trust and register them, or use a new output_dir."
             )
-        print(
-            "[Pipeline] WARNING: adopting legacy artifacts without a prior "
-            "manifest; subsequent resume runs will be fingerprint-checked."
-        )
+        else:
+            print(
+                "[Pipeline] WARNING: adopting legacy artifacts without a prior "
+                "manifest; subsequent resume runs will be fingerprint-checked."
+            )
 
     if path.exists() and has_reusable_artifacts:
         checks: dict[str, str | None] = {}
@@ -640,6 +822,8 @@ def _validate_or_write_manifest(output_dir: Path, run: dict, config: dict) -> No
             checks["labeling_config_sha256"] = current[
                 "labeling_config_sha256"
             ]
+            for key in labeling_provenance_keys:
+                checks[key] = current.get(key)
         if root_artifacts_exist and (flags["method"] or flags["ads_cgc"]):
             checks["root_features_config_sha256"] = current[
                 "root_features_config_sha256"
@@ -678,10 +862,65 @@ def _validate_or_write_manifest(output_dir: Path, run: dict, config: dict) -> No
                 "independent root/baseline fingerprints."
             )
 
+        if allow_labeling_update and (
+            root_artifacts_exist or baseline_artifacts_exist
+        ):
+            changed_labeling = {
+                key: (previous.get(key), current.get(key))
+                for key in labeling_provenance_keys
+                if previous.get(key) != current.get(key)
+            }
+            if changed_labeling:
+                raise ValueError(
+                    "Refusing to accept newly produced labeling while retained "
+                    "feature artifacts still depend on the previous labels: "
+                    f"{changed_labeling}. Remove/re-extract those features or "
+                    "use a new output_dir."
+                )
+
+        missing_labeling_keys = [
+            key
+            for key in (
+                "labeling_sha256",
+                "labeling_schema_version",
+                "labeling_primary_locator",
+            )
+            if key in checks and previous.get(key) in (None, "")
+        ]
+        if missing_labeling_keys and labeling_path.exists():
+            if safe_labeling_update:
+                for key in missing_labeling_keys:
+                    previous[key] = checks[key]
+            elif not bool(run.get("adopt_legacy_artifacts", False)):
+                raise ValueError(
+                    "Existing labeling artifacts use a legacy manifest without "
+                    "schema/locator/content provenance. Set "
+                    "ADOPT_LEGACY_ARTIFACTS=true once to register them, rebuild "
+                    "labeling, or use a new output_dir."
+                )
+            else:
+                for key in missing_labeling_keys:
+                    previous[key] = checks[key]
+                print(
+                    "[Pipeline] WARNING: adopted legacy labeling provenance "
+                    f"for {missing_labeling_keys}."
+                )
+
         mismatches = {
             key: (previous.get(key), value)
             for key, value in checks.items()
             if previous.get(key) != value
+            and not (
+                safe_labeling_update
+                and key
+                in {
+                    "labeling_sha256",
+                    "labeling_manifest_sha256",
+                    "labeling_schema_version",
+                    "labeling_primary_locator",
+                    "labeling_sample_unit",
+                }
+            )
         }
         if mismatches:
             action = "resume" if bool(run.get("resume")) else "reuse"
@@ -735,16 +974,34 @@ def _baseline_features_config_sha256(
     config: Mapping[str, object],
     run: Mapping[str, object],
 ) -> str:
-    """Fingerprint only inputs that change ``baseline/features.pkl``."""
-    extraction = config.get("feature_extraction") or {}
-    if not isinstance(extraction, Mapping):
-        extraction = {}
+    """Fingerprint only inputs that change baseline features or caches."""
+
+    # Keep the coordinator hash identical to the per-artifact manifests used by
+    # both joint and baseline-only extraction. Training-only settings (MLP
+    # widths, optimizers, epochs, classifiers, and early stopping) must not
+    # invalidate already-extracted features.
+    from scripts.extract_features import (
+        _combined_baseline_config,
+        _controlled_baseline_enabled,
+        _controlled_baseline_feature_config,
+        _official_svar_enabled,
+        _official_svar_feature_config,
+    )
+
+    baseline_cfg = _combined_baseline_config(config)
     return _stable_sha256(
         {
             "labeling_config_sha256": _labeling_config_sha256(config, run),
-            "baseline": extraction.get("baseline"),
-            # Older configs used a top-level section; runtime merges both.
-            "baselines": config.get("baselines"),
+            "controlled": (
+                _controlled_baseline_feature_config(baseline_cfg)
+                if _controlled_baseline_enabled(baseline_cfg)
+                else None
+            ),
+            "official": (
+                _official_svar_feature_config(baseline_cfg)
+                if _official_svar_enabled(baseline_cfg)
+                else None
+            ),
         }
     )
 
@@ -775,8 +1032,75 @@ def _labeling_config_sha256(
         {
             "generation_config_sha256": _generation_config_sha256(config, run),
             "chair_cache": str(run.get("chair_cache") or ""),
+            "labeling": config.get("labeling"),
         }
     )
+
+
+def _labeling_artifact_metadata(
+    output_dir: Path,
+    config: Mapping[str, object],
+) -> dict[str, object]:
+    """Return artifact-level labeling provenance for pipeline resume checks."""
+
+    labeling_path = output_dir / "labeling.json"
+    manifest_path = output_dir / "labeling_manifest.json"
+    labeling_cfg = config.get("labeling") or {}
+    if not isinstance(labeling_cfg, Mapping):
+        labeling_cfg = {}
+
+    manifest: Mapping[str, object] = {}
+    if manifest_path.exists():
+        loaded = _load_json(manifest_path)
+        if isinstance(loaded, Mapping):
+            manifest = loaded
+    labeling_sha256 = (
+        _stable_sha256(_load_json(labeling_path))
+        if labeling_path.exists()
+        else None
+    )
+    if (
+        labeling_sha256 is not None
+        and manifest.get("labeling_sha256") not in (None, labeling_sha256)
+    ):
+        raise ValueError(
+            "labeling.json does not match labeling_manifest.json; rebuild "
+            "schema-v2 labeling before reusing downstream artifacts."
+        )
+
+    schema = (
+        manifest.get("label_schema_version")
+        or manifest.get("schema_version")
+        or manifest.get("labeling_schema_version")
+        or labeling_cfg.get("schema_version")
+    )
+    locator = (
+        manifest.get("primary_locator")
+        or manifest.get("labeling_primary_locator")
+        or labeling_cfg.get("primary_locator")
+    )
+    sample_unit = (
+        manifest.get("sample_unit")
+        or manifest.get("labeling_sample_unit")
+        or labeling_cfg.get("sample_unit")
+    )
+    return {
+        "labeling_sha256": (
+            labeling_sha256
+        ),
+        "labeling_manifest_sha256": (
+            _file_sha256(manifest_path) if manifest_path.exists() else None
+        ),
+        "labeling_schema_version": (
+            str(schema) if schema not in (None, "") else None
+        ),
+        "labeling_primary_locator": (
+            str(locator) if locator not in (None, "") else None
+        ),
+        "labeling_sample_unit": (
+            str(sample_unit) if sample_unit not in (None, "") else None
+        ),
+    }
 
 
 def _stable_sha256(payload: object) -> str:
@@ -790,6 +1114,200 @@ def _stable_sha256(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _reuse_generation_artifacts(
+    source_dir: Path,
+    output_dir: Path,
+    *,
+    model: str,
+    model_cfg: Mapping[str, object],
+    prompt: str,
+    expected_image_ids: Sequence[int],
+    resume: bool = False,
+    adopt_legacy: bool = False,
+) -> None:
+    """Copy only generation artifacts after validating their full identity."""
+
+    source = source_dir.resolve()
+    destination = output_dir.resolve()
+    if source == destination:
+        raise ValueError(
+            "--reuse-generations-from must point to a different output directory"
+        )
+    if not resume:
+        _refuse_reuse_over_downstream_artifacts(destination)
+
+    image_ids = [int(value) for value in expected_image_ids]
+    source_generations_path = source / "generations.json"
+    if source_generations_path.is_symlink():
+        raise ValueError(
+            f"Refusing a symlinked source generation file: {source_generations_path}"
+        )
+    if not source_generations_path.is_file():
+        raise FileNotFoundError(
+            f"Reusable generation artifact not found: {source_generations_path}"
+        )
+    source_generations = _load_json(source_generations_path)
+    source_payload = canonical_generation_payload(
+        source_generations,
+        expected_image_ids=image_ids,
+    )
+
+    source_manifest_path = source / GENERATION_MANIFEST_NAME
+    if source_manifest_path.is_symlink():
+        raise ValueError(
+            f"Refusing a symlinked source generation manifest: {source_manifest_path}"
+        )
+    if source_manifest_path.exists():
+        source_manifest = _load_json(source_manifest_path)
+        validate_generation_manifest(
+            source_manifest,
+            model=model,
+            model_cfg=model_cfg,
+            prompt=prompt,
+            generations=source_generations,
+            expected_image_ids=image_ids,
+        )
+    else:
+        source_manifest = build_generation_manifest(
+            model=model,
+            model_cfg=model_cfg,
+            prompt=prompt,
+            generations=source_generations,
+            expected_image_ids=image_ids,
+        )
+        print(
+            "[Pipeline] Reusable generations have no manifest; validated "
+            "content and cohort and will create one automatically."
+        )
+
+    target_generations_path = destination / "generations.json"
+    if target_generations_path.is_symlink():
+        raise ValueError(
+            f"Refusing a symlinked target generation file: {target_generations_path}"
+        )
+    if target_generations_path.exists():
+        target_generations = _load_json(target_generations_path)
+        target_payload = canonical_generation_payload(
+            target_generations,
+            expected_image_ids=image_ids,
+        )
+        if stable_generation_sha256(target_payload) != stable_generation_sha256(
+            source_payload
+        ):
+            raise ValueError(
+                "Refusing --reuse-generations-from because target captions or "
+                f"actual response_token_ids differ from source: {target_generations_path}"
+            )
+    else:
+        _copy_reused_artifact(source_generations_path, target_generations_path)
+
+    target_manifest_path = destination / GENERATION_MANIFEST_NAME
+    if target_manifest_path.is_symlink():
+        raise ValueError(
+            f"Refusing a symlinked target generation manifest: {target_manifest_path}"
+        )
+    if target_manifest_path.exists():
+        target_manifest = _load_json(target_manifest_path)
+        validate_generation_manifest(
+            target_manifest,
+            model=model,
+            model_cfg=model_cfg,
+            prompt=prompt,
+            generations=source_generations,
+            expected_image_ids=image_ids,
+        )
+    else:
+        target_manifest = dict(source_manifest)
+        _atomic_write_json(target_manifest_path, target_manifest)
+
+    source_split_path = source / "image_splits.json"
+    copied_split = False
+    if source_split_path.exists():
+        if source_split_path.is_symlink():
+            raise ValueError(f"Refusing a symlinked source split: {source_split_path}")
+        source_split = _load_json(source_split_path)
+        validate_strict_811_split(
+            source_split,
+            expected_image_ids=image_ids,
+        )
+        target_split_path = destination / "image_splits.json"
+        if target_split_path.is_symlink():
+            raise ValueError(f"Refusing a symlinked target split: {target_split_path}")
+        if target_split_path.exists():
+            target_split = _load_json(target_split_path)
+            validate_strict_811_split(
+                target_split,
+                expected_image_ids=image_ids,
+            )
+            if _stable_sha256(target_split) != _stable_sha256(source_split):
+                raise ValueError(
+                    "Refusing --reuse-generations-from because the retained "
+                    f"image split differs from source: {target_split_path}"
+                )
+        else:
+            _copy_reused_artifact(source_split_path, target_split_path)
+        copied_split = True
+
+    print(
+        "[Pipeline] Reused validated generations"
+        + (" and strict image split" if copied_split else "")
+        + f" from {source}"
+    )
+
+
+def _refuse_reuse_over_downstream_artifacts(output_dir: Path) -> None:
+    if not output_dir.exists():
+        return
+    protected = [
+        output_dir / "labeling.json",
+        output_dir / "labeling_manifest.json",
+        output_dir / "chair_summary.json",
+        output_dir / "coco_ground_truth.jsonl",
+        output_dir / "features.pkl",
+        output_dir / "features_manifest.json",
+        output_dir / "baseline",
+        output_dir / "results",
+        output_dir / "pipeline_manifest.json",
+        output_dir / "resolved_pipeline_config.yaml",
+        output_dir / "generation_shards",
+        *output_dir.glob("features.part*.pkl"),
+    ]
+    existing = sorted({str(path) for path in protected if path.exists()})
+    if existing:
+        raise RuntimeError(
+            "Refusing --reuse-generations-from without --resume because the "
+            "target already contains downstream artifacts: "
+            + ", ".join(existing)
+        )
+
+
+def _copy_reused_artifact(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if _file_sha256(source) != _file_sha256(destination):
+            raise ValueError(
+                f"Refusing to overwrite different retained artifact: {destination}"
+            )
+        return
+    temporary = destination.with_name(f".{destination.name}.reuse.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _prepare_fresh_artifacts(
     output_dir: Path,
     run: Mapping[str, object],
@@ -801,11 +1319,16 @@ def _prepare_fresh_artifacts(
     if bool(stages.get("generation")):
         _remove_paths(
             output_dir / "generations.json",
+            output_dir / GENERATION_MANIFEST_NAME,
             output_dir / "labeling.json",
+            output_dir / "labeling_manifest.json",
             output_dir / "generation_shards",
         )
     elif bool(stages.get("labeling")):
-        _remove_paths(output_dir / "labeling.json")
+        _remove_paths(
+            output_dir / "labeling.json",
+            output_dir / "labeling_manifest.json",
+        )
 
     flags = _effective_feature_flags(config)
     if bool(stages.get("feature_extraction")):
@@ -827,6 +1350,7 @@ def _prepare_fresh_artifacts(
                 baseline_dir / "feature_parts",
                 baseline_dir / "dhcp",
                 baseline_dir / "halloc",
+                baseline_dir / "svar_official",
             )
             for path in baseline_dir.glob("features.part*.pkl"):
                 _remove_paths(path)

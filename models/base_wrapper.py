@@ -315,22 +315,18 @@ class BaseLVLMWrapper(ABC):
         requirements: Optional[ExtractionRequirements] = None,
     ) -> List[ModelOutput]:
         """Fallback batch API; wrappers can override to reuse one image forward."""
-        targets = (
-            [int(token_id) for token_id in target_token_ids]
-            if target_token_ids is not None
-            else [int(response_token_ids[int(index)]) for index in response_token_indices]
+        response_ids, requested_indices, targets = self.validate_causal_batch_request(
+            response_token_ids=response_token_ids,
+            response_token_indices=response_token_indices,
+            target_token_ids=target_token_ids,
         )
-        if len(targets) != len(response_token_indices):
-            raise ValueError(
-                "target_token_ids and response_token_indices must have the same length."
-            )
         outputs: List[ModelOutput] = []
-        for response_index, target_token_id in zip(response_token_indices, targets):
+        for response_index, target_token_id in zip(requested_indices, targets):
             index = int(response_index)
             outputs.append(
                 self.extract_token_features(
                     image=image,
-                    prefix_token_ids=[int(token_id) for token_id in response_token_ids[:index]],
+                    prefix_token_ids=response_ids[:index],
                     response_token_idx=index,
                     target_token_id=int(target_token_id),
                     cfg_dgst_t=cfg_dgst_t,
@@ -339,6 +335,45 @@ class BaseLVLMWrapper(ABC):
                 )
             )
         return outputs
+
+    @staticmethod
+    def validate_causal_batch_request(
+        *,
+        response_token_ids: Sequence[int],
+        response_token_indices: Sequence[int],
+        target_token_ids: Optional[Sequence[int]] = None,
+    ) -> tuple[List[int], List[int], List[int]]:
+        """Validate that each requested state predicts the saved target token."""
+
+        response_ids = [int(value) for value in response_token_ids]
+        requested_indices = [int(value) for value in response_token_indices]
+        for index in requested_indices:
+            if index < 0 or index >= len(response_ids):
+                raise ValueError(
+                    f"response token index {index} is outside response length "
+                    f"{len(response_ids)}"
+                )
+        expected_targets = [response_ids[index] for index in requested_indices]
+        if target_token_ids is None:
+            targets = expected_targets
+        else:
+            targets = [int(value) for value in target_token_ids]
+            if len(targets) != len(requested_indices):
+                raise ValueError(
+                    "target_token_ids and response_token_indices must have "
+                    "the same length."
+                )
+            mismatches = [
+                (offset, requested_indices[offset], targets[offset], expected)
+                for offset, expected in enumerate(expected_targets)
+                if targets[offset] != expected
+            ]
+            if mismatches:
+                raise ValueError(
+                    "target_token_ids must equal the actual saved response token "
+                    f"at each requested index; mismatches={mismatches[:5]}"
+                )
+        return response_ids, requested_indices, targets
 
     @property
     @abstractmethod

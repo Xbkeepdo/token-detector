@@ -29,6 +29,7 @@ from .extractor import (
 from .halloc import HalLocCLIPFeatureExtractor
 from .projectaway import compute_projectaway_probability_cache
 from .schema import SUPPORTED_BASELINES
+from .svar import normalize_svar_protocols, prepare_official_svar_spans
 
 
 def normalize_baseline_methods(methods: Sequence[str] | str) -> tuple[str, ...]:
@@ -87,23 +88,78 @@ class BaselineRuntime:
         final_norm: Optional[Any] = None,
     ) -> None:
         self.wrapper = wrapper
-        self.methods = normalize_baseline_methods(methods)
-        if not self.methods:
+        self.requested_methods = normalize_baseline_methods(methods)
+        if not self.requested_methods:
             raise ValueError("At least one baseline method must be selected")
         self.config = deepcopy(dict(config or {}))
+        svar_cfg = dict(self.config.get("svar") or {})
+        self.svar_protocols = (
+            normalize_svar_protocols(svar_cfg.get("protocols"))
+            if "svar" in self.requested_methods
+            else ()
+        )
+        self.official_svar_enabled = "official" in self.svar_protocols
+        # ``methods`` are the payloads written to the shared controlled file.
+        # Keep this public attribute for existing callers while exposing the
+        # original selection through ``requested_methods``.
+        self.methods = tuple(
+            method
+            for method in self.requested_methods
+            if method != "svar" or "controlled" in self.svar_protocols
+        )
         self.baseline_dir = Path(baseline_dir)
         self.baseline_dir.mkdir(parents=True, exist_ok=True)
+        self.svar_official_dir = self.baseline_dir / "svar_official"
+        if self.official_svar_enabled:
+            self.svar_official_dir.mkdir(parents=True, exist_ok=True)
         self.device = str(device or getattr(wrapper, "device", "cuda"))
         self.worker_id = int(worker_id)
         self.parallel = bool(parallel)
-        self.requirements: ExtractionRequirements = baseline_extraction_requirements(
+        self.controlled_requirements = baseline_extraction_requirements(
             self.methods
         )
+        self.official_requirements = (
+            baseline_extraction_requirements(("svar",))
+            if self.official_svar_enabled
+            else baseline_extraction_requirements(())
+        )
+        # Backwards-compatible union for callers that always extract both
+        # protocols. Resume-aware callers should use ``requirements_for`` so
+        # an official-only transaction captures attention and nothing else.
+        self.requirements: ExtractionRequirements = (
+            self.controlled_requirements.merged(self.official_requirements)
+        )
         self._closed = False
+        self._resume = bool(resume)
 
+        # Heavy controlled-baseline resources are initialized on first use.
+        # An official-SVAR-only resume must not load CLIP, allocate a DHCP
+        # writer, or resolve the LVLM output embedding layer.
         self._owns_dhcp_writer = False
         self.dhcp_writer = dhcp_writer
-        if "dhcp" in self.methods and self.dhcp_writer is None:
+        self.clip_extractor = clip_extractor
+        self.output_layer = output_layer
+        self.final_norm = final_norm
+
+    def requirements_for(
+        self,
+        *,
+        controlled: bool,
+        official: bool,
+    ) -> ExtractionRequirements:
+        """Return only the captures needed by the pending protocol payloads."""
+
+        requirements = baseline_extraction_requirements(())
+        if controlled and self.methods:
+            requirements = requirements.merged(self.controlled_requirements)
+        if official and self.official_svar_enabled:
+            requirements = requirements.merged(self.official_requirements)
+        return requirements
+
+    def _ensure_dhcp_writer(self) -> Optional[DHCPShardWriter]:
+        if "dhcp" not in self.methods:
+            return None
+        if self.dhcp_writer is None:
             shard_prefix = f"worker_{self.worker_id}" if self.parallel else None
             shard_root = self.baseline_dir / "dhcp" / "shards"
             writer_root = shard_root / shard_prefix if shard_prefix else shard_root
@@ -111,25 +167,31 @@ class BaselineRuntime:
             self.dhcp_writer = DHCPShardWriter(
                 writer_root,
                 shard_size=int(dhcp_cfg.get("shard_size", 256)),
-                resume=resume,
+                resume=self._resume,
                 reference_prefix=shard_prefix,
             )
             self._owns_dhcp_writer = True
+        return self.dhcp_writer
 
-        self.clip_extractor = clip_extractor
-        if "halloc" in self.methods and self.clip_extractor is None:
+    def _ensure_clip_extractor(self) -> Optional[HalLocCLIPFeatureExtractor]:
+        if "halloc" not in self.methods:
+            return None
+        if self.clip_extractor is None:
             halloc_cfg = dict(self.config.get("halloc") or {})
             self.clip_extractor = HalLocCLIPFeatureExtractor(
                 str(halloc_cfg.get("clip_model", "openai/clip-vit-base-patch32")),
                 device=self.device,
             )
+        return self.clip_extractor
 
-        self.output_layer = output_layer
-        self.final_norm = final_norm
-        if "projectaway" in self.methods:
-            model = getattr(wrapper, "model", None)
-            if self.output_layer is None:
-                self.output_layer = resolve_output_embedding_layer(model)
+    def _ensure_output_layer(self) -> Optional[Any]:
+        if "projectaway" not in self.methods:
+            return None
+        if self.output_layer is None:
+            self.output_layer = resolve_output_embedding_layer(
+                getattr(self.wrapper, "model", None)
+            )
+        return self.output_layer
 
     def build_image_records(
         self,
@@ -150,6 +212,9 @@ class BaselineRuntime:
             )
         if not spans:
             return []
+        if not self.methods:
+            return []
+        dhcp_writer = self._ensure_dhcp_writer()
         response_ids = [int(value) for value in response_token_ids]
         normalized_spans = [dict(span) for span in spans]
         for span in normalized_spans:
@@ -162,6 +227,9 @@ class BaselineRuntime:
 
         projectaway_cache = None
         if "projectaway" in self.methods:
+            output_layer = self._ensure_output_layer()
+            if output_layer is None:
+                raise RuntimeError("ProjectAway output layer could not be resolved")
             union_ids = tuple(
                 dict.fromkeys(
                     response_ids[index]
@@ -177,9 +245,9 @@ class BaselineRuntime:
             projectaway_cfg = dict(self.config.get("projectaway") or {})
             projectaway_cache = compute_projectaway_probability_cache(
                 patch_hidden,
-                self.output_layer.weight,
+                output_layer.weight,
                 union_ids,
-                unembedding_bias=getattr(self.output_layer, "bias", None),
+                unembedding_bias=getattr(output_layer, "bias", None),
                 # ProjectAway applies the LM head directly to intermediate
                 # visual hidden states; decoder final-norm here would define a
                 # different detector.
@@ -192,12 +260,15 @@ class BaselineRuntime:
 
         halloc_cache_file = None
         if "halloc" in self.methods:
+            clip_extractor = self._ensure_clip_extractor()
+            if clip_extractor is None:
+                raise RuntimeError("HalLoc CLIP extractor could not be initialized")
             response_hidden = model_outputs[0].response_hidden_states
             if response_hidden is None:
                 raise RuntimeError(
                     "HalLoc requested but wrapper returned no response_hidden_states"
                 )
-            clip_features = self.clip_extractor.encode(image)
+            clip_features = clip_extractor.encode(image)
             relative = Path("halloc") / "cache"
             if self.parallel:
                 relative /= f"worker_{self.worker_id}"
@@ -236,27 +307,96 @@ class BaselineRuntime:
                 metatoken_step_stats=(
                     model_out.baseline_capture or shared_metatoken_stats
                 ),
-                occurrence_count=counts[_normalize_word(span.get("word", ""))],
+                occurrence_count=_span_occurrence_count(span, counts),
                 target_token_ids=[response_ids[index] for index in token_indices],
                 projectaway_probability_cache=projectaway_cache,
                 halloc_cache_file=halloc_cache_file,
                 halloc_object_index=token_indices[0],
             )
-            records.append(
-                compute_baseline_record(
-                    model_out=model_out,
-                    span=span,
-                    context=context,
-                    methods=self.methods,
-                    dhcp_writer=self.dhcp_writer,
-                    config=self.config,
-                )
+            record = compute_baseline_record(
+                model_out=model_out,
+                span=span,
+                context=context,
+                methods=self.methods,
+                dhcp_writer=dhcp_writer,
+                config=self.config,
             )
+            if "svar" in record.get("baselines", {}):
+                record.setdefault("metadata", {})["svar_protocol"] = "controlled"
+            records.append(record)
         # One image is the resume transaction boundary.  The caller appends
         # ``records`` immediately after this method returns, so every referenced
         # DHCP shard must already exist on disk before the pickle commit.
-        if self.dhcp_writer is not None:
-            self.dhcp_writer.flush()
+        if dhcp_writer is not None:
+            dhcp_writer.flush()
+        return records
+
+    def prepare_official_svar_spans(
+        self,
+        label_info: Mapping[str, Any],
+        response_token_ids: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        """Resolve found official-SVAR samples from one labeling record."""
+
+        if not self.official_svar_enabled:
+            return []
+        samples = label_info.get("official_svar_samples") or []
+        return prepare_official_svar_spans(samples, response_token_ids)
+
+    def build_official_svar_records(
+        self,
+        *,
+        image_id: int,
+        response_token_ids: Sequence[int],
+        spans: Sequence[Mapping[str, Any]],
+        model_outputs: Sequence[ModelOutput],
+    ) -> list[dict[str, Any]]:
+        """Build isolated SVAR records for the paper-compatible sample list."""
+
+        if self._closed:
+            raise RuntimeError("BaselineRuntime is already closed")
+        if not self.official_svar_enabled:
+            return []
+        if len(spans) != len(model_outputs):
+            raise ValueError(
+                f"Received {len(spans)} official SVAR spans but "
+                f"{len(model_outputs)} model outputs"
+            )
+        response_ids = [int(value) for value in response_token_ids]
+        records: list[dict[str, Any]] = []
+        for span_value, model_out in zip(spans, model_outputs):
+            span = dict(span_value)
+            token_indices = [
+                int(value) for value in span.get("token_indices", [])
+            ]
+            if len(token_indices) != 1:
+                raise ValueError(
+                    "Official SVAR records require exactly one matched token index"
+                )
+            index = token_indices[0]
+            if index < 0 or index >= len(response_ids):
+                raise ValueError(
+                    f"Official SVAR index {index} is outside response length "
+                    f"{len(response_ids)}"
+                )
+            context = BaselineExtractionContext(
+                response_token_ids=response_ids,
+                image_id=int(image_id),
+                target_token_ids=[response_ids[index]],
+            )
+            record = compute_baseline_record(
+                model_out=model_out,
+                span=span,
+                context=context,
+                methods=("svar",),
+                config=self.config,
+            )
+            metadata = record.setdefault("metadata", {})
+            metadata["svar_protocol"] = "official"
+            metadata["svar_official"] = deepcopy(
+                dict(span.get("svar_official") or {})
+            )
+            records.append(record)
         return records
 
     def close(self) -> None:
@@ -283,6 +423,23 @@ def _occurrence_counts(spans: Sequence[Mapping[str, Any]]) -> dict[str, int]:
         word = _normalize_word(span.get("word", ""))
         counts[word] = counts.get(word, 0) + 1
     return counts
+
+
+def _span_occurrence_count(
+    span: Mapping[str, Any],
+    fallback_counts: Mapping[str, int],
+) -> int:
+    """Prefer the pre-deduplication count persisted by schema-v2 labeling."""
+
+    value = span.get("occurrence_count")
+    if value is not None:
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            count = 0
+        if count >= 1:
+            return count
+    return int(fallback_counts.get(_normalize_word(span.get("word", "")), 1))
 
 
 def _normalize_word(value: Any) -> str:

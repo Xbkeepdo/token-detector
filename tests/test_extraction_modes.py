@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -235,6 +236,17 @@ class ExtractionModeTests(unittest.TestCase):
             root = Path(directory)
             image_path = root / "image.jpg"
             Image.new("RGB", (4, 4), color="white").save(image_path)
+            (root / "generations.json").write_text(
+                json.dumps(
+                    {
+                        "1": {
+                            "generated_text": "chair",
+                            "response_token_ids": [9],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
             root_path = root / "features.pkl"
             baseline_path = root / "baseline" / "features.pkl"
             wrapper = Wrapper()

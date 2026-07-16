@@ -38,10 +38,12 @@ from features.baseline import (
     get_baseline_payload,
     halloc_optimizer_config,
     normalize_baseline_methods,
+    normalize_svar_protocols,
     validate_baseline_record,
 )
+from scripts.training_provenance import load_validated_training_features
 from utils.config_utils import load_config
-from utils.io_utils import load_json, load_pkl, save_json, save_pkl
+from utils.io_utils import load_json, save_json, save_pkl
 from utils.split_utils import validate_strict_811_split
 
 
@@ -99,16 +101,9 @@ def main() -> None:
     baseline_dir = Path(args.output_dir) / str(
         baseline_cfg.get("output_subdir", "baseline")
     )
-    feature_path = baseline_dir / "features.pkl"
     split_path = Path(args.output_dir) / "image_splits.json"
-    if not feature_path.exists():
-        raise FileNotFoundError(feature_path)
     if not split_path.exists():
         raise FileNotFoundError(split_path)
-
-    records = load_pkl(str(feature_path))
-    for record in records:
-        validate_baseline_record(record)
     image_splits = load_json(str(split_path))
     image_split_counts = validate_strict_811_split(image_splits)
     configured_count = int((config.get("dataset") or {}).get("num_images", 0))
@@ -117,8 +112,6 @@ def main() -> None:
             "Strict split size differs from dataset.num_images: "
             f"{sum(image_split_counts.values())} != {configured_count}"
         )
-    split_records = split_records_by_image(records, image_splits)
-    _require_strict_splits(split_records)
     methods = normalize_baseline_methods(
         args.methods
         if args.methods is not None
@@ -128,41 +121,286 @@ def main() -> None:
     )
     if not methods:
         raise ValueError("No baseline methods selected for training")
+    svar_protocols = (
+        normalize_svar_protocols(
+            dict(baseline_cfg.get("svar") or {}).get("protocols")
+        )
+        if "svar" in methods
+        else ()
+    )
+    controlled_methods = tuple(
+        method
+        for method in methods
+        if method != "svar" or "controlled" in svar_protocols
+    )
+    official_svar_enabled = "svar" in methods and "official" in svar_protocols
 
     seeds = _configured_training_seeds(args, training_cfg, baseline_cfg)
     if args.run_name is not None and len(seeds) != 1:
         raise ValueError("--run-name can only be used with one effective seed")
     device = _resolve_device(args.device)
+    write_summary = bool(training_cfg.get("write_summary", True))
+
+    if controlled_methods:
+        feature_path = baseline_dir / "features.pkl"
+        split_records = _load_and_split_baseline_records(
+            feature_path=feature_path,
+            image_splits=image_splits,
+            model_key=args.model,
+            config=config,
+            output_dir=Path(args.output_dir),
+            expected_artifact_family="baseline_controlled",
+            expected_svar_protocol=(
+                "controlled" if "svar" in controlled_methods else None
+            ),
+        )
+        _run_training_protocol(
+            model=args.model,
+            seeds=seeds,
+            methods=controlled_methods,
+            split_records=split_records,
+            image_split_counts=image_split_counts,
+            feature_path=feature_path,
+            split_path=split_path,
+            result_root=baseline_dir,
+            baseline_cfg=baseline_cfg,
+            device=device,
+            run_name=args.run_name,
+            result_stem=f"{args.model}_baselines",
+            label_protocol=(
+                "shared_first_canonical_mention_exact_response_offsets"
+            ),
+            write_summary=write_summary,
+        )
+
+    if official_svar_enabled:
+        official_dir = baseline_dir / "svar_official"
+        official_feature_path = official_dir / "features.pkl"
+        official_split_records = _load_and_split_baseline_records(
+            feature_path=official_feature_path,
+            image_splits=image_splits,
+            model_key=args.model,
+            config=config,
+            output_dir=Path(args.output_dir),
+            required=("svar",),
+            expected_artifact_family="baseline_svar_official",
+            expected_svar_protocol="official",
+        )
+        official_sample_audit = _official_svar_sample_audit(
+            Path(args.output_dir) / "labeling.json",
+            image_splits,
+        )
+        extracted_found = sum(
+            len(records) for records in official_split_records.values()
+        )
+        expected_found = int(official_sample_audit["overall"]["found"])
+        if expected_found != extracted_found:
+            raise RuntimeError(
+                "SVAR-official found sample count differs between labeling "
+                f"and features: {expected_found} != {extracted_found}."
+            )
+        _run_training_protocol(
+            model=args.model,
+            seeds=seeds,
+            methods=("svar",),
+            split_records=official_split_records,
+            image_split_counts=image_split_counts,
+            feature_path=official_feature_path,
+            split_path=split_path,
+            result_root=official_dir,
+            baseline_cfg=baseline_cfg,
+            device=device,
+            run_name=args.run_name,
+            result_stem=f"{args.model}_svar_official",
+            label_protocol=(
+                "official_svar_set_first_token_id_first_occurrence"
+            ),
+            sample_audit=official_sample_audit,
+            write_summary=write_summary,
+        )
+
+
+
+def _official_svar_sample_audit(
+    labeling_path: Path,
+    image_splits: Mapping[str, Sequence[int]],
+) -> dict[str, Any]:
+    if not labeling_path.exists():
+        raise FileNotFoundError(labeling_path)
+    labeling = load_json(str(labeling_path))
+    if not isinstance(labeling, Mapping):
+        raise RuntimeError(f"Invalid labeling file: {labeling_path}")
+    image_to_split: dict[int, str] = {}
+    for split in ("train", "val", "test"):
+        for raw_image_id in image_splits[split]:
+            image_id = int(raw_image_id)
+            if image_id in image_to_split:
+                raise RuntimeError(
+                    f"Image {image_id} occurs in multiple data splits."
+                )
+            image_to_split[image_id] = split
+
+    def empty_counts() -> dict[str, int]:
+        return {
+            "total": 0,
+            "found": 0,
+            "not_found": 0,
+            "hallucination_total": 0,
+            "real_total": 0,
+            "hallucination_found": 0,
+            "real_found": 0,
+        }
+
+    overall = empty_counts()
+    by_split = {split: empty_counts() for split in ("train", "val", "test")}
+    for raw_image_id, raw_row in labeling.items():
+        image_id = int(raw_image_id)
+        split = image_to_split.get(image_id)
+        if split is None:
+            raise RuntimeError(
+                f"Labeling image {image_id} is outside image_splits.json."
+            )
+        if not isinstance(raw_row, Mapping):
+            raise RuntimeError(f"Invalid labeling row for image {image_id}.")
+        for sample in raw_row.get("official_svar_samples") or []:
+            if not isinstance(sample, Mapping):
+                raise RuntimeError(
+                    f"Invalid official SVAR sample for image {image_id}."
+                )
+            status = str(sample.get("status", "")).strip().lower()
+            if status not in {"found", "not_found"}:
+                raise RuntimeError(
+                    f"Official SVAR sample for image {image_id} has status "
+                    f"{status!r}."
+                )
+            label = int(sample.get("label", -1))
+            if label not in (0, 1):
+                raise RuntimeError(
+                    f"Official SVAR sample for image {image_id} has invalid "
+                    f"label {label}."
+                )
+            for bucket in (overall, by_split[split]):
+                bucket["total"] += 1
+                bucket[status] += 1
+                label_name = "hallucination" if label == 0 else "real"
+                bucket[f"{label_name}_total"] += 1
+                if status == "found":
+                    bucket[f"{label_name}_found"] += 1
+    return {"overall": overall, "by_split": by_split}
+
+
+def _load_and_split_baseline_records(
+    *,
+    feature_path: Path,
+    image_splits: Mapping[str, Sequence[int]],
+    model_key: str,
+    config: Mapping[str, Any],
+    output_dir: Path,
+    required: Sequence[str] = (),
+    expected_artifact_family: Optional[str] = None,
+    expected_svar_protocol: Optional[str] = None,
+) -> dict[str, list[Mapping[str, Any]]]:
+    if expected_artifact_family is None:
+        raise ValueError("expected_artifact_family is required")
+    records = load_validated_training_features(
+        feature_path=feature_path,
+        artifact_family=expected_artifact_family,
+        model_key=model_key,
+        config=config,
+        output_dir=output_dir,
+        image_splits=image_splits,
+    )
+    if not records:
+        raise RuntimeError(
+            f"No extractable samples are available in {feature_path}."
+        )
+    split_image_ids = {
+        int(image_id)
+        for split_name in ("train", "val", "test")
+        for image_id in image_splits[split_name]
+    }
+    feature_image_ids = {int(record.get("image_id", -1)) for record in records}
+    unexpected_ids = sorted(feature_image_ids - split_image_ids)
+    if unexpected_ids:
+        raise RuntimeError(
+            "Baseline features contain image IDs outside image_splits.json: "
+            f"{unexpected_ids[:10]}"
+        )
+    for record in records:
+        validate_baseline_record(record, required=required)
+        if expected_svar_protocol is not None:
+            actual_protocol = str(
+                (record.get("metadata") or {}).get("svar_protocol") or ""
+            )
+            if actual_protocol != expected_svar_protocol:
+                raise RuntimeError(
+                    f"SVAR record protocol {actual_protocol!r} does not match "
+                    f"expected {expected_svar_protocol!r}."
+                )
+            if expected_svar_protocol == "official" and set(
+                record.get("baselines") or {}
+            ) != {"svar"}:
+                raise RuntimeError(
+                    "SVAR-official feature records must contain only the SVAR "
+                    "baseline payload."
+                )
+    split_records = split_records_by_image(records, image_splits)
+    _require_strict_splits(split_records)
+    return split_records
+
+
+def _run_training_protocol(
+    *,
+    model: str,
+    seeds: Sequence[int],
+    methods: Sequence[str],
+    split_records: Mapping[str, Sequence[Mapping[str, Any]]],
+    image_split_counts: Mapping[str, int],
+    feature_path: Path,
+    split_path: Path,
+    result_root: Path,
+    baseline_cfg: Mapping[str, Any],
+    device: str,
+    run_name: Optional[str],
+    result_stem: str,
+    label_protocol: str,
+    write_summary: bool,
+    sample_audit: Optional[Mapping[str, Any]] = None,
+) -> None:
     run_outputs: list[dict[str, Any]] = []
     run_paths: list[Path] = []
     for seed in seeds:
         seed_cfg = dict(baseline_cfg)
         seed_cfg["seed"] = int(seed)
-        run_name = args.run_name
-        if run_name is None and len(seeds) > 1:
-            run_name = f"seed{seed}"
+        effective_run_name = run_name
+        if effective_run_name is None and len(seeds) > 1:
+            effective_run_name = f"seed{seed}"
         output, result_path = _train_one_seed(
-            model=args.model,
+            model=model,
             seed=int(seed),
             methods=methods,
             split_records=split_records,
             image_split_counts=image_split_counts,
             feature_path=feature_path,
             split_path=split_path,
-            baseline_dir=baseline_dir,
+            baseline_dir=result_root,
             baseline_cfg=seed_cfg,
             device=device,
-            run_name=run_name,
+            run_name=effective_run_name,
+            result_stem=result_stem,
+            label_protocol=label_protocol,
+            sample_audit=sample_audit,
         )
         run_outputs.append(output)
         run_paths.append(result_path)
 
-    if bool(training_cfg.get("write_summary", True)):
+    if write_summary:
         _write_training_summaries(
-            model=args.model,
-            baseline_dir=baseline_dir,
+            model=model,
+            baseline_dir=result_root,
             outputs=run_outputs,
             result_paths=run_paths,
+            result_stem=result_stem,
         )
 
 
@@ -179,6 +417,11 @@ def _train_one_seed(
     baseline_cfg: Mapping[str, Any],
     device: str,
     run_name: Optional[str],
+    result_stem: Optional[str] = None,
+    label_protocol: str = (
+        "shared_first_canonical_mention_exact_response_offsets"
+    ),
+    sample_audit: Optional[Mapping[str, Any]] = None,
 ) -> tuple[dict[str, Any], Path]:
     result_dir = baseline_dir / "results"
     checkpoint_dir = baseline_dir / "checkpoints"
@@ -188,7 +431,8 @@ def _train_one_seed(
         checkpoint_dir = checkpoint_dir / run_name
     result_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    result_path = result_dir / f"{model}_baselines.json"
+    result_stem = str(result_stem or f"{model}_baselines")
+    result_path = result_dir / f"{result_stem}.json"
     output: dict[str, Any] = {
         "model": model,
         "seed": int(seed),
@@ -198,11 +442,13 @@ def _train_one_seed(
         "stored_label_semantics": {"0": "hallucination", "1": "real"},
         "detector_target_semantics": {"0": "real", "1": "hallucination"},
         "headline_positive_class": "hallucination",
-        "label_protocol": "local_chair_object_spans_without_gpt_semantic_review",
+        "label_protocol": str(label_protocol),
         "counts": {name: len(rows) for name, rows in split_records.items()},
         "image_split_counts": image_split_counts,
         "methods": {},
     }
+    if sample_audit is not None:
+        output["sample_audit"] = dict(sample_audit)
 
     for method in methods:
         print(f"[BaselineTrain] seed={seed} method={method} device={device}")
@@ -279,12 +525,14 @@ def _write_training_summaries(
     baseline_dir: Path,
     outputs: Sequence[Mapping[str, Any]],
     result_paths: Sequence[Path],
+    result_stem: Optional[str] = None,
 ) -> None:
     if len(outputs) != len(result_paths):
         raise ValueError("Baseline outputs and result paths must have equal length")
+    base_stem = str(result_stem or f"{model}_baselines")
     for output, result_path in zip(outputs, result_paths):
         summary = aggregate_baseline_outputs([output])
-        markdown_path = result_path.with_name(f"{model}_baselines_summary.md")
+        markdown_path = result_path.with_name(f"{base_stem}_summary.md")
         _write_baseline_markdown(
             markdown_path,
             summary,
@@ -296,7 +544,7 @@ def _write_training_summaries(
         summary = aggregate_baseline_outputs(outputs)
         result_dir = baseline_dir / "results"
         result_dir.mkdir(parents=True, exist_ok=True)
-        stem = f"{model}_baselines_{len(outputs)}seed"
+        stem = f"{base_stem}_{len(outputs)}seed"
         json_path = result_dir / f"{stem}.json"
         markdown_path = result_dir / f"{stem}_summary.md"
         summary["seed_result_paths"] = [str(path) for path in result_paths]
@@ -324,6 +572,10 @@ def aggregate_baseline_outputs(
     for output in outputs:
         if str(output["model"]) != model:
             raise ValueError("Cannot aggregate baseline outputs from different models")
+        if output.get("sample_audit") != outputs[0].get("sample_audit"):
+            raise ValueError(
+                "All seeds must use the same baseline sample audit"
+            )
         actual = list(_baseline_method_variants(output))
         if actual != expected:
             raise ValueError(
@@ -360,6 +612,7 @@ def aggregate_baseline_outputs(
         "counts": outputs[0].get("counts"),
         "image_split_counts": outputs[0].get("image_split_counts"),
         "configured_methods": outputs[0].get("configured_methods"),
+        "sample_audit": outputs[0].get("sample_audit"),
         "methods": rows,
     }
 
@@ -428,13 +681,20 @@ def _write_baseline_markdown(
     counts = summary.get("counts") or {}
     image_counts = summary.get("image_split_counts") or {}
     methods = summary.get("methods") or {}
+    label_protocol = str(summary.get("label_protocol") or "")
+    experiment_name = (
+        "SVAR Official"
+        if "official_svar" in label_protocol
+        else "Baseline"
+    )
     lines = [
-        f"# {summary['model']} Baseline 结果汇总",
+        f"# {summary['model']} {experiment_name} 结果汇总",
         "",
         "## 实验协议",
         "",
         f"- 随机种子：`{', '.join(str(seed) for seed in seeds)}`。",
         "- headline 正类：hallucination。",
+        f"- 标签协议：`{label_protocol or 'unknown'}`。",
         "- 阈值只在 validation set 上选择，test set 只用于最终评估。",
         f"- image split：train/val/test = "
         f"{image_counts.get('train', '?')}/{image_counts.get('val', '?')}/"
@@ -443,6 +703,34 @@ def _write_baseline_markdown(
         f"{counts.get('train', '?')}/{counts.get('val', '?')}/"
         f"{counts.get('test', '?')}。",
     ]
+    sample_audit = summary.get("sample_audit") or {}
+    overall_audit = sample_audit.get("overall") or {}
+    if overall_audit:
+        lines.extend(
+            [
+                "- SVAR official 查询：total={}，found={}，not_found={}。".format(
+                    overall_audit.get("total", "?"),
+                    overall_audit.get("found", "?"),
+                    overall_audit.get("not_found", "?"),
+                ),
+                "- found 标签构成：hallucination={}，real={}。".format(
+                    overall_audit.get("hallucination_found", "?"),
+                    overall_audit.get("real_found", "?"),
+                ),
+            ]
+        )
+        split_audit = sample_audit.get("by_split") or {}
+        lines.append(
+            "- found split："
+            + "，".join(
+                "{}={}".format(
+                    split,
+                    (split_audit.get(split) or {}).get("found", "?"),
+                )
+                for split in ("train", "val", "test")
+            )
+            + "。"
+        )
     if multi_seed:
         lines.append(
             f"- 表中数值为 {len(seeds)} 个随机种子的总体均值 ± 总体标准差。"

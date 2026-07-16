@@ -12,6 +12,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from utils.config_utils import extraction_mode_flags, resolve_run_config
+from utils.generation_provenance import build_generation_manifest
 from utils.split_utils import (
     build_strict_811_split,
     ensure_strict_811_split,
@@ -24,12 +25,26 @@ from scripts.run_pipeline import (
     _baseline_features_config_sha256,
     _effective_feature_flags,
     _feature_sets,
+    _labeling_config_sha256,
     _prepare_fresh_artifacts,
+    _require_complete_generations,
+    _reuse_generation_artifacts,
     _root_features_config_sha256,
     _validate_or_write_manifest,
+    build_baseline_extract_command,
     build_root_extract_command,
 )
 from scripts.extract_features import _resolve_extraction_mode
+
+
+def _generation_rows(image_ids: list[int]) -> dict[str, dict[str, object]]:
+    return {
+        str(image_id): {
+            "generated_text": f"caption {image_id}",
+            "response_token_ids": [1000 + image_id, 2000 + image_id],
+        }
+        for image_id in image_ids
+    }
 
 
 def _minimal_config() -> dict:
@@ -293,6 +308,19 @@ class PipelineConfigTests(unittest.TestCase):
         model_index = command.index("--model")
         self.assertEqual(command[model_index + 1], "model_a")
 
+    def test_baseline_only_uses_the_provenance_protected_entrypoint(self) -> None:
+        run = resolve_run_config(_minimal_config(), environ={})
+        command = build_baseline_extract_command(
+            run,
+            Path("resolved.yaml"),
+            Path("outputs/model_a/COCO4000-vv"),
+        )
+        self.assertEqual(command[1], "scripts/extract_features.py")
+        self.assertEqual(
+            command[command.index("--extraction-mode") + 1],
+            "baseline_only",
+        )
+
     def test_disabled_four_gate_branch_is_not_sent_to_training(self) -> None:
         config = {
             "feature_extraction": {
@@ -362,6 +390,465 @@ class PipelineConfigTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "Refusing to resume"):
                 _validate_or_write_manifest(output, run, changed)
+
+    def test_labeling_protocol_and_artifact_content_are_resume_keys(self) -> None:
+        config = _minimal_config()
+        config["dataset"] = {"num_images": 1, "seed": 42}
+        config["labeling"] = {
+            "schema_version": 2,
+            "sample_unit": "first_canonical_mention",
+            "primary_locator": "exact_response_offsets",
+        }
+        config["feature_extraction"] = {
+            "method": {"enabled": True},
+            "ads_cgc": {"enabled": False},
+            "baseline": {"enabled": False, "output_subdir": "baseline"},
+        }
+        run = {
+            **config["run"],
+            "extraction_mode": "method_only",
+            "resume": True,
+            "adopt_legacy_artifacts": True,
+        }
+        changed_locator = json.loads(json.dumps(config))
+        changed_locator["labeling"]["primary_locator"] = "first_token_id"
+        self.assertNotEqual(
+            _labeling_config_sha256(config, run),
+            _labeling_config_sha256(changed_locator, run),
+        )
+        changed_protocols = json.loads(json.dumps(config))
+        changed_protocols["feature_extraction"]["baseline"]["svar"] = {
+            "protocols": ["controlled", "official"]
+        }
+        self.assertEqual(
+            _labeling_config_sha256(config, run),
+            _labeling_config_sha256(changed_protocols, run),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "labeling.json").write_text(
+                '{"1":{"schema_version":2}}',
+                encoding="utf-8",
+            )
+            (output / "labeling_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "label_schema_version": 2,
+                        "sample_unit": "first_canonical_mention",
+                        "primary_locator": "exact_response_offsets",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _validate_or_write_manifest(output, run, config)
+            first = json.loads(
+                (output / "pipeline_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(first["manifest_version"], 3)
+            self.assertEqual(first["labeling_schema_version"], "2")
+            self.assertEqual(
+                first["labeling_primary_locator"],
+                "exact_response_offsets",
+            )
+
+            (output / "labeling.json").write_text(
+                '{"1":{"schema_version":2,"changed":true}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "labeling_sha256"):
+                _validate_or_write_manifest(output, run, config)
+
+    def test_manifest_accepts_new_label_artifact_from_enabled_stage(self) -> None:
+        config = _minimal_config()
+        config["dataset"] = {"num_images": 1, "seed": 42}
+        config["labeling"] = {
+            "schema_version": 2,
+            "sample_unit": "first_canonical_mention",
+            "primary_locator": "exact_response_offsets",
+        }
+        config["feature_extraction"] = {
+            "method": {"enabled": True},
+            "ads_cgc": {"enabled": False},
+            "baseline": {"enabled": False},
+        }
+        run = {
+            **config["run"],
+            "extraction_mode": "method_only",
+            "resume": True,
+            "adopt_legacy_artifacts": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _validate_or_write_manifest(output, run, config)
+            (output / "labeling.json").write_text(
+                '{"1":{"schema_version":2}}',
+                encoding="utf-8",
+            )
+            _validate_or_write_manifest(
+                output,
+                run,
+                config,
+                allow_labeling_update=True,
+            )
+            manifest = json.loads(
+                (output / "pipeline_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertIsNotNone(manifest["labeling_sha256"])
+
+    def test_reuse_generations_copies_only_validated_generation_and_split(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            expected_ids = list(range(10, 20))
+            generations = _generation_rows(expected_ids)
+            model_cfg = {"hf_name": "unused"}
+            (source / "baseline").mkdir(parents=True)
+            (source / "generations.json").write_text(
+                json.dumps(generations),
+                encoding="utf-8",
+            )
+            (source / "generation_manifest.json").write_text(
+                json.dumps(
+                    build_generation_manifest(
+                        model="model_a",
+                        model_cfg=model_cfg,
+                        prompt="Describe this image.",
+                        generations=generations,
+                        expected_image_ids=expected_ids,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            (source / "image_splits.json").write_text(
+                json.dumps(build_strict_811_split(expected_ids, seed=42)),
+                encoding="utf-8",
+            )
+            (source / "labeling.json").write_text("{}", encoding="utf-8")
+            (source / "features.pkl").write_bytes(b"root")
+            (source / "baseline" / "features.pkl").write_bytes(b"baseline")
+
+            _reuse_generation_artifacts(
+                source,
+                destination,
+                model="model_a",
+                model_cfg=model_cfg,
+                prompt="Describe this image.",
+                expected_image_ids=expected_ids,
+            )
+
+            self.assertTrue((destination / "generations.json").exists())
+            self.assertTrue((destination / "generation_manifest.json").exists())
+            self.assertTrue((destination / "image_splits.json").exists())
+            self.assertFalse((destination / "labeling.json").exists())
+            self.assertFalse((destination / "features.pkl").exists())
+            self.assertFalse((destination / "baseline").exists())
+
+            config = _minimal_config()
+            config["dataset"] = {"num_images": len(expected_ids), "seed": 42}
+            config["feature_extraction"] = {
+                "method": {"enabled": True},
+                "ads_cgc": {"enabled": False},
+                "baseline": {"enabled": False},
+            }
+            run = {
+                **config["run"],
+                "extraction_mode": "method_only",
+                "resume": True,
+                "adopt_legacy_artifacts": False,
+                "reuse_generations_from": str(source),
+            }
+            _validate_or_write_manifest(destination, run, config)
+            manifest = json.loads(
+                (destination / "pipeline_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                manifest["generation_reuse_source"],
+                str(source),
+            )
+
+    def test_pipeline_reuse_requires_matching_manifest_cohort_and_response_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            expected_ids = [1, 2, 3]
+            generations = _generation_rows(expected_ids)
+            (source / "generations.json").write_text(
+                json.dumps(generations), encoding="utf-8"
+            )
+            (source / "generation_manifest.json").write_text(
+                json.dumps(
+                    build_generation_manifest(
+                        model="model_a",
+                        model_cfg={"hf_name": "unused"},
+                        prompt="Wrong prompt.",
+                        generations=generations,
+                        expected_image_ids=expected_ids,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "model/prompt/content"):
+                _reuse_generation_artifacts(
+                    source,
+                    root / "wrong_prompt",
+                    model="model_a",
+                    model_cfg={"hf_name": "unused"},
+                    prompt="Describe this image.",
+                    expected_image_ids=expected_ids,
+                )
+
+            (source / "generation_manifest.json").write_text(
+                json.dumps(
+                    build_generation_manifest(
+                        model="model_a",
+                        model_cfg={"hf_name": "different-checkpoint"},
+                        prompt="Describe this image.",
+                        generations=generations,
+                        expected_image_ids=expected_ids,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "model/prompt/content"):
+                _reuse_generation_artifacts(
+                    source,
+                    root / "wrong_model_config",
+                    model="model_a",
+                    model_cfg={"hf_name": "unused"},
+                    prompt="Describe this image.",
+                    expected_image_ids=expected_ids,
+                )
+
+            bad_cohort = dict(generations)
+            bad_cohort["4"] = bad_cohort.pop("3")
+            (source / "generations.json").write_text(
+                json.dumps(bad_cohort), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "selected image cohort"):
+                _reuse_generation_artifacts(
+                    source,
+                    root / "wrong_cohort",
+                    model="model_a",
+                    model_cfg={"hf_name": "unused"},
+                    prompt="Describe this image.",
+                    expected_image_ids=expected_ids,
+                )
+
+            no_ids = _generation_rows(expected_ids)
+            no_ids["2"]["response_token_ids"] = []
+            (source / "generations.json").write_text(
+                json.dumps(no_ids), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "response_token_ids"):
+                _reuse_generation_artifacts(
+                    source,
+                    root / "missing_ids",
+                    model="model_a",
+                    model_cfg={"hf_name": "unused"},
+                    prompt="Describe this image.",
+                    expected_image_ids=expected_ids,
+                )
+
+    def test_pipeline_reuse_complete_generations_auto_writes_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            expected_ids = [1, 2, 3]
+            (source / "generations.json").write_text(
+                json.dumps(_generation_rows(expected_ids)), encoding="utf-8"
+            )
+            common = {
+                "model": "model_a",
+                "model_cfg": {"hf_name": "unused"},
+                "prompt": "Describe this image.",
+                "expected_image_ids": expected_ids,
+            }
+
+            destination = root / "reused"
+            _reuse_generation_artifacts(
+                source,
+                destination,
+                **common,
+            )
+            manifest = json.loads(
+                (destination / "generation_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "complete")
+            self.assertNotIn("adopted_legacy_source", manifest)
+
+    def test_generation_disabled_labeling_validates_complete_manifest_and_content(
+        self,
+    ) -> None:
+        config = _minimal_config()
+        config["dataset"] = {"num_images": 3, "seed": 42}
+        run = {
+            **config["run"],
+            "adopt_legacy_artifacts": False,
+        }
+        expected_ids = [1, 2, 3]
+        generations = _generation_rows(expected_ids)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "generations.json").write_text(
+                json.dumps(generations), encoding="utf-8"
+            )
+            registered = _require_complete_generations(
+                output,
+                config=config,
+                run=run,
+                expected_image_ids=expected_ids,
+            )
+            self.assertEqual(registered["status"], "complete")
+            self.assertTrue((output / "generation_manifest.json").is_file())
+
+            tampered = _generation_rows(expected_ids)
+            tampered["2"]["response_token_ids"][0] += 1
+            (output / "generations.json").write_text(
+                json.dumps(tampered), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "model/prompt/content"):
+                _require_complete_generations(
+                    output,
+                    config=config,
+                    run=run,
+                    expected_image_ids=expected_ids,
+                )
+
+    def test_labeling_update_cannot_bless_retained_features(self) -> None:
+        config = _minimal_config()
+        config["dataset"] = {"num_images": 1, "seed": 42}
+        config["labeling"] = {
+            "schema_version": 2,
+            "sample_unit": "first_canonical_mention",
+            "primary_locator": "exact_response_offsets",
+        }
+        config["feature_extraction"] = {
+            "method": {"enabled": True},
+            "ads_cgc": {"enabled": False},
+            "baseline": {"enabled": False},
+        }
+        run = {
+            **config["run"],
+            "extraction_mode": "method_only",
+            "resume": True,
+            "adopt_legacy_artifacts": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _validate_or_write_manifest(output, run, config)
+            (output / "features.pkl").write_bytes(b"stale")
+            (output / "labeling.json").write_text(
+                '{"1":{"schema_version":2}}', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "retained feature artifacts"):
+                _validate_or_write_manifest(
+                    output,
+                    run,
+                    config,
+                    allow_labeling_update=True,
+                )
+
+    def test_pipeline_reuse_refuses_existing_downstream_without_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            expected_ids = [1, 2, 3]
+            (source / "generations.json").write_text(
+                json.dumps(_generation_rows(expected_ids)), encoding="utf-8"
+            )
+            (destination / "labeling.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "downstream artifacts"):
+                _reuse_generation_artifacts(
+                    source,
+                    destination,
+                    model="model_a",
+                    model_cfg={"hf_name": "unused"},
+                    prompt="Describe this image.",
+                    expected_image_ids=expected_ids,
+                    resume=False,
+                )
+
+    def test_pipeline_baseline_hash_ignores_training_only_settings(self) -> None:
+        config = _minimal_config()
+        config["dataset"] = {"num_images": 4000, "seed": 42}
+        config["feature_extraction"] = {
+            "baseline": {
+                "enabled": True,
+                "methods": ["metatoken", "svar", "dhcp", "projectaway", "halloc"],
+                "metatoken": {"classifiers": ["lr"], "gb_n_estimators": 100},
+                "svar": {
+                    "protocols": ["controlled", "official"],
+                    "layer_start": 5,
+                    "layer_end": 19,
+                    "hidden_dim": 248,
+                    "learning_rate": 0.001,
+                    "batch_size": 32,
+                    "epochs": 50,
+                    "early_stopping_patience": 5,
+                },
+                "dhcp": {
+                    "spatial_size": [12, 12],
+                    "hidden_dim": 128,
+                    "batch_size": 1024,
+                    "epochs": 30,
+                },
+                "projectaway": {"detection_only": True},
+                "halloc": {
+                    "clip_model": "clip-a",
+                    "visualbert_model": "visualbert-a",
+                    "learning_rate": 1e-6,
+                    "batch_size": 16,
+                    "epochs": 25,
+                },
+            }
+        }
+        run = {**config["run"], "extraction_mode": "all"}
+        original = _baseline_features_config_sha256(config, run)
+
+        training_change = json.loads(json.dumps(config))
+        baseline = training_change["feature_extraction"]["baseline"]
+        baseline["metatoken"]["classifiers"] = ["gb", "mlp"]
+        baseline["svar"].update(
+            hidden_dim=999,
+            learning_rate=0.5,
+            batch_size=3,
+            epochs=2,
+            early_stopping_patience=1,
+        )
+        baseline["dhcp"].update(hidden_dim=999, batch_size=3, epochs=2)
+        baseline["projectaway"]["detection_only"] = False
+        baseline["halloc"].update(
+            visualbert_model="visualbert-b",
+            learning_rate=0.5,
+            batch_size=3,
+            epochs=2,
+        )
+        self.assertEqual(
+            original,
+            _baseline_features_config_sha256(training_change, run),
+        )
+
+        extraction_change = json.loads(json.dumps(config))
+        extraction_change["feature_extraction"]["baseline"]["svar"][
+            "layer_start"
+        ] = 6
+        self.assertNotEqual(
+            original,
+            _baseline_features_config_sha256(extraction_change, run),
+        )
 
     def test_manifest_keeps_root_and_baseline_provenance_independent(self) -> None:
         config = _minimal_config()
@@ -507,6 +994,43 @@ class PipelineConfigTests(unittest.TestCase):
             (output / "generations.json").write_text("{}", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "no pipeline_manifest"):
                 _validate_or_write_manifest(output, run, config)
+
+    def test_no_resume_generation_cleanup_removes_generation_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for name in (
+                "generations.json",
+                "generation_manifest.json",
+                "labeling.json",
+                "labeling_manifest.json",
+            ):
+                (output / name).write_text("{}", encoding="utf-8")
+            (output / "generation_shards").mkdir()
+            (output / "generation_shards" / "worker_0.jsonl").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            run = {
+                "stages": {
+                    "generation": True,
+                    "labeling": True,
+                    "feature_extraction": False,
+                    "training": False,
+                    "plotting": False,
+                }
+            }
+            config = {
+                "feature_extraction": {
+                    "method": {"enabled": False},
+                    "ads_cgc": {"enabled": False},
+                    "baseline": {"enabled": False},
+                }
+            }
+            _prepare_fresh_artifacts(output, run, config)
+            self.assertFalse((output / "generations.json").exists())
+            self.assertFalse((output / "generation_manifest.json").exists())
+            self.assertFalse((output / "labeling.json").exists())
+            self.assertFalse((output / "labeling_manifest.json").exists())
+            self.assertFalse((output / "generation_shards").exists())
 
     def test_no_resume_baseline_cleanup_preserves_root_features(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

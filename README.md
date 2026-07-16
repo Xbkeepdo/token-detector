@@ -29,36 +29,42 @@ The main algorithm lives in:
 Run from this directory:
 
 ```bash
-python scripts/extract_features.py \
-  --model qwen2_5_vl_7b \
-  --config configs/model_configs.yaml \
-  --output-dir outputs/qwen2_5_vl_7b/COCO500 \
-  --device cuda \
-  --resume
+python -m nltk.downloader -d "$HOME/nltk_data" \
+  punkt averaged_perceptron_tagger wordnet omw-1.4
 
-python scripts/train_and_eval.py \
-  --model qwen2_5_vl_7b \
-  --config configs/model_configs.yaml \
-  --output-dir outputs/qwen2_5_vl_7b/COCO500
+MODEL=qwen3_vl_8b \
+OUTPUT=outputs/qwen3_vl_8b/COCO4000-512 \
+bash run.sh
 ```
 
-`features.pkl` rows contain `dgst_t_score`, `dgst_t_per_layer`,
-`dgst_t_feature_vector`, prompt cosine curves, and context-confidence curves.
+To rebuild corrected SVAR-aligned labels and features without regenerating the
+captions, use a new output directory and copy only the old generation artifact:
 
-The POPE-specific legacy extractor was copied with the TGD tree but is not the
-primary migrated path.
+```bash
+mkdir -p outputs/qwen3_vl_8b/COCO4000-512-svar-aligned
+cp outputs/qwen3_vl_8b/COCO4000-512/generations.json \
+  outputs/qwen3_vl_8b/COCO4000-512-svar-aligned/
 
+MODEL=qwen3_vl_8b \
+OUTPUT=outputs/qwen3_vl_8b/COCO4000-512-svar-aligned \
+bash run.sh
+```
 
+A complete copied `generations.json` is accepted automatically after validating
+the selected image cohort and every row's `generated_text` and actual
+`response_token_ids`. The new output receives its own generation manifest;
+manual registration is not required. Partial legacy generation shards still
+require explicit adoption because their content is incomplete.
 
-python scripts/train_feature_sets.py \
-  --model internvl_2_5_8b \
-  --config configs/model_configs.yaml \
-  --output-dir outputs/internvl_2_5_8b/COCO500 \
-  --feature-sets \
-    risk \
-    risk_capped_topmass_085 \
-    risk_capped_topmass_085+context_confidence \
-    risk_capped_topmass_085+context_confidence_max_prompt \
-    risk_capped_topmass_085+target_visual_hidden_cosine \
-  --classifiers xgb rf mlp \
-  --scoring auc
+The schema-v2 labeling file keeps two views:
+
+- `all_object_token_spans` retains every CHAIR mention for standard CHAIR
+  metrics.
+- `object_token_spans` retains the first mention of each canonical object and
+  is shared by DGST, ADS/CGC, and controlled baselines.
+- `official_svar_samples` is optional diagnostic metadata; the active config
+  trains `SVAR-controlled` from the exact shared object spans.
+
+All feature families use the exact response-token location. For a target at
+response index `i`, wrappers receive `response_ids[:i]`; the final causal state
+therefore predicts `response_ids[i]`.

@@ -498,9 +498,10 @@ class CHAIR:
         }
 
     def _caption_to_units(self, caption: str) -> list[dict[str, Any]]:
-        lower_caption = caption.lower()
-        spans = list(self._tokenizer.span_tokenize(lower_caption))
-        words = [lower_caption[start:end] for start, end in spans]
+        # Tokenize the original string so Unicode case expansion (for example
+        # ``İ`` -> ``i\u0307``) cannot shift offsets into the source caption.
+        spans = list(self._tokenizer.span_tokenize(caption))
+        words = [caption[start:end].lower() for start, end in spans]
         if not words:
             return []
 
@@ -590,8 +591,13 @@ def chair_summary(labeling: dict[str, dict] | dict[int, dict]) -> dict[str, floa
     real_mentions = 0
     hallucinated_images = 0
     for item in labeling.values():
+        source_spans = (
+            item["all_object_token_spans"]
+            if "all_object_token_spans" in item
+            else item.get("object_token_spans", [])
+        )
         spans = [
-            span for span in item.get("object_token_spans", [])
+            span for span in source_spans
             if span.get("label") in (LABEL_HALLUCINATED, LABEL_REAL)
         ]
         hall = sum(1 for span in spans if int(span.get("label")) == LABEL_HALLUCINATED)

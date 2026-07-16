@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional
 
 import numpy as np
 import torch
@@ -19,7 +19,7 @@ from features.attention import compute_alpha_img_alpha_text
 from features.ads import compute_ads
 from features.cgc import compute_cgc
 from features.dgst_t import compute_dgst_t
-from utils.io_utils import append_pkl, load_json, load_pkl
+from utils.io_utils import append_pkl, load_json, load_pkl, save_pkl
 
 
 def extract_features_for_dataset(
@@ -33,6 +33,7 @@ def extract_features_for_dataset(
     cfg_feature_extraction: Optional[dict] = None,
     baseline_runtime=None,
     baseline_output_path: Optional[str] = None,
+    baseline_official_output_path: Optional[str] = None,
 ) -> List[dict]:
     """Main entry point.  Iterates over `coco_samples`, extracts features"""
     all_features: List[dict] = []
@@ -45,15 +46,32 @@ def extract_features_for_dataset(
     done_image_ids = set()
     baseline_features: List[dict] = []
     baseline_done_image_ids: set[int] = set()
+    official_svar_features: List[dict] = []
+    official_svar_done_image_ids: set[int] = set()
     output_dir = os.path.dirname(output_path)
     generation_results = _load_generation_results(output_dir)
     if resume and os.path.exists(output_path):
         all_features = load_pkl(output_path)
         done_image_ids = {f["image_id"] for f in all_features}
         print(f"[Extractor] Resuming — {len(done_image_ids)} images already done.")
-    if baseline_runtime is not None:
+    runtime_methods = (
+        getattr(baseline_runtime, "methods", None)
+        if baseline_runtime is not None
+        else ()
+    )
+    controlled_baseline_enabled = bool(
+        baseline_runtime is not None
+        and (runtime_methods is None or tuple(runtime_methods))
+    )
+    official_svar_enabled = bool(
+        baseline_runtime is not None
+        and getattr(baseline_runtime, "official_svar_enabled", False)
+    )
+    if controlled_baseline_enabled:
         if baseline_output_path is None:
-            raise ValueError("baseline_runtime requires baseline_output_path.")
+            raise ValueError(
+                "A controlled baseline runtime requires baseline_output_path."
+            )
         if resume and os.path.exists(baseline_output_path):
             baseline_features = load_pkl(baseline_output_path)
             baseline_done_image_ids = {
@@ -65,22 +83,77 @@ def extract_features_for_dataset(
                 "[Extractor] Baseline resume — "
                 f"{len(baseline_done_image_ids)} images already done."
             )
+    if official_svar_enabled:
+        if baseline_official_output_path is None:
+            raise ValueError(
+                "Official SVAR extraction requires "
+                "baseline_official_output_path."
+            )
+        if resume and os.path.exists(baseline_official_output_path):
+            official_svar_features = load_pkl(baseline_official_output_path)
+            official_svar_done_image_ids = {
+                int(feature["image_id"])
+                for feature in official_svar_features
+                if "image_id" in feature
+            }
+            print(
+                "[Extractor] Official SVAR resume — "
+                f"{len(official_svar_done_image_ids)} images already done."
+            )
 
     for sample in tqdm(coco_samples, desc="Extracting features"):
-        image_id = sample["image_id"]
-        root_is_done = image_id in done_image_ids
-        baseline_is_done = (
-            baseline_runtime is None or image_id in baseline_done_image_ids
-        )
-        if root_is_done and baseline_is_done:
+        image_id = int(sample["image_id"])
+        family_needs = sample.get("_feature_families_needed")
+        if family_needs is not None:
+            if not isinstance(family_needs, Mapping) or set(family_needs) != {
+                "root",
+                "controlled",
+                "official",
+            }:
+                raise ValueError(
+                    f"Image {image_id}: invalid _feature_families_needed="
+                    f"{family_needs!r}"
+                )
+            if bool(family_needs["controlled"]) and not controlled_baseline_enabled:
+                raise RuntimeError(
+                    f"Image {image_id}: controlled baseline output is marked "
+                    "pending but no controlled baseline runtime is enabled."
+                )
+            if bool(family_needs["official"]) and not official_svar_enabled:
+                raise RuntimeError(
+                    f"Image {image_id}: official SVAR output is marked pending "
+                    "but official SVAR is disabled."
+                )
+            root_is_done = not bool(family_needs["root"])
+            controlled_baseline_is_done = (
+                not controlled_baseline_enabled
+                or not bool(family_needs["controlled"])
+            )
+            official_svar_is_done = (
+                not official_svar_enabled
+                or not bool(family_needs["official"])
+            )
+        else:
+            root_is_done = image_id in done_image_ids
+            controlled_baseline_is_done = (
+                not controlled_baseline_enabled
+                or image_id in baseline_done_image_ids
+            )
+            official_svar_is_done = (
+                not official_svar_enabled
+                or image_id in official_svar_done_image_ids
+            )
+        if (
+            root_is_done
+            and controlled_baseline_is_done
+            and official_svar_is_done
+        ):
             continue
         requirements = build_extraction_requirements(
             method=bool(family_flags["method"] and not root_is_done),
             ads_cgc=bool(family_flags["ads_cgc"] and not root_is_done),
             baseline=False,
         )
-        if baseline_runtime is not None and not baseline_is_done:
-            requirements = requirements.merged(baseline_runtime.requirements)
         image_dgst_t = (
             active_dgst_t
             if family_flags["method"] and not root_is_done
@@ -94,13 +167,26 @@ def extract_features_for_dataset(
         labeling_generated_text = label_info.get("generated_text", "")
         if not labeling_generated_text:
             continue
-        labeling_response_ids = model_wrapper.tokenizer.encode(
-            labeling_generated_text, add_special_tokens=False
-        )
-        if image_id in generation_results:
-            raw_response_ids = generation_results[image_id].get("response_token_ids", [])
-            if raw_response_ids:
-                labeling_response_ids = [int(token_id) for token_id in raw_response_ids]
+        generation_entry = generation_results.get(image_id)
+        if not isinstance(generation_entry, dict):
+            raise RuntimeError(
+                f"Image {image_id}: generations.json has no matching row. "
+                "Schema-v2 extraction never reconstructs response IDs by "
+                "tokenizing generated_text."
+            )
+        generation_text = str(generation_entry.get("generated_text", ""))
+        if generation_text != str(labeling_generated_text):
+            raise RuntimeError(
+                f"Image {image_id}: generated_text differs between "
+                "generations.json and labeling.json."
+            )
+        raw_response_ids = generation_entry.get("response_token_ids") or []
+        if not raw_response_ids:
+            raise RuntimeError(
+                f"Image {image_id}: generations.json has no actual "
+                "response_token_ids. Re-run or reuse the generation stage."
+            )
+        labeling_response_ids = [int(token_id) for token_id in raw_response_ids]
         gen_out = GenerationOutput(
             image_id=image_id,
             generated_text=labeling_generated_text,
@@ -114,29 +200,96 @@ def extract_features_for_dataset(
         image = Image.open(sample["image_path"]).convert("RGB")
 
         object_token_spans = label_info.get("object_token_spans", [])
-        if not object_token_spans:
-            continue
 
         image_features = []
-        valid_spans = []
-        response_indices = []
-        target_token_ids = []
+        controlled_spans = []
         for span in object_token_spans:
-            token_indices = span.get("token_indices") or []
-            if not token_indices:
+            if not span.get("token_indices"):
                 continue
-            if not all(
-                0 <= int(index) < len(gen_out.response_token_ids)
-                for index in token_indices
-            ):
-                continue
-            first_idx = int(token_indices[0])
-            valid_spans.append(span)
-            response_indices.append(first_idx)
-            target_token_ids.append(int(gen_out.response_token_ids[first_idx]))
+            _resolve_causal_target(
+                response_token_ids=gen_out.response_token_ids,
+                span=span,
+                image_id=image_id,
+            )
+            controlled_spans.append(span)
 
-        if not valid_spans:
+        need_controlled_outputs = (
+            not root_is_done or not controlled_baseline_is_done
+        )
+        official_spans = (
+            baseline_runtime.prepare_official_svar_spans(
+                label_info,
+                gen_out.response_token_ids,
+            )
+            if official_svar_enabled and not official_svar_is_done
+            else []
+        )
+        for span in official_spans:
+            _resolve_causal_target(
+                response_token_ids=gen_out.response_token_ids,
+                span=span,
+                image_id=image_id,
+            )
+        if official_svar_enabled and not official_spans:
+            # Images without a found official first-token-ID sample are not an
+            # official-SVAR extraction transaction. They must not force a
+            # repeated model forward on every resume.
+            official_svar_is_done = True
+        if not controlled_spans and not official_spans:
             continue
+
+        if baseline_runtime is not None:
+            controlled_capture_needed = bool(
+                controlled_baseline_enabled
+                and not controlled_baseline_is_done
+                and controlled_spans
+            )
+            official_capture_needed = bool(
+                official_spans and not official_svar_is_done
+            )
+            requirement_selector = getattr(
+                baseline_runtime, "requirements_for", None
+            )
+            if callable(requirement_selector):
+                baseline_requirements = requirement_selector(
+                    controlled=controlled_capture_needed,
+                    official=official_capture_needed,
+                )
+            else:
+                # Retain compatibility with lightweight injected runtimes used
+                # by downstream callers and tests. The built-in runtime always
+                # exposes the resume-aware selector above.
+                baseline_requirements = baseline_runtime.requirements
+            requirements = requirements.merged(baseline_requirements)
+
+        requested_spans = [
+            *(controlled_spans if need_controlled_outputs else []),
+            *official_spans,
+        ]
+        response_indices = list(
+            dict.fromkeys(
+                _resolve_causal_target(
+                    response_token_ids=gen_out.response_token_ids,
+                    span=span,
+                    image_id=image_id,
+                )[0]
+                for span in requested_spans
+            )
+        )
+        if not response_indices:
+            continue
+        target_token_ids = [
+            int(gen_out.response_token_ids[index]) for index in response_indices
+        ]
+        representative_spans = []
+        for index in response_indices:
+            representative_spans.append(
+                next(
+                    span
+                    for span in requested_spans
+                    if int(span["token_indices"][0]) == index
+                )
+            )
 
         try:
             model_outputs = model_wrapper.extract_token_features_batch(
@@ -162,7 +315,7 @@ def extract_features_for_dataset(
                 model_wrapper=model_wrapper,
                 image=image,
                 image_id=image_id,
-                spans=valid_spans,
+                spans=representative_spans,
                 response_token_ids=gen_out.response_token_ids,
                 response_indices=response_indices,
                 target_token_ids=target_token_ids,
@@ -171,32 +324,52 @@ def extract_features_for_dataset(
                 requirements=requirements,
             )
 
-        if len(model_outputs) != len(valid_spans):
+        if len(model_outputs) != len(response_indices):
             raise RuntimeError(
                 f"Image {image_id} returned {len(model_outputs)} outputs for "
-                f"{len(valid_spans)} object tokens. Refusing to mark a partial "
+                f"{len(response_indices)} causal token positions. Refusing to mark a partial "
                 "image complete because image-level resume would skip its "
                 "missing object spans."
             )
 
-        successful = [
-            (span, first_idx, target_token_id, model_out)
-            for span, first_idx, target_token_id, model_out in zip(
-                valid_spans,
+        successful_positions = [
+            (first_idx, target_token_id, model_out)
+            for first_idx, target_token_id, model_out in zip(
                 response_indices,
                 target_token_ids,
                 model_outputs,
             )
             if model_out is not None
         ]
-        if len(successful) != len(valid_spans):
+        if len(successful_positions) != len(response_indices):
             raise RuntimeError(
-                f"Image {image_id} produced {len(successful)} successful outputs "
-                f"for {len(valid_spans)} object tokens. Refusing to persist a "
+                f"Image {image_id} produced {len(successful_positions)} successful outputs "
+                f"for {len(response_indices)} causal positions. Refusing to persist a "
                 "partial image because image-level resume would skip it."
             )
+        outputs_by_index = {
+            int(first_idx): model_out
+            for first_idx, target_token_id, model_out in successful_positions
+        }
+        for first_idx, _target_token_id, model_out in successful_positions:
+            returned_index = getattr(model_out, "response_token_idx", None)
+            if returned_index is not None and int(returned_index) != int(first_idx):
+                raise AssertionError(
+                    f"Image {image_id}: wrapper returned response_token_idx="
+                    f"{returned_index} for requested causal position {first_idx}"
+                )
+        controlled_successful = [
+            (
+                span,
+                int(span["token_indices"][0]),
+                int(gen_out.response_token_ids[int(span["token_indices"][0])]),
+                outputs_by_index[int(span["token_indices"][0])],
+            )
+            for span in controlled_spans
+            if int(span["token_indices"][0]) in outputs_by_index
+        ]
         if not root_is_done:
-            for span, first_idx, target_token_id, model_out in successful:
+            for span, first_idx, target_token_id, model_out in controlled_successful:
                 feat = _build_enabled_feature_record(
                     image_id=image_id,
                     span=span,
@@ -209,29 +382,61 @@ def extract_features_for_dataset(
                 )
                 image_features.append(feat)
 
-        if baseline_runtime is not None and successful and not baseline_is_done:
+        if (
+            controlled_baseline_enabled
+            and controlled_successful
+            and not controlled_baseline_is_done
+        ):
             image_baselines = baseline_runtime.build_image_records(
                 image=image,
                 image_id=int(image_id),
                 response_token_ids=gen_out.response_token_ids,
-                spans=[item[0] for item in successful],
-                model_outputs=[item[3] for item in successful],
+                spans=[item[0] for item in controlled_successful],
+                model_outputs=[item[3] for item in controlled_successful],
             )
             baseline_features.extend(image_baselines)
             if image_baselines:
                 append_pkl(image_baselines, baseline_output_path)
+
+        if official_spans and not official_svar_is_done:
+            official_outputs = [
+                outputs_by_index[int(span["token_indices"][0])]
+                for span in official_spans
+            ]
+            image_official_svar = baseline_runtime.build_official_svar_records(
+                image_id=int(image_id),
+                response_token_ids=gen_out.response_token_ids,
+                spans=official_spans,
+                model_outputs=official_outputs,
+            )
+            official_svar_features.extend(image_official_svar)
+            if image_official_svar:
+                append_pkl(
+                    image_official_svar,
+                    baseline_official_output_path,
+                )
 
         if not root_is_done:
             all_features.extend(image_features)
         if image_features and not root_is_done:
             append_pkl(image_features, output_path)
 
+    if controlled_baseline_enabled and not os.path.exists(baseline_output_path):
+        save_pkl([], baseline_output_path)
+    if official_svar_enabled and not os.path.exists(baseline_official_output_path):
+        save_pkl([], baseline_official_output_path)
     print(f"[Extractor] Done. {len(all_features)} DGST-T object tokens saved to {output_path}.")
     if baseline_runtime is not None:
-        print(
-            f"[Extractor] Done. {len(baseline_features)} baseline object tokens "
-            f"saved to {baseline_output_path}."
-        )
+        if controlled_baseline_enabled:
+            print(
+                f"[Extractor] Done. {len(baseline_features)} baseline object tokens "
+                f"saved to {baseline_output_path}."
+            )
+        if official_svar_enabled:
+            print(
+                f"[Extractor] Done. {len(official_svar_features)} official SVAR "
+                f"object tokens saved to {baseline_official_output_path}."
+            )
     return all_features
 
 
@@ -421,6 +626,49 @@ def _load_generation_results(output_dir: str) -> dict[int, dict]:
         return {}
     raw = load_json(path)
     return {int(key): value for key, value in raw.items()}
+
+
+def _resolve_causal_target(
+    *,
+    response_token_ids: List[int],
+    span: dict,
+    image_id: Optional[int] = None,
+) -> tuple[int, int, List[int]]:
+    """Resolve the exact response token and the prefix that predicts it.
+
+    ``response_index=i`` means the target is ``response_token_ids[i]`` and the
+    causal decoder input contains only ``response_token_ids[:i]``.  The helper
+    intentionally rejects corrupt schema-v2 locations rather than shifting to
+    a neighbouring token.
+    """
+
+    raw_indices = span.get("token_indices") or []
+    if not raw_indices:
+        raise ValueError(
+            f"Image {image_id}: object span has no exact token_indices"
+        )
+    try:
+        indices = [int(value) for value in raw_indices]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Image {image_id}: non-integer token_indices={raw_indices}"
+        ) from exc
+    if any(index < 0 for index in indices):
+        raise ValueError(
+            f"Image {image_id}: negative token_indices={indices}"
+        )
+    response_length = len(response_token_ids)
+    if any(index >= response_length for index in indices):
+        raise ValueError(
+            f"Image {image_id}: token_indices={indices} are outside response "
+            f"length {response_length}"
+        )
+    first_index = indices[0]
+    target_token_id = int(response_token_ids[first_index])
+    prefix_token_ids = [
+        int(value) for value in response_token_ids[:first_index]
+    ]
+    return first_index, target_token_id, prefix_token_ids
 
 
 def _build_feature_record(
@@ -967,10 +1215,23 @@ def _extract_token_features_fallback(
     outputs = []
     for span, first_idx, target_token_id in zip(spans, response_indices, target_token_ids):
         try:
+            resolved_index, resolved_target, prefix_token_ids = _resolve_causal_target(
+                response_token_ids=response_token_ids,
+                span=span,
+                image_id=image_id,
+            )
+            if resolved_index != int(first_idx) or resolved_target != int(
+                target_token_id
+            ):
+                raise AssertionError(
+                    "Fallback causal target differs from the batch request: "
+                    f"resolved=({resolved_index}, {resolved_target}), "
+                    f"requested=({first_idx}, {target_token_id})"
+                )
             outputs.append(
                 model_wrapper.extract_token_features(
                     image=image,
-                    prefix_token_ids=[int(token_id) for token_id in response_token_ids[: int(first_idx)]],
+                    prefix_token_ids=prefix_token_ids,
                     response_token_idx=int(first_idx),
                     target_token_id=int(target_token_id),
                     cfg_dgst_t=cfg_dgst_t,

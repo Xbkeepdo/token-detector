@@ -14,6 +14,14 @@ run:
 experiment:
   mode: "vv"                               # Fixed visual-only support for this profile.
 
+labeling:
+  schema_version: 2
+  sample_unit: "first_canonical_mention"   # One training sample per image/canonical COCO object.
+  primary_locator: "exact_response_offsets" # Exact span over the generated response token IDs.
+  save_all_mentions: true                  # Preserve occurrence-level CHAIRs/CHAIRi statistics.
+  save_svar_official_samples: true         # Also build the paper-code canonical/surface lookup samples.
+  alignment_failure_policy: "error"        # error | skip; never substitute a neighbouring token.
+
 models:
   llava_1_5_7b:
     hf_name: "/home/apulis-dev/userdata/models/llava/llava-hf/llava-1___5-7b-hf"
@@ -114,6 +122,7 @@ feature_extraction:
       classifiers: ["lr", "gb"]             # LR(lbfgs), GB(100 estimators).
       gb_n_estimators: 100
     svar:
+      protocols: ["controlled"]             # Exact response offsets; shared fair samples.
       layer_start: 5                         # Inclusive; official LLaVA range is 5..18.
       layer_end: 19                          # Exclusive.
       hidden_dim: 248
@@ -251,6 +260,7 @@ training:
       - "raw_attention_ev"
       - "raw_attention_risk+raw_attention_target_cosine"
       - "raw_attention_risk+raw_attention_ev"
+      - "raw_attention_risk+raw_attention_target_cosine+raw_attention_ev"
     ads_cgc:
       - "ads"
       - "cgc"

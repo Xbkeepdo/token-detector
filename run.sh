@@ -14,12 +14,17 @@ DEVICE="${DEVICE:-cuda:0}"
 GENERATION_DEVICES="${GENERATION_DEVICES:-cuda:0 cuda:1}"
 FEATURE_DEVICES="${FEATURE_DEVICES:-cuda:0 cuda:1}"
 CHAIR_CACHE="${CHAIR_CACHE:-outputs/chair_cache/coco_val2014_chair.pkl}"
-NLTK_DATA="${NLTK_DATA:-/home/apulis-dev/userdata/nltk_data}"
+NLTK_DATA="${NLTK_DATA:-$HOME/nltk_data}"
+REUSE_GENERATIONS_FROM="${REUSE_GENERATIONS_FROM:-}"
 
 DEFAULT_PYTHON="/opt/conda/private/envs/vicr/bin/python"
 PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
 [[ -x "$PYTHON_BIN" ]] || PYTHON_BIN=python
 export CUDA_VISIBLE_DEVICES NLTK_DATA
+
+LABEL_ARGS=()
+[[ -n "$REUSE_GENERATIONS_FROM" ]] && \
+    LABEL_ARGS+=(--reuse-generations-from "$REUSE_GENERATIONS_FROM")
 
 # Step 1: Generate descriptions + CHAIR-style COCO labeling
 "$PYTHON_BIN" scripts/generate_and_label.py \
@@ -29,6 +34,7 @@ export CUDA_VISIBLE_DEVICES NLTK_DATA
     --chair-cache "$CHAIR_CACHE" \
     --device "$DEVICE" \
     --generation-devices $GENERATION_DEVICES \
+    "${LABEL_ARGS[@]}" \
     --resume
 
 # Step 2: Extract method + ADS/CGC + baseline features selected by YAML
