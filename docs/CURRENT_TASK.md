@@ -1,5 +1,31 @@
 # Current Task
 
+## 2026-07-17 Baseline 正类切换为 real
+
+- `training.baseline.positive_class` 默认设为 `real`；后续 MetaToken、SVAR、DHCP、ProjectAway、HalLoc 都在 validation 上使用 real probability 最大化 Real-F1 选择阈值，并同时保留 real/hallucination 两套指标。
+- baseline 汇总表以 Real Precision/Recall/F1/AUPR 为 headline，AUROC 在同时翻转标签和 score 后保持不变，最后一列报告 Hallucination F1。
+- CPU 首轮 46 项相关测试中两项命令数量断言失败，原因是当前用户配置已将 `run.extraction_mode` 改为 `method_only`，旧测试仍假定 YAML 为 `all`；测试现显式构造 `all` 模式，不修改用户当前运行选择。
+- 首轮 131 项完整 CPU 测试另有 1 项旧断言仍强制 active YAML 为 `all`；已改为验证值属于四种合法 extraction mode，继续保留用户当前 `method_only`。
+- 用户当前正在占用 GPU，本轮尚未启动 baseline 重训；先完成 CPU 代码验证，待 GPU 可用后再用 seeds 42/43/44 重算指定汇总。
+- 已立即将指定 `qwen3_vl_8b_baselines_3seed_summary.md` 改为 Real-positive 表格；它复用旧 JSON 中已保存的 real metrics，并明确注明旧阈值仍按 validation Hallucination-F1 选择。后续真正重跑后会由新逻辑改为 validation Real-F1 阈值。
+- 验证：禁用 CUDA 后完整 131 项 unittest 通过；补充 threshold score-class/checkpoint 元数据后，baseline/reporting/SVAR protocol 相关 24 项再次通过；`py_compile` 与 `git diff --check` 通过。
+
+## 2026-07-17 Qwen3 SVAR 关闭 early stopping 实验
+
+- 复用 `COCO4000-512-AC/baseline/features.pkl` 和严格 image-level 8:1:1，只训练 SVAR；seeds=`42/43/44`，每个 seed 固定运行 50 epochs，不提前终止，仍按最低 validation loss 选择 checkpoint。
+- 固定 50 epochs 的 test AUC/AUPR/F1/Acc=`0.8777±0.0015 / 0.6776±0.0026 / 0.6673±0.0050 / 0.8314±0.0026`；原 patience=5 为 `0.8739±0.0023 / 0.6736±0.0023 / 0.6531±0.0141 / 0.8155±0.0185`。
+- 差值分别为 AUC `+0.0038`、AUPR `+0.0040`、F1 `+0.0142`、Acc `+0.0159`。seed 42 最佳 epoch 从 16 后移到 38，seed 44 从 22 后移到 28；seed 43 仍为 epoch 20，结果不变。
+- 独立结果位于 `baseline/results/svar_no_early_stop_seed{42,43,44}/`，汇总为 `baseline/results/qwen3_vl_8b_svar_no_early_stop_3seed_summary.md`，未覆盖原 baseline 结果。
+
+## 2026-07-17 EV 改为 target-dist 区域质量乘原始 target-cosine
+
+- 活动 DGST 六个 target 分支统一使用各自 target-dist 的 top-32 区域：`mass=sum(target_dist[topK])`，`target_cosine=mean(cosine[topK])`，最终 `EV=mass*target_cosine`。
+- EV 不再逐 token 计算 `support-attention*(1+cosine)/2`，也不再将 cosine 从 `[-1,1]` 平移到 `[0,1]`；因此新版 EV 允许为负数。
+- hpre 分支继续匹配 prediction/visual hpre，hmid 分支继续匹配 prediction/visual hmid；source-dist、OT cost 和 EMD risk 不直接参与 EV。
+- 特征记录新增 `dgst_t_ev_definition=target_dist_topk_mass_x_mean_target_cosine`；新版数值字段显式命名为 `dgst_t_{method}_ev_target_dist_mass_x_cosine_topk32_{state}_per_layer`，训练别名为 `{method}_ev_target_dist_mass_x_cosine`。旧 `{method}_ev` 别名只兼容读取旧 `..._ev_topk32...` 字段，避免新旧公式静默混用。
+- 验证：`/opt/conda/private/envs/vicr/bin/python -m unittest discover -v tests` 共 131 项通过；大于 32 个视觉 token 的测试逐分支手算验证了 top-K mass、matched-state cosine 和 EV。
+- 字段改名后的首轮 51 项相关测试有 1 项失败：旧测试强制要求训练列表包含 `hpre_softmax_prob_direct_risk`，但当前 YAML 有意只训练所选子集；已将断言收敛为验证 direct 抽取分支开启、新 raw-attention EV 组合可训练，随后重跑验证。
+
 ## 2026-07-16 run.sh 阶段级 resume 修复
 
 - `coco-labeling/label_coco.py` 现在会核对当前 4000 image IDs、generation caption 与完整 labeling schema；全部一致时直接跳过 tokenizer/model、CHAIR evaluator 和逐图 labeling，不再每次重算 `labeling.json`。
@@ -1328,3 +1354,18 @@
 - `run.prompt`、`run.extraction_mode`、DGST branches、baseline 开关、训练器、正类方向、probe 参数和 feature sets 全部由 `configs/model_configs_unified.yaml` 管理，不再出现在 `run.sh`。
 - `extract_features.py` 根据 YAML 自动路由 `all | method_only | ads_cgc_only | baseline_only`；`train_and_eval.py` 使用同一模式和 family switches，训练根 `features.pkl` 中选定特征及独立 `baseline/` 特征。
 - 严格 8:1:1 仍由 generation/labeling 阶段建立并供所有方法共享；抽取的 `--resume` 与 baseline 目录隔离保持不变。
+
+## 2026-07-17 Baseline Real-positive 三随机种子重跑
+
+- Baseline 训练与汇总的 headline 正类改为 `real`；存储标签仍保持 `0=hallucination, 1=real`，不改变已有 labeling/features。
+- MetaToken、SVAR、DHCP、ProjectAway 已在 GPU 0 上按 seeds `42,43,44` 完整重跑；未运行 HalLoc，也未重新提取特征。
+- 每个方法均在 validation set 上最大化 Real-F1 选择阈值，test set 只做最终评估；逐 seed JSON 已核对 `headline_positive_class=real` 与 `threshold_score_class=real`。
+- 三随机种子 Test 结果：MetaToken-LR AUROC/Real-F1 `0.8615/0.8892`，MetaToken-GB `0.8687/0.8901`，SVAR `0.8739/0.8940`，DHCP `0.8477/0.8919`，ProjectAway `0.7518/0.8636`。
+- 新汇总位于 `outputs/qwen3_vl_8b/COCO4000-512-AC/baseline/results/qwen3_vl_8b_baselines_3seed_summary.md`；旧的 Hall-F1 阈值说明已消失，报告明确记录 validation Real-F1 阈值协议。
+
+## 2026-07-17 COCO4000-EV 分标签曲线
+
+- 新增 `scripts/plot_dgst_ev_mass_cosine_by_label.py`，一次读取根 `features.pkl`，绘制六种 `EV = target-distribution top-k mass × target cosine` 的 hallucination/real 逐层均值与 SEM。
+- Qwen3 `COCO4000-EV` 总图、PDF、逐层 CSV 和 Markdown 摘要写入实验 `results/`；统计使用完整 11,751 条样本，其中 hallucination 2,625、real 9,126。
+- 五条 Gaussian/raw-attention 分支的最大绝对 Hall-Real 均值差位于第 6 层；hpre direct target-probability 分支位于第 35 层。六个峰值差均为负，表示对应层 real 样本的平均 EV 更高。
+- 验证：脚本 `py_compile` 通过；CSV 严格包含 6 分支 × 36 层 = 216 行，全部均值/SEM/difference 有限；PNG 已人工检查布局与图例，`git diff --check` 通过。

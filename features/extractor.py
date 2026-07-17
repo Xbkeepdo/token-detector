@@ -1076,6 +1076,7 @@ def _build_four_gate_feature_record(
         "dgst_t_state_by_method",
         "dgst_t_transport_top_k",
         "dgst_t_target_region_top_k",
+        "dgst_t_ev_definition",
         "dgst_t_cost",
         "dgst_t_ot_solver",
     )
@@ -1101,7 +1102,8 @@ def _build_four_gate_feature_record(
             [
                 f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer",
                 f"dgst_t_{method}_target_cosine_topk32_{state_name}_per_layer",
-                f"dgst_t_{method}_ev_topk32_{state_name}_per_layer",
+                f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
+                f"topk32_{state_name}_per_layer",
             ]
         )
     missing = [
@@ -1172,7 +1174,7 @@ def _build_four_gate_feature_record(
         for suffix in (
             f"risk_sqrt_{state_name}_per_layer",
             f"target_cosine_topk32_{state_name}_per_layer",
-            f"ev_topk32_{state_name}_per_layer",
+            f"ev_target_dist_mass_x_cosine_topk32_{state_name}_per_layer",
         ):
             key = f"dgst_t_{method}_{suffix}"
             feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)

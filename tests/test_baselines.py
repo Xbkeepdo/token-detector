@@ -19,8 +19,10 @@ from detection.baselines import (
     DHCPMLP,
     SVARMLP,
     build_metatoken_classifier,
+    evaluate_detection_scores,
     evaluate_hallucination_scores,
     raw_labels_to_hallucination_targets,
+    select_detection_threshold,
     select_hallucination_threshold,
 )
 from features.baseline import (
@@ -353,6 +355,22 @@ class BaselineDetectorTests(unittest.TestCase):
         self.assertEqual(metrics["headline_positive_class"], "hallucination")
         self.assertEqual(metrics["hallucination_positive"]["f1"], 1.0)
         self.assertEqual(metrics["real_positive"]["f1"], 1.0)
+
+        real_threshold = select_detection_threshold(
+            raw,
+            scores,
+            positive_class="real",
+        )
+        real_metrics = evaluate_detection_scores(
+            raw,
+            scores,
+            real_threshold,
+            positive_class="real",
+        )
+        self.assertEqual(real_metrics["headline_positive_class"], "real")
+        self.assertEqual(real_metrics["threshold_score_class"], "real")
+        self.assertEqual(real_metrics["real_positive"]["f1"], 1.0)
+        self.assertEqual(real_metrics["hallucination_positive"]["f1"], 1.0)
 
     def test_metatoken_classifier_paper_hyperparameters(self):
         lr = build_metatoken_classifier("lr").named_steps["classifier"]

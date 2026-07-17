@@ -27,11 +27,11 @@ def _metrics(value: float) -> dict:
             "aupr": value,
         },
         "real_positive": {
-            "precision": value,
-            "recall": value,
-            "f1": value,
-            "auc": value,
-            "aupr": value,
+            "precision": value + 0.05,
+            "recall": value + 0.05,
+            "f1": value + 0.05,
+            "auc": value + 0.05,
+            "aupr": value + 0.05,
         },
     }
 
@@ -68,9 +68,10 @@ class BaselineReportingTests(unittest.TestCase):
         self.assertEqual(summary["seeds"], [42, 43, 44])
         self.assertEqual(summary["num_seeds"], 3)
         stats = summary["methods"]["svar"]["test_metrics"]["f1"]
-        self.assertAlmostEqual(stats["mean"], 0.7)
+        self.assertEqual(summary["headline_positive_class"], "real")
+        self.assertAlmostEqual(stats["mean"], 0.75)
         self.assertAlmostEqual(stats["std"], (2 / 300) ** 0.5)
-        self.assertEqual(stats["values"], [0.6, 0.7, 0.8])
+        self.assertEqual(stats["values"], [0.65, 0.75, 0.8500000000000001])
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "summary.md"
@@ -80,8 +81,9 @@ class BaselineReportingTests(unittest.TestCase):
                 source_paths=[Path(f"seed{seed}.json") for seed in (42, 43, 44)],
             )
             text = path.read_text(encoding="utf-8")
-        self.assertIn("0.7000 ± 0.0816", text)
-        self.assertIn("各随机种子的 Test Hallucination F1", text)
+        self.assertIn("0.7500 ± 0.0816", text)
+        self.assertIn("headline 正类：real", text)
+        self.assertIn("各随机种子的 Test Real F1", text)
         self.assertIn("seed 42", text)
 
     def test_rejects_duplicate_seeds(self) -> None:

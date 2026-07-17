@@ -616,6 +616,10 @@ def _register_four_gate_aliases() -> None:
             f"{method}_ev": (
                 f"dgst_t_{method}_ev_topk32_{state_name}_per_layer"
             ),
+            f"{method}_ev_target_dist_mass_x_cosine": (
+                f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
+                f"topk32_{state_name}_per_layer"
+            ),
         }
         for block, feature_key in specs.items():
             FEATURE_ALIASES[block] = block

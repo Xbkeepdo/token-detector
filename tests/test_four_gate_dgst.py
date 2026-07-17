@@ -292,11 +292,20 @@ class FourGateDGSTTests(unittest.TestCase):
                 hmid_cosine_map if state_name == "hmid" else cosine_map
             )
             expected_cosine = branch_cosine.index_select(0, region).mean()
+            expected_ev = (
+                target_dist.index_select(0, region).sum()
+                * expected_cosine
+            )
             key = (
                 f"dgst_t_{method}_target_cosine_topk32_"
                 f"{state_name}_per_layer"
             )
             self.assertAlmostEqual(float(result[key][0]), float(expected_cosine), places=6)
+            ev_key = (
+                f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
+                f"topk32_{state_name}_per_layer"
+            )
+            self.assertAlmostEqual(float(result[ev_key][0]), float(expected_ev), places=6)
             cost_states = (
                 capture["h_mid"][0, :patches]
                 if state_name == "hmid"
@@ -393,9 +402,6 @@ class FourGateDGSTTests(unittest.TestCase):
             tuple(result["dgst_t_attention_support_per_layer"].shape), (1, 3)
         )
 
-        normalized_attention = attention[0, :, 3, :3].mean(dim=0)
-        normalized_attention = normalized_attention / normalized_attention.sum()
-
         for method in FOUR_GATE_METHODS:
             state_name = "hmid" if method.startswith("hmid_") else "hpre"
             branch_states = (
@@ -408,13 +414,10 @@ class FourGateDGSTTests(unittest.TestCase):
                 branch_states[:3],
                 dim=-1,
             )
-            expected_ev = float(
-                (
-                    normalized_attention
-                    * ((1.0 + cosine) / 2.0)
-                ).sum().item()
-            )
             expected_cosine = float(cosine.mean().item())
+            # K=32 covers all three visual tokens, so the normalized target
+            # distribution contributes mass 1.0 for every method.
+            expected_ev = expected_cosine
             gate_key = f"dgst_t_{method}_gate_per_layer"
             risk_key = (
                 f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
@@ -424,7 +427,8 @@ class FourGateDGSTTests(unittest.TestCase):
                 f"{state_name}_per_layer"
             )
             ev_key = (
-                f"dgst_t_{method}_ev_topk32_{state_name}_per_layer"
+                f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
+                f"topk32_{state_name}_per_layer"
             )
             self.assertEqual(tuple(result[gate_key].shape), (1, 3))
             self.assertEqual(result[gate_key].dtype, torch.float32)
@@ -455,7 +459,7 @@ class FourGateDGSTTests(unittest.TestCase):
             parse_feature_set(
                 "hpre_raw_logit_gauss_risk+"
                 "hpre_raw_logit_gauss_target_cosine+"
-                "hpre_raw_logit_gauss_ev"
+                "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
             ),
         )
         self.assertEqual(matrix.shape, (1, 3))
@@ -517,14 +521,21 @@ class FourGateDGSTTests(unittest.TestCase):
         )
         cosine = F.cosine_similarity(h_prev[0, 3].unsqueeze(0), h_prev[0, :3], dim=-1)
         expected_cosine = float(cosine.mean())
-        expected_ev = float((expected_attention * ((1.0 + cosine) / 2.0)).sum())
+        # raw_attention uses attention itself as target-dist.  K=32 covers all
+        # tokens here, hence target-region mass is one.
+        expected_ev = expected_cosine
         self.assertAlmostEqual(
             float(result["dgst_t_raw_attention_target_cosine_topk32_hpre_per_layer"][0]),
             expected_cosine,
             places=6,
         )
         self.assertAlmostEqual(
-            float(result["dgst_t_raw_attention_ev_topk32_hpre_per_layer"][0]),
+            float(
+                result[
+                    "dgst_t_raw_attention_ev_target_dist_mass_x_cosine_"
+                    "topk32_hpre_per_layer"
+                ][0]
+            ),
             expected_ev,
             places=6,
         )
@@ -641,7 +652,7 @@ class FourGateDGSTTests(unittest.TestCase):
             parse_feature_set(
                 "hpre_softmax_prob_direct_risk+"
                 "hpre_softmax_prob_direct_target_cosine+"
-                "hpre_softmax_prob_direct_ev"
+                "hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
             ),
         )
         self.assertEqual(matrix.shape, (1, 3))

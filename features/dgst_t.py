@@ -4126,9 +4126,15 @@ def compute_four_gate_dgst_batch_from_captures(
                 else:
                     local_cosine = cosine_map.index_select(0, region)
                     target_cosine = float(local_cosine.mean().item())
-                    local_attention = attention_support.index_select(0, region)
+                    # EV couples two properties of the branch-specific target
+                    # region: how much of that branch's target distribution is
+                    # concentrated in its top-K tokens, and how well those
+                    # tokens align with the matched prediction state.  Keep the
+                    # region cosine unweighted so it is exactly the separately
+                    # reported target-cosine feature.
+                    target_region_mass = target_dist.index_select(0, region).sum()
                     evidence_value = float(
-                        (local_attention * ((1.0 + local_cosine) / 2.0)).sum().item()
+                        (target_region_mass * local_cosine.mean()).item()
                     )
                 if method != DIRECT_HPRE_SOFTMAX_METHOD:
                     record["gates"][method].append(gate)
@@ -4177,6 +4183,9 @@ def compute_four_gate_dgst_batch_from_captures(
             },
             "dgst_t_transport_top_k": int(transport_top_k),
             "dgst_t_target_region_top_k": int(target_region_top_k),
+            "dgst_t_ev_definition": (
+                "target_dist_topk_mass_x_mean_target_cosine"
+            ),
             "dgst_t_cost": "sqrt_cosine_matched_state",
             "dgst_t_ot_solver": "emd",
             "dgst_t_attention_support_per_layer": torch.stack(
@@ -4220,7 +4229,8 @@ def compute_four_gate_dgst_batch_from_captures(
                 f"dgst_t_{method}_target_cosine_topk32_{state_name}_per_layer"
             ] = torch.tensor(record["cosines"][method], dtype=torch.float32)
             result[
-                f"dgst_t_{method}_ev_topk32_{state_name}_per_layer"
+                f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
+                f"topk32_{state_name}_per_layer"
             ] = torch.tensor(
                 record["ev"][method], dtype=torch.float32
             )

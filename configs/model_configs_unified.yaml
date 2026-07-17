@@ -9,7 +9,7 @@
 
 run:
   prompt: "Describe this image."
-  extraction_mode: "all"                   # all | method_only | ads_cgc_only | baseline_only
+  extraction_mode: "method_only"                   # all | method_only | ads_cgc_only | baseline_only
 
 experiment:
   mode: "vv"                               # Fixed visual-only support for this profile.
@@ -199,6 +199,8 @@ feature_extraction:
     transport_top_k: 64
     cost_mode: "sqrt_matched_state"          # hpre branches use hpre; hmid branches use hmid.
     ot_solver: "emd"
+    # Each branch selects its own target-dist top-K. EV = target-dist top-K
+    # mass * the matched-state mean target cosine in the same region (no shift).
     atarget_visual_top_k: 32
     relative_vll_mad_epsilon: 1.0e-6
     target_attention_epsilon: 1.0e-12
@@ -230,6 +232,7 @@ training:
     # Training-only selection: this does not change/re-extract baseline/features.pkl.
     # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
     methods: ["metatoken", "svar", "dhcp", "projectaway"]
+    positive_class: "real"                  # real | hallucination; selects val threshold and headline metrics.
     seeds: [42, 43, 44]                     # Use [42] for a quick single-seed run.
     write_summary: true                     # Per-seed MD + aggregate mean/std MD.
   torch_probe:
@@ -240,36 +243,52 @@ training:
   feature_sets:
     method:
       - "hpre_raw_logit_gauss_risk"
-      - "hpre_raw_logit_gauss_target_cosine"
-      - "hpre_raw_logit_gauss_ev"
-      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_target_cosine"
-      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_ev"
+      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       - "hpre_softmax_prob_gauss_risk"
-      - "hpre_softmax_prob_gauss_target_cosine"
-      - "hpre_softmax_prob_gauss_ev"
-      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_target_cosine"
-      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev"
+      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       - "hmid_raw_logit_gauss_risk"
-      - "hmid_raw_logit_gauss_target_cosine"
-      - "hmid_raw_logit_gauss_ev"
-      - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_target_cosine"
-      - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_ev"
+      - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       - "hmid_softmax_prob_gauss_risk"
-      - "hmid_softmax_prob_gauss_target_cosine"
-      - "hmid_softmax_prob_gauss_ev"
-      - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_target_cosine"
-      - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev"
-      - "hpre_softmax_prob_direct_risk"
-      - "hpre_softmax_prob_direct_target_cosine"
-      - "hpre_softmax_prob_direct_ev"
-      - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_target_cosine"
-      - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_ev"
+      - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       - "raw_attention_risk"
-      - "raw_attention_target_cosine"
-      - "raw_attention_ev"
-      - "raw_attention_risk+raw_attention_target_cosine"
-      - "raw_attention_risk+raw_attention_ev"
-      - "raw_attention_risk+raw_attention_target_cosine+raw_attention_ev"
+      - "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine"
+      - "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
+      - "raw_attention_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk"
+      # - "hpre_raw_logit_gauss_target_cosine"
+      # - "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_target_cosine"
+      # - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk"
+      # - "hpre_softmax_prob_gauss_target_cosine"
+      # - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_target_cosine"
+      # - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_raw_logit_gauss_risk"
+      # - "hmid_raw_logit_gauss_target_cosine"
+      # - "hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_target_cosine"
+      # - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_softmax_prob_gauss_risk"
+      # - "hmid_softmax_prob_gauss_target_cosine"
+      # - "hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_target_cosine"
+      # - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_direct_risk"
+      # - "hpre_softmax_prob_direct_target_cosine"
+      # - "hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_target_cosine"
+      # - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
+      # - "raw_attention_risk"
+      # - "raw_attention_target_cosine"
+      # - "raw_attention_ev_target_dist_mass_x_cosine"
+      # - "raw_attention_risk+raw_attention_target_cosine"
+      # - "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine"
+      # - "raw_attention_risk+raw_attention_target_cosine+raw_attention_ev_target_dist_mass_x_cosine"
     ads_cgc:
       - "ads"
       - "cgc"

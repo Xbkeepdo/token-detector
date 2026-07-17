@@ -6,7 +6,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
 MODEL="${MODEL:-qwen3_vl_8b}"
-OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-512}"
+OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-EV}"
 CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"

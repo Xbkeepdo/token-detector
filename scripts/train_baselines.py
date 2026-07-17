@@ -23,9 +23,9 @@ from detection.baselines import (
     SVARMLP,
     build_dense_baseline_matrix,
     build_metatoken_classifier,
-    evaluate_hallucination_scores,
+    evaluate_detection_scores,
     raw_labels_to_hallucination_targets,
-    select_hallucination_threshold,
+    select_detection_threshold,
     sklearn_hallucination_scores,
     split_records_by_image,
     torch_hallucination_scores,
@@ -55,7 +55,7 @@ SUMMARY_METRICS = (
     "f1",
     "auc",
     "aupr",
-    "real_f1",
+    "other_f1",
 )
 
 
@@ -140,6 +140,9 @@ def main() -> None:
         raise ValueError("--run-name can only be used with one effective seed")
     device = _resolve_device(args.device)
     write_summary = bool(training_cfg.get("write_summary", True))
+    positive_class = _normalize_reporting_positive_class(
+        training_cfg.get("positive_class", "real")
+    )
 
     if controlled_methods:
         feature_path = baseline_dir / "features.pkl"
@@ -171,6 +174,7 @@ def main() -> None:
                 "shared_first_canonical_mention_exact_response_offsets"
             ),
             write_summary=write_summary,
+            positive_class=positive_class,
         )
 
     if official_svar_enabled:
@@ -217,6 +221,7 @@ def main() -> None:
             ),
             sample_audit=official_sample_audit,
             write_summary=write_summary,
+            positive_class=positive_class,
         )
 
 
@@ -365,6 +370,7 @@ def _run_training_protocol(
     result_stem: str,
     label_protocol: str,
     write_summary: bool,
+    positive_class: str,
     sample_audit: Optional[Mapping[str, Any]] = None,
 ) -> None:
     run_outputs: list[dict[str, Any]] = []
@@ -390,6 +396,7 @@ def _run_training_protocol(
             result_stem=result_stem,
             label_protocol=label_protocol,
             sample_audit=sample_audit,
+            positive_class=positive_class,
         )
         run_outputs.append(output)
         run_paths.append(result_path)
@@ -401,6 +408,7 @@ def _run_training_protocol(
             outputs=run_outputs,
             result_paths=run_paths,
             result_stem=result_stem,
+            positive_class=positive_class,
         )
 
 
@@ -422,6 +430,7 @@ def _train_one_seed(
         "shared_first_canonical_mention_exact_response_offsets"
     ),
     sample_audit: Optional[Mapping[str, Any]] = None,
+    positive_class: str = "real",
 ) -> tuple[dict[str, Any], Path]:
     result_dir = baseline_dir / "results"
     checkpoint_dir = baseline_dir / "checkpoints"
@@ -441,7 +450,7 @@ def _train_one_seed(
         "split_path": str(split_path),
         "stored_label_semantics": {"0": "hallucination", "1": "real"},
         "detector_target_semantics": {"0": "real", "1": "hallucination"},
-        "headline_positive_class": "hallucination",
+        "headline_positive_class": str(positive_class),
         "label_protocol": str(label_protocol),
         "counts": {name: len(rows) for name, rows in split_records.items()},
         "image_split_counts": image_split_counts,
@@ -453,18 +462,39 @@ def _train_one_seed(
     for method in methods:
         print(f"[BaselineTrain] seed={seed} method={method} device={device}")
         if method == "metatoken":
-            result = _train_metatoken(split_records, checkpoint_dir, baseline_cfg)
+            result = _train_metatoken(
+                split_records,
+                checkpoint_dir,
+                baseline_cfg,
+                positive_class,
+            )
         elif method == "svar":
-            result = _train_svar(split_records, checkpoint_dir, baseline_cfg, device)
+            result = _train_svar(
+                split_records,
+                checkpoint_dir,
+                baseline_cfg,
+                device,
+                positive_class,
+            )
         elif method == "dhcp":
             result = _train_dhcp(
-                split_records, baseline_dir, checkpoint_dir, baseline_cfg, device
+                split_records,
+                baseline_dir,
+                checkpoint_dir,
+                baseline_cfg,
+                device,
+                positive_class,
             )
         elif method == "projectaway":
-            result = _evaluate_projectaway(split_records)
+            result = _evaluate_projectaway(split_records, positive_class)
         else:
             result = _train_halloc(
-                split_records, baseline_dir, checkpoint_dir, baseline_cfg, device
+                split_records,
+                baseline_dir,
+                checkpoint_dir,
+                baseline_cfg,
+                device,
+                positive_class,
             )
         output["methods"][method] = result
         save_json(output, str(result_path))
@@ -480,7 +510,7 @@ def _baseline_training_config(config: Mapping[str, Any]) -> dict[str, Any]:
     baseline = training.get("baseline") or {}
     if not isinstance(baseline, Mapping):
         raise ValueError("training.baseline must be a YAML mapping")
-    allowed = {"methods", "seeds", "write_summary"}
+    allowed = {"methods", "seeds", "write_summary", "positive_class"}
     unknown = sorted(set(baseline) - allowed)
     if unknown:
         raise ValueError(f"Unknown training.baseline options: {unknown}")
@@ -519,6 +549,18 @@ def _safe_run_name(value: str) -> str:
     return run_name
 
 
+def _normalize_reporting_positive_class(value: object) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized in {"real", "non_hallucination", "nonhallucination"}:
+        return "real"
+    if normalized in {"hall", "hallucinated", "hallucination"}:
+        return "hallucination"
+    raise ValueError(
+        "training.baseline.positive_class must be 'real' or 'hallucination', "
+        f"got {value!r}"
+    )
+
+
 def _write_training_summaries(
     *,
     model: str,
@@ -526,12 +568,16 @@ def _write_training_summaries(
     outputs: Sequence[Mapping[str, Any]],
     result_paths: Sequence[Path],
     result_stem: Optional[str] = None,
+    positive_class: str = "real",
 ) -> None:
     if len(outputs) != len(result_paths):
         raise ValueError("Baseline outputs and result paths must have equal length")
     base_stem = str(result_stem or f"{model}_baselines")
     for output, result_path in zip(outputs, result_paths):
-        summary = aggregate_baseline_outputs([output])
+        summary = aggregate_baseline_outputs(
+            [output],
+            positive_class=positive_class,
+        )
         markdown_path = result_path.with_name(f"{base_stem}_summary.md")
         _write_baseline_markdown(
             markdown_path,
@@ -541,7 +587,10 @@ def _write_training_summaries(
         print(f"[BaselineTrain] saved {markdown_path}")
 
     if len(outputs) > 1:
-        summary = aggregate_baseline_outputs(outputs)
+        summary = aggregate_baseline_outputs(
+            outputs,
+            positive_class=positive_class,
+        )
         result_dir = baseline_dir / "results"
         result_dir.mkdir(parents=True, exist_ok=True)
         stem = f"{base_stem}_{len(outputs)}seed"
@@ -560,10 +609,13 @@ def _write_training_summaries(
 
 def aggregate_baseline_outputs(
     outputs: Sequence[Mapping[str, Any]],
+    *,
+    positive_class: str = "real",
 ) -> dict[str, Any]:
     if not outputs:
         raise ValueError("At least one baseline output is required")
     model = str(outputs[0]["model"])
+    positive_class = _normalize_reporting_positive_class(positive_class)
     seeds = [int(output["seed"]) for output in outputs]
     if len(set(seeds)) != len(seeds):
         raise ValueError(f"Baseline seeds must be unique, got {seeds}")
@@ -589,7 +641,11 @@ def aggregate_baseline_outputs(
         row: dict[str, Any] = {"display_name": display_name}
         for split in ("val", "test"):
             seed_metrics = [
-                _headline_metrics(_baseline_method_variants(output)[key][1], split)
+                _headline_metrics(
+                    _baseline_method_variants(output)[key][1],
+                    split,
+                    positive_class=positive_class,
+                )
                 for output in outputs
             ]
             row[f"{split}_metrics"] = {
@@ -605,7 +661,13 @@ def aggregate_baseline_outputs(
         "seeds": seeds,
         "num_seeds": len(seeds),
         "std_definition": "population",
-        "headline_positive_class": "hallucination",
+        "headline_positive_class": positive_class,
+        "source_headline_positive_classes": sorted(
+            {
+                str(output.get("headline_positive_class") or "unknown")
+                for output in outputs
+            }
+        ),
         "stored_label_semantics": outputs[0].get("stored_label_semantics"),
         "detector_target_semantics": outputs[0].get("detector_target_semantics"),
         "label_protocol": outputs[0].get("label_protocol"),
@@ -646,18 +708,25 @@ def _baseline_method_variants(
     return variants
 
 
-def _headline_metrics(result: Mapping[str, Any], split: str) -> dict[str, float]:
+def _headline_metrics(
+    result: Mapping[str, Any],
+    split: str,
+    *,
+    positive_class: str,
+) -> dict[str, float]:
     metrics = result.get(f"{split}_metrics") or {}
     hallucination = metrics.get("hallucination_positive") or {}
     real = metrics.get("real_positive") or {}
+    positive = real if positive_class == "real" else hallucination
+    other = hallucination if positive_class == "real" else real
     return {
         "accuracy": float(metrics["accuracy"]),
-        "precision": float(hallucination["precision"]),
-        "recall": float(hallucination["recall"]),
-        "f1": float(hallucination["f1"]),
-        "auc": float(hallucination["auc"]),
-        "aupr": float(hallucination["aupr"]),
-        "real_f1": float(real["f1"]),
+        "precision": float(positive["precision"]),
+        "recall": float(positive["recall"]),
+        "f1": float(positive["f1"]),
+        "auc": float(positive["auc"]),
+        "aupr": float(positive["aupr"]),
+        "other_f1": float(other["f1"]),
     }
 
 
@@ -682,6 +751,15 @@ def _write_baseline_markdown(
     image_counts = summary.get("image_split_counts") or {}
     methods = summary.get("methods") or {}
     label_protocol = str(summary.get("label_protocol") or "")
+    positive_class = _normalize_reporting_positive_class(
+        summary.get("headline_positive_class", "real")
+    )
+    positive_label = "Real" if positive_class == "real" else "Hall."
+    other_label = "Hall." if positive_class == "real" else "Real"
+    source_positive_classes = set(
+        str(value)
+        for value in summary.get("source_headline_positive_classes", [])
+    )
     experiment_name = (
         "SVAR Official"
         if "official_svar" in label_protocol
@@ -693,9 +771,15 @@ def _write_baseline_markdown(
         "## 实验协议",
         "",
         f"- 随机种子：`{', '.join(str(seed) for seed in seeds)}`。",
-        "- headline 正类：hallucination。",
+        f"- headline 正类：{positive_class}。",
         f"- 标签协议：`{label_protocol or 'unknown'}`。",
-        "- 阈值只在 validation set 上选择，test set 只用于最终评估。",
+        (
+            f"- 阈值在 validation set 上按 {positive_label} F1 选择，"
+            "test set 只用于最终评估。"
+            if source_positive_classes == {positive_class}
+            else "- 当前汇总切换为 Real-positive 展示；原始 JSON 的阈值按 "
+            "validation Hallucination-F1 选择，尚未重新选 Real-F1 阈值。"
+        ),
         f"- image split：train/val/test = "
         f"{image_counts.get('train', '?')}/{image_counts.get('val', '?')}/"
         f"{image_counts.get('test', '?')}。",
@@ -745,7 +829,9 @@ def _write_baseline_markdown(
             "",
             "## Test 结果",
             "",
-            "| 方法 | Accuracy | Hall. Precision | Hall. Recall | Hall. F1 | AUROC | AUPR | Real F1 |",
+            f"| 方法 | Accuracy | {positive_label} Precision | "
+            f"{positive_label} Recall | {positive_label} F1 | AUROC | AUPR | "
+            f"{other_label} F1 |",
             "|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
@@ -764,7 +850,9 @@ def _write_baseline_markdown(
             "",
             "## Validation 结果",
             "",
-            "| 方法 | Accuracy | Hall. Precision | Hall. Recall | Hall. F1 | AUROC | AUPR | Real F1 |",
+            f"| 方法 | Accuracy | {positive_label} Precision | "
+            f"{positive_label} Recall | {positive_label} F1 | AUROC | AUPR | "
+            f"{other_label} F1 |",
             "|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
@@ -782,7 +870,7 @@ def _write_baseline_markdown(
         lines.extend(
             [
                 "",
-                "## 各随机种子的 Test Hallucination F1",
+                f"## 各随机种子的 Test {positive_label} F1",
                 "",
                 "| 方法 | " + " | ".join(f"seed {seed}" for seed in seeds) + " |",
                 "|---|" + "---:|" * len(seeds),
@@ -805,7 +893,7 @@ def _write_baseline_markdown(
                 "",
                 "## 简要结论",
                 "",
-                f"- Test Hallucination F1 最高的方法是 **{best['display_name']}**："
+                f"- Test {positive_label} F1 最高的方法是 **{best['display_name']}**："
                 f"{_format_summary_value(best['test_metrics']['f1'], multi_seed)}。",
             ]
         )
@@ -820,7 +908,12 @@ def _format_summary_value(statistics: Mapping[str, Any], multi_seed: bool) -> st
     return f"{mean:.4f} ± {float(statistics['std']):.4f}"
 
 
-def _train_metatoken(split_records, checkpoint_dir, cfg) -> dict[str, Any]:
+def _train_metatoken(
+    split_records,
+    checkpoint_dir,
+    cfg,
+    positive_class,
+) -> dict[str, Any]:
     matrices = {}
     for split in ("train", "val", "test"):
         matrices[split] = build_dense_baseline_matrix(
@@ -849,7 +942,11 @@ def _train_metatoken(split_records, checkpoint_dir, cfg) -> dict[str, Any]:
         )
         val_scores = sklearn_hallucination_scores(classifier, matrices["val"][0])
         test_scores = sklearn_hallucination_scores(classifier, matrices["test"][0])
-        threshold = select_hallucination_threshold(matrices["val"][1], val_scores)
+        threshold = select_detection_threshold(
+            matrices["val"][1],
+            val_scores,
+            positive_class=positive_class,
+        )
         path = checkpoint_dir / f"metatoken_{kind}.pkl"
         save_pkl(classifier, str(path))
         result[kind] = {
@@ -861,18 +958,31 @@ def _train_metatoken(split_records, checkpoint_dir, cfg) -> dict[str, Any]:
             },
             "input_dim": int(matrices["train"][0].shape[1]),
             "threshold": threshold,
-            "val_metrics": evaluate_hallucination_scores(
-                matrices["val"][1], val_scores, threshold
+            "threshold_score_class": str(positive_class),
+            "val_metrics": evaluate_detection_scores(
+                matrices["val"][1],
+                val_scores,
+                threshold,
+                positive_class=positive_class,
             ),
-            "test_metrics": evaluate_hallucination_scores(
-                matrices["test"][1], test_scores, threshold
+            "test_metrics": evaluate_detection_scores(
+                matrices["test"][1],
+                test_scores,
+                threshold,
+                positive_class=positive_class,
             ),
             "checkpoint": str(path),
         }
     return result
 
 
-def _train_svar(split_records, checkpoint_dir, cfg, device) -> dict[str, Any]:
+def _train_svar(
+    split_records,
+    checkpoint_dir,
+    cfg,
+    device,
+    positive_class,
+) -> dict[str, Any]:
     matrices = {
         split: build_dense_baseline_matrix(split_records[split], "svar")[:2]
         for split in ("train", "val", "test")
@@ -904,6 +1014,7 @@ def _train_svar(split_records, checkpoint_dir, cfg, device) -> dict[str, Any]:
             svar_cfg.get("early_stopping_patience", 5)
         ),
         seed=seed,
+        positive_class=positive_class,
     )
     path = checkpoint_dir / "svar.pt"
     _atomic_torch_save(
@@ -913,6 +1024,7 @@ def _train_svar(split_records, checkpoint_dir, cfg, device) -> dict[str, Any]:
             "input_dim": int(matrices["train"][0].shape[1]),
             "hidden_dim": int(_setting(svar_cfg, "hidden_dim", "hidden_size", default=248)),
             "threshold": trained.threshold,
+            "threshold_score_class": str(positive_class),
         },
     )
     return {
@@ -923,9 +1035,11 @@ def _train_svar(split_records, checkpoint_dir, cfg, device) -> dict[str, Any]:
             "early_stopping_patience": int(
                 svar_cfg.get("early_stopping_patience", 5)
             ),
+            "positive_class": str(positive_class),
         },
         "input_dim": int(matrices["train"][0].shape[1]),
         "threshold": trained.threshold,
+        "threshold_score_class": str(positive_class),
         "val_metrics": trained.val_metrics,
         "test_metrics": trained.test_metrics,
         "history": trained.history,
@@ -933,7 +1047,14 @@ def _train_svar(split_records, checkpoint_dir, cfg, device) -> dict[str, Any]:
     }
 
 
-def _train_dhcp(split_records, baseline_dir, checkpoint_dir, cfg, device):
+def _train_dhcp(
+    split_records,
+    baseline_dir,
+    checkpoint_dir,
+    cfg,
+    device,
+    positive_class,
+):
     datasets = {
         split: DHCPRecordDataset(
             split_records[split], baseline_dir / "dhcp" / "shards"
@@ -1015,7 +1136,11 @@ def _train_dhcp(split_records, baseline_dir, checkpoint_dir, cfg, device):
     )
     val_raw = np.asarray([record["label"] for record in datasets["val"].records])
     test_raw = np.asarray([record["label"] for record in datasets["test"].records])
-    threshold = select_hallucination_threshold(val_raw, val_scores)
+    threshold = select_detection_threshold(
+        val_raw,
+        val_scores,
+        positive_class=positive_class,
+    )
     path = checkpoint_dir / "dhcp.pt"
     _atomic_torch_save(
         path,
@@ -1024,6 +1149,7 @@ def _train_dhcp(split_records, baseline_dir, checkpoint_dir, cfg, device):
             "input_shape": shape,
             "hidden_dim": dhcp_hidden,
             "threshold": threshold,
+            "threshold_score_class": str(positive_class),
         },
     )
     return {
@@ -1036,18 +1162,30 @@ def _train_dhcp(split_records, baseline_dir, checkpoint_dir, cfg, device):
             "epochs": dhcp_epochs,
             "early_stopping_patience": patience,
             "weighted_sampler": True,
+            "positive_class": str(positive_class),
         },
         "input_shape": list(shape),
         "input_dim": input_dim,
         "threshold": threshold,
-        "val_metrics": evaluate_hallucination_scores(val_raw, val_scores, threshold),
-        "test_metrics": evaluate_hallucination_scores(test_raw, test_scores, threshold),
+        "threshold_score_class": str(positive_class),
+        "val_metrics": evaluate_detection_scores(
+            val_raw,
+            val_scores,
+            threshold,
+            positive_class=positive_class,
+        ),
+        "test_metrics": evaluate_detection_scores(
+            test_raw,
+            test_scores,
+            threshold,
+            positive_class=positive_class,
+        ),
         "history": history,
         "checkpoint": str(path),
     }
 
 
-def _evaluate_projectaway(split_records) -> dict[str, Any]:
+def _evaluate_projectaway(split_records, positive_class) -> dict[str, Any]:
     scores, labels = {}, {}
     for split in ("val", "test"):
         payloads = [
@@ -1060,20 +1198,42 @@ def _evaluate_projectaway(split_records) -> dict[str, Any]:
         labels[split] = np.asarray(
             [int(record["label"]) for record in split_records[split]]
         )
-    threshold = select_hallucination_threshold(labels["val"], scores["val"])
+    threshold = select_detection_threshold(
+        labels["val"],
+        scores["val"],
+        positive_class=positive_class,
+    )
     return {
-        "paper_config": {"training_free": True, "threshold_selected_on": "val"},
+        "paper_config": {
+            "training_free": True,
+            "threshold_selected_on": "val",
+            "positive_class": str(positive_class),
+        },
         "threshold": threshold,
-        "val_metrics": evaluate_hallucination_scores(
-            labels["val"], scores["val"], threshold
+        "threshold_score_class": str(positive_class),
+        "val_metrics": evaluate_detection_scores(
+            labels["val"],
+            scores["val"],
+            threshold,
+            positive_class=positive_class,
         ),
-        "test_metrics": evaluate_hallucination_scores(
-            labels["test"], scores["test"], threshold
+        "test_metrics": evaluate_detection_scores(
+            labels["test"],
+            scores["test"],
+            threshold,
+            positive_class=positive_class,
         ),
     }
 
 
-def _train_halloc(split_records, baseline_dir, checkpoint_dir, cfg, device):
+def _train_halloc(
+    split_records,
+    baseline_dir,
+    checkpoint_dir,
+    cfg,
+    device,
+    positive_class,
+):
     seed = int(cfg.get("seed", 42))
     _seed_everything(seed)
     datasets = {
@@ -1179,13 +1339,18 @@ def _train_halloc(split_records, baseline_dir, checkpoint_dir, cfg, device):
     _, test_scores = _halloc_scores(model, loaders["test"], device, criterion)
     val_raw = np.asarray([record["label"] for record in datasets["val"].records])
     test_raw = np.asarray([record["label"] for record in datasets["test"].records])
-    threshold = select_hallucination_threshold(val_raw, val_scores)
+    threshold = select_detection_threshold(
+        val_raw,
+        val_scores,
+        positive_class=positive_class,
+    )
     path = checkpoint_dir / "halloc.pt"
     _atomic_torch_save(
         path,
         {
             "state_dict": best_state,
             "threshold": threshold,
+            "threshold_score_class": str(positive_class),
             "paper_metadata": model.paper_metadata(),
             "lvlm_hidden_size": int(sample[0].shape[-1]),
             "clip_hidden_size": int(sample[1].shape[-1]),
@@ -1205,10 +1370,22 @@ def _train_halloc(split_records, baseline_dir, checkpoint_dir, cfg, device):
             "max_epochs": halloc_epochs,
             "scheduler": scheduler_name,
             "early_stopping_patience": patience,
+            "positive_class": str(positive_class),
         },
         "threshold": threshold,
-        "val_metrics": evaluate_hallucination_scores(val_raw, val_scores, threshold),
-        "test_metrics": evaluate_hallucination_scores(test_raw, test_scores, threshold),
+        "threshold_score_class": str(positive_class),
+        "val_metrics": evaluate_detection_scores(
+            val_raw,
+            val_scores,
+            threshold,
+            positive_class=positive_class,
+        ),
+        "test_metrics": evaluate_detection_scores(
+            test_raw,
+            test_scores,
+            threshold,
+            positive_class=positive_class,
+        ),
         "history": history,
         "checkpoint": str(path),
     }

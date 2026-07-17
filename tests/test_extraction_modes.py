@@ -49,6 +49,7 @@ def _dgst_result(layers: int = 2, patches: int = 6) -> dict:
         },
         "dgst_t_transport_top_k": 64,
         "dgst_t_target_region_top_k": 32,
+        "dgst_t_ev_definition": "target_dist_topk_mass_x_mean_target_cosine",
         "dgst_t_cost": "sqrt_cosine_matched_state",
         "dgst_t_ot_solver": "emd",
         "dgst_t_attention_support_per_layer": torch.full(
@@ -71,7 +72,10 @@ def _dgst_result(layers: int = 2, patches: int = 6) -> dict:
         ] = torch.full(
             (layers,), 0.1 * offset
         )
-        value[f"dgst_t_{method}_ev_topk32_{state_name}_per_layer"] = torch.full(
+        value[
+            f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
+            f"topk32_{state_name}_per_layer"
+        ] = torch.full(
             (layers,), 0.2 * offset
         )
     return value

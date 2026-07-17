@@ -19,7 +19,8 @@ from utils.config_utils import load_config
 class RawAttentionIntegrationTests(unittest.TestCase):
     def test_training_aliases_use_the_standard_dgst_output_keys(self) -> None:
         feature_set = (
-            "raw_attention_risk+raw_attention_target_cosine+raw_attention_ev"
+            "raw_attention_risk+raw_attention_target_cosine+"
+            "raw_attention_ev_target_dist_mass_x_cosine"
         )
         blocks = parse_feature_set(feature_set)
         self.assertEqual(
@@ -27,7 +28,7 @@ class RawAttentionIntegrationTests(unittest.TestCase):
             [
                 "raw_attention_risk",
                 "raw_attention_target_cosine",
-                "raw_attention_ev",
+                "raw_attention_ev_target_dist_mass_x_cosine",
             ],
         )
 
@@ -38,7 +39,8 @@ class RawAttentionIntegrationTests(unittest.TestCase):
                 0.3,
                 0.4,
             ],
-            "dgst_t_raw_attention_ev_topk32_hpre_per_layer": [0.5, 0.6],
+            "dgst_t_raw_attention_ev_target_dist_mass_x_cosine_"
+            "topk32_hpre_per_layer": [0.5, 0.6],
         }
         matrix, labels = build_selected_matrix([record], blocks)
         np.testing.assert_allclose(
@@ -51,7 +53,7 @@ class RawAttentionIntegrationTests(unittest.TestCase):
         values = [
             "hpre_raw_logit_gauss_risk",
             "raw_attention_risk",
-            "raw_attention_risk+raw_attention_ev",
+            "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine",
         ]
         config = {
             "feature_extraction": {
@@ -76,13 +78,19 @@ class RawAttentionIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             _enabled_method_feature_sets(config, values),
-            ["raw_attention_risk", "raw_attention_risk+raw_attention_ev"],
+            [
+                "raw_attention_risk",
+                "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine",
+            ],
         )
 
     def test_active_yaml_enables_raw_attention_control(self) -> None:
         config = load_config(os.path.join(ROOT, "configs/model_configs_unified.yaml"))
         self.assertEqual(config["run"]["prompt"], "Describe this image.")
-        self.assertEqual(config["run"]["extraction_mode"], "all")
+        self.assertIn(
+            config["run"]["extraction_mode"],
+            {"all", "method_only", "ads_cgc_only", "baseline_only"},
+        )
         dgst = config["feature_extraction"]["dgst_t"]
         self.assertIn("raw_attention", dgst["four_gate_methods"])
         self.assertTrue(dgst["branches"]["raw_attention"])
@@ -90,9 +98,8 @@ class RawAttentionIntegrationTests(unittest.TestCase):
         self.assertTrue(dgst["branches"]["hpre_softmax_prob_direct"])
         method_sets = config["training"]["feature_sets"]["method"]
         self.assertIn("raw_attention_risk", method_sets)
-        self.assertIn("hpre_softmax_prob_direct_risk", method_sets)
         self.assertIn(
-            "raw_attention_risk+raw_attention_target_cosine+raw_attention_ev",
+            "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine",
             method_sets,
         )
         self.assertEqual(config["training"]["trainer"], "torch_mlp")

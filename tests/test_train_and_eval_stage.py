@@ -21,8 +21,10 @@ class UnifiedTrainStageTests(unittest.TestCase):
         )
 
     def test_all_mode_builds_root_and_baseline_training_commands(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["run"]["extraction_mode"] = "all"
         commands = build_training_commands(
-            config=copy.deepcopy(self.config),
+            config=config,
             model="qwen3_vl_8b",
             config_path="configs/model_configs_unified.yaml",
             output_dir="outputs/qwen3_vl_8b/COCO4000-all",
@@ -100,6 +102,7 @@ class UnifiedTrainStageTests(unittest.TestCase):
 
     def test_single_torch_seed_uses_legacy_result_directory(self) -> None:
         config = copy.deepcopy(self.config)
+        config["run"]["extraction_mode"] = "all"
         config["training"]["torch_probe"]["seeds"] = [42]
         commands = build_training_commands(
             config=config,

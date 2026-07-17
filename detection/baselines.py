@@ -176,6 +176,7 @@ def train_torch_detector(
     standardize: bool = False,
     early_stopping_patience: int = 5,
     seed: int = 42,
+    positive_class: str = "hallucination",
 ) -> TorchDetectorResult:
     """Train a two-class detector and select threshold only on validation data."""
 
@@ -268,13 +269,27 @@ def train_torch_detector(
     model.load_state_dict(best_state)
     val_scores = torch_hallucination_scores(model, val, chosen_device)
     test_scores = torch_hallucination_scores(model, test, chosen_device)
-    threshold = select_hallucination_threshold(raw_y_val, val_scores)
+    threshold = select_detection_threshold(
+        raw_y_val,
+        val_scores,
+        positive_class=positive_class,
+    )
     return TorchDetectorResult(
         state_dict=best_state,
         history=history,
         threshold=threshold,
-        val_metrics=evaluate_hallucination_scores(raw_y_val, val_scores, threshold),
-        test_metrics=evaluate_hallucination_scores(raw_y_test, test_scores, threshold),
+        val_metrics=evaluate_detection_scores(
+            raw_y_val,
+            val_scores,
+            threshold,
+            positive_class=positive_class,
+        ),
+        test_metrics=evaluate_detection_scores(
+            raw_y_test,
+            test_scores,
+            threshold,
+            positive_class=positive_class,
+        ),
     )
 
 
@@ -322,6 +337,62 @@ def select_hallucination_threshold(
     return float(thresholds[int(np.nanargmax(f1))])
 
 
+def select_detection_threshold(
+    raw_labels: Sequence[int],
+    hallucination_scores: Sequence[float],
+    *,
+    positive_class: str,
+) -> float:
+    """Select a validation-F1 threshold in the requested score direction."""
+
+    positive = _normalize_positive_class(positive_class)
+    if positive == "hallucination":
+        return select_hallucination_threshold(raw_labels, hallucination_scores)
+    real_targets = np.asarray(raw_labels, dtype=np.int64).reshape(-1)
+    hall_scores = np.asarray(hallucination_scores, dtype=np.float64).reshape(-1)
+    return _select_binary_f1_threshold(real_targets, 1.0 - hall_scores)
+
+
+def _select_binary_f1_threshold(
+    targets: Sequence[int],
+    scores: Sequence[float],
+) -> float:
+    targets_array = np.asarray(targets, dtype=np.int64).reshape(-1)
+    scores_array = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if targets_array.size != scores_array.size or targets_array.size == 0:
+        raise ValueError("Validation labels/scores must be non-empty and aligned")
+    if np.unique(targets_array).size < 2:
+        raise ValueError("Validation split must contain hallucinated and real samples")
+    precision, recall, thresholds = precision_recall_curve(
+        targets_array,
+        scores_array,
+    )
+    if thresholds.size == 0:
+        return 0.5
+    f1 = 2 * precision[:-1] * recall[:-1] / np.maximum(
+        precision[:-1] + recall[:-1], 1e-12
+    )
+    return float(thresholds[int(np.nanargmax(f1))])
+
+
+def _normalize_positive_class(value: str) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "hall": "hallucination",
+        "hallucinated": "hallucination",
+        "hallucination": "hallucination",
+        "real": "real",
+        "non_hallucination": "real",
+        "nonhallucination": "real",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "positive_class must be 'hallucination' or 'real', "
+            f"got {value!r}"
+        )
+    return aliases[normalized]
+
+
 def evaluate_hallucination_scores(
     raw_labels: Sequence[int],
     hallucination_scores: Sequence[float],
@@ -340,6 +411,7 @@ def evaluate_hallucination_scores(
     real_predictions = 1 - hall_predictions
     result = {
         "threshold": float(threshold),
+        "threshold_score_class": "hallucination",
         "headline_positive_class": "hallucination",
         "stored_label_semantics": {"0": "hallucination", "1": "real"},
         "detector_target_semantics": {"0": "real", "1": "hallucination"},
@@ -355,6 +427,56 @@ def evaluate_hallucination_scores(
         ),
     }
     return result
+
+
+def evaluate_detection_scores(
+    raw_labels: Sequence[int],
+    hallucination_scores: Sequence[float],
+    threshold: float,
+    *,
+    positive_class: str,
+) -> dict[str, Any]:
+    """Evaluate both class directions using a threshold for the headline class."""
+
+    positive = _normalize_positive_class(positive_class)
+    if positive == "hallucination":
+        return evaluate_hallucination_scores(
+            raw_labels,
+            hallucination_scores,
+            threshold,
+        )
+
+    hall_targets = raw_labels_to_hallucination_targets(raw_labels)
+    scores = np.asarray(hallucination_scores, dtype=np.float64).reshape(-1)
+    if hall_targets.size != scores.size or scores.size == 0:
+        raise ValueError("Evaluation labels/scores must be non-empty and aligned")
+    if not np.isfinite(scores).all():
+        raise ValueError("Evaluation scores contain non-finite values")
+    real_targets = 1 - hall_targets
+    real_scores = 1.0 - scores
+    real_predictions = (real_scores >= float(threshold)).astype(np.int64)
+    hall_predictions = 1 - real_predictions
+    return {
+        "threshold": float(threshold),
+        "threshold_score_class": "real",
+        "headline_positive_class": "real",
+        "stored_label_semantics": {"0": "hallucination", "1": "real"},
+        "detector_target_semantics": {"0": "real", "1": "hallucination"},
+        "accuracy": float(accuracy_score(real_targets, real_predictions)),
+        "confusion_matrix_hallucination_positive": confusion_matrix(
+            hall_targets, hall_predictions, labels=[0, 1]
+        ).tolist(),
+        "hallucination_positive": _class_metrics(
+            hall_targets,
+            hall_predictions,
+            scores,
+        ),
+        "real_positive": _class_metrics(
+            real_targets,
+            real_predictions,
+            real_scores,
+        ),
+    }
 
 
 def _class_metrics(
