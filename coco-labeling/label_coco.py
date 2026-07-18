@@ -30,7 +30,7 @@ from utils.generation_provenance import (
     validate_generation_manifest,
 )
 from utils.io_utils import load_json, save_json
-from utils.split_utils import ensure_strict_811_split
+from utils.split_utils import ensure_strict_82_split
 from utils.token_alignment import (
     TokenAlignmentError,
     build_response_token_offsets,
@@ -356,16 +356,16 @@ def _load_or_create_splits(
     shared_splits_path: str | os.PathLike[str] | None = None,
 ) -> dict:
     # ``train_ratio`` and ``resume`` remain in the signature for callers of the
-    # historical helper.  The active protocol is always the leak-free 8:1:1
-    # image split, and ``ensure_strict_811_split`` safely reuses an identical
-    # split or backs up and replaces an old train/val==test split.
+    # historical helper.  The active protocol is always the leak-free outer
+    # 8:2 image split. This protocol has no validation partition, and
+    # ``ensure_strict_82_split`` backs up any incompatible historical split.
     del train_ratio, resume
     shared_path = None
     if shared_splits_path:
         shared_path = Path(shared_splits_path).expanduser()
         if not shared_path.is_absolute():
             shared_path = Path(__file__).resolve().parents[1] / shared_path
-    splits, backup_path = ensure_strict_811_split(
+    splits, backup_path = ensure_strict_82_split(
         Path(output_dir) / "image_splits.json",
         [int(sample["image_id"]) for sample in samples],
         seed=int(seed),
@@ -374,9 +374,9 @@ def _load_or_create_splits(
     if backup_path is not None:
         print(f"[COCO-CHAIR] Backed up previous split to {backup_path}")
     print(
-        "[COCO-CHAIR] Strict image split: "
-        f"{len(splits['train'])} train, {len(splits['val'])} val, "
-        f"{len(splits['test'])} test."
+        "[COCO-CHAIR] Strict image split (no validation): "
+        f"{len(splits['train'])} train, {len(splits['test'])} test "
+        "(fixed epochs, last checkpoint, train-F1 threshold)."
     )
     return splits
 

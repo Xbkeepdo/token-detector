@@ -63,6 +63,8 @@ class TorchProbeConfig:
     early_stopping_patience: int = 10
     seed: int = 42
     positive_class: str = "real"
+    split_protocol: str = "strict_82_no_validation"
+    threshold_selection: str = "train_f1"
 
 
 class MatrixDataset(Dataset):
@@ -171,7 +173,25 @@ def main() -> None:
         early_stopping_patience=int(args.early_stopping_patience),
         seed=int(args.seed),
         positive_class=str(args.positive_class),
+        split_protocol=str(
+            (yaml_config.get("training") or {}).get(
+                "split_protocol", "strict_82_no_validation"
+            )
+        ),
+        threshold_selection=str(
+            (yaml_config.get("training") or {}).get(
+                "threshold_selection", "train_f1"
+            )
+        ),
     )
+    if config.split_protocol != "strict_82_no_validation":
+        raise ValueError(
+            "Training requires training.split_protocol=strict_82_no_validation"
+        )
+    if config.threshold_selection != "train_f1":
+        raise ValueError(
+            "Strict 8:2 training requires training.threshold_selection=train_f1"
+        )
 
     feature_path = os.path.join(args.output_dir, "features.pkl")
     splits_path = os.path.join(args.output_dir, "image_splits.json")
@@ -187,9 +207,9 @@ def main() -> None:
         raise FileNotFoundError(splits_path)
 
     splits = load_json(splits_path)
-    from utils.split_utils import validate_strict_811_split
+    from utils.split_utils import validate_strict_82_split
 
-    split_counts = validate_strict_811_split(splits)
+    split_counts = validate_strict_82_split(splits)
     configured_count = int(
         (yaml_config.get("dataset") or {}).get("num_images", 0)
     )
@@ -209,7 +229,7 @@ def main() -> None:
     train_feats, val_feats, test_feats = split_by_image_id(
         all_features,
         train_image_ids={int(x) for x in splits["train"]},
-        val_image_ids={int(x) for x in splits["val"]},
+        val_image_ids=set(),
         test_image_ids={int(x) for x in splits["test"]},
     )
 
@@ -269,6 +289,8 @@ def main() -> None:
             "early_stopping_patience": config.early_stopping_patience,
             "seed": config.seed,
             "positive_class": config.positive_class,
+            "split_protocol": config.split_protocol,
+            "threshold_selection": config.threshold_selection,
         }
         metrics["artifacts"] = {
             "model": os.path.join(artifacts_dir, "model.pt"),
@@ -314,7 +336,6 @@ def train_and_evaluate_probe(
     os.makedirs(output_dir, exist_ok=True)
 
     train_targets = _targets_for_positive_class(y_train, config.positive_class)
-    val_targets = _targets_for_positive_class(y_val, config.positive_class)
     test_targets = _targets_for_positive_class(y_test, config.positive_class)
 
     train_loader = DataLoader(
@@ -323,8 +344,6 @@ def train_and_evaluate_probe(
         shuffle=True,
         drop_last=X_train.shape[0] > config.batch_size,
     )
-    val_loader = DataLoader(MatrixDataset(X_val, val_targets), batch_size=config.batch_size)
-
     model = DGSTStyleProbe(
         input_dim=int(X_train.shape[1]),
         hidden_sizes=config.hidden_sizes,
@@ -343,62 +362,39 @@ def train_and_evaluate_probe(
         patience=config.lr_patience,
     )
 
-    best_val_loss = float("inf")
-    best_epoch = -1
-    epochs_without_improvement = 0
     history = []
     model_path = os.path.join(output_dir, "model.pt")
 
     progress = tqdm(range(config.num_epochs), desc="Training torch probe", unit="epoch", leave=False)
     for epoch in progress:
         train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss, val_probs = _predict_loss_and_probs(model, val_loader, criterion, device)
-        scheduler.step(val_loss)
-        val_metrics = _metrics_from_probs(val_targets, val_probs, positive_class=config.positive_class)
+        scheduler.step(train_loss)
         history.append(
             {
-                "epoch": int(epoch),
+                "epoch": int(epoch + 1),
                 "train_loss": float(train_loss),
-                "val_loss": float(val_loss),
-                "val_f1": float(val_metrics["f1"]),
-                "val_auc": float(val_metrics["auc"]),
+                "monitor": "train_loss",
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
             }
         )
         progress.set_postfix(
             train_loss=f"{train_loss:.4f}",
-            val_loss=f"{val_loss:.4f}",
-            val_f1=f"{val_metrics['f1']:.4f}",
         )
-        if val_loss < best_val_loss:
-            best_val_loss = float(val_loss)
-            best_epoch = int(epoch)
-            torch.save(model.state_dict(), model_path)
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= max(
-                1, int(config.early_stopping_patience)
-            ):
-                break
 
     progress.close()
-    if best_epoch < 0:
-        raise RuntimeError("Torch probe training did not produce a best checkpoint.")
-
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    _best_val_loss, best_val_probs = _predict_loss_and_probs(
-        model, val_loader, criterion, device
+    torch.save(model.state_dict(), model_path)
+    train_eval_loader = DataLoader(
+        MatrixDataset(X_train, train_targets),
+        batch_size=config.batch_size,
+        shuffle=False,
     )
-    decision_threshold = _select_validation_threshold(
-        val_targets,
-        best_val_probs,
+    _train_eval_loss, train_probs = _predict_loss_and_probs(
+        model,
+        train_eval_loader,
+        criterion,
+        device,
     )
-    selected_val_metrics = _metrics_from_probs(
-        val_targets,
-        best_val_probs,
-        positive_class=config.positive_class,
-        threshold=decision_threshold,
-    )
+    decision_threshold = _select_f1_threshold(train_targets, train_probs)
     test_dataset = MatrixDataset(X_test, test_targets)
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size)
     _test_loss, test_probs = _predict_loss_and_probs(model, test_loader, criterion, device)
@@ -408,12 +404,21 @@ def train_and_evaluate_probe(
         positive_class=config.positive_class,
         threshold=decision_threshold,
     )
-    metrics["best_epoch"] = int(best_epoch)
-    metrics["best_val_loss"] = float(best_val_loss)
-    metrics["val_score"] = float(selected_val_metrics["f1"])
-    metrics["val_metrics"] = selected_val_metrics
+    metrics["best_epoch"] = int(config.num_epochs)
+    metrics["best_val_loss"] = None
+    metrics["val_score"] = None
+    metrics["val_metrics"] = None
+    metrics["train_metrics"] = _metrics_from_probs(
+        train_targets,
+        train_probs,
+        positive_class=config.positive_class,
+        threshold=decision_threshold,
+    )
     metrics["decision_threshold"] = float(decision_threshold)
     metrics["epochs_ran"] = int(len(history))
+    metrics["checkpoint_selection"] = "last_epoch"
+    metrics["threshold_selection"] = config.threshold_selection
+    metrics["split_protocol"] = config.split_protocol
 
     save_json(history, os.path.join(output_dir, "history.json"))
     save_json(asdict(config), os.path.join(output_dir, "config.json"))
@@ -469,40 +474,88 @@ def _metrics_from_probs(
     threshold: float = 0.5,
 ) -> dict:
     y_true = np.asarray(y_true, dtype=np.int32)
-    y_pred = (np.asarray(probs) >= float(threshold)).astype(np.int32)
-    try:
-        auc = float(roc_auc_score(y_true, probs))
-    except Exception:
-        auc = float("nan")
-    try:
-        aupr = float(average_precision_score(y_true, probs))
-    except Exception:
-        aupr = float("nan")
+    probs = np.asarray(probs, dtype=np.float64)
+    y_pred = (probs >= float(threshold)).astype(np.int32)
+
+    if positive_class in ("real", "non_hallucination"):
+        real_targets = y_true
+        real_scores = probs
+        real_predictions = y_pred
+        hallucination_targets = 1 - y_true
+        hallucination_scores = 1.0 - probs
+        hallucination_predictions = 1 - y_pred
+        headline_positive_class = "real"
+    else:
+        hallucination_targets = y_true
+        hallucination_scores = probs
+        hallucination_predictions = y_pred
+        real_targets = 1 - y_true
+        real_scores = 1.0 - probs
+        real_predictions = 1 - y_pred
+        headline_positive_class = "hallucination"
+
+    real_metrics = _class_metrics_from_predictions(
+        real_targets,
+        real_scores,
+        real_predictions,
+    )
+    hallucination_metrics = _class_metrics_from_predictions(
+        hallucination_targets,
+        hallucination_scores,
+        hallucination_predictions,
+    )
+    headline = (
+        real_metrics
+        if headline_positive_class == "real"
+        else hallucination_metrics
+    )
 
     metrics = {
-        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        **headline,
         "accuracy": float(accuracy_score(y_true, y_pred)),
-        "auc": auc,
-        "aupr": aupr,
+        "reported_positive_class": headline_positive_class,
+        "real_positive": real_metrics,
+        "hallucination_positive": hallucination_metrics,
     }
-    if positive_class in ("real", "non_hallucination"):
-        metrics["reported_positive_class"] = "real"
-    else:
-        metrics["reported_positive_class"] = "hallucination"
     return metrics
 
 
-def _select_validation_threshold(
+def _class_metrics_from_predictions(
+    y_true: np.ndarray,
+    scores: np.ndarray,
+    predictions: np.ndarray,
+) -> dict:
+    y_true = np.asarray(y_true, dtype=np.int32)
+    scores = np.asarray(scores, dtype=np.float64)
+    predictions = np.asarray(predictions, dtype=np.int32)
+    try:
+        auc = float(roc_auc_score(y_true, scores))
+    except Exception:
+        auc = float("nan")
+    try:
+        aupr = float(average_precision_score(y_true, scores))
+    except Exception:
+        aupr = float("nan")
+    return {
+        "precision": float(
+            precision_score(y_true, predictions, zero_division=0)
+        ),
+        "recall": float(recall_score(y_true, predictions, zero_division=0)),
+        "f1": float(f1_score(y_true, predictions, zero_division=0)),
+        "auc": auc,
+        "aupr": aupr,
+    }
+
+
+def _select_f1_threshold(
     y_true: np.ndarray,
     probabilities: np.ndarray,
 ) -> float:
-    """Maximize validation F1; test labels never enter threshold selection."""
+    """Maximize F1 on caller-provided scores; test rows must never be passed."""
     targets = np.asarray(y_true, dtype=np.int32).reshape(-1)
     scores = np.asarray(probabilities, dtype=np.float64).reshape(-1)
     if targets.size == 0 or targets.size != scores.size:
-        raise ValueError("Threshold selection requires equal non-empty val arrays.")
+        raise ValueError("Threshold selection requires equal non-empty arrays.")
     candidates = np.unique(np.concatenate(([0.0], scores, [1.0])))
     best_key = (-np.inf, -np.inf, -np.inf)
     best_threshold = 0.5
@@ -517,6 +570,11 @@ def _select_validation_threshold(
             best_key = key
             best_threshold = float(threshold)
     return best_threshold
+
+
+# Backward-compatible import for historical tests/tools. The active strict 8:2
+# trainer calls ``_select_f1_threshold`` with training scores.
+_select_validation_threshold = _select_f1_threshold
 
 
 def _targets_for_positive_class(labels: np.ndarray, positive_class: str) -> np.ndarray:

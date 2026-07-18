@@ -54,8 +54,8 @@ class TrainingProvenanceTests(unittest.TestCase):
         }
         splits = {
             "train": list(range(1, 9)),
-            "val": [9],
-            "test": [10],
+            "val": [],
+            "test": [9, 10],
         }
         labeling = {}
         generations = {}
@@ -297,7 +297,7 @@ class TrainingProvenanceTests(unittest.TestCase):
                 records=self._records(labeling),
             )
             bad_splits = copy.deepcopy(splits)
-            bad_splits["test"] = [999]
+            bad_splits["test"] = [9, 999]
             with self.assertRaisesRegex(ValueError, "coverage"):
                 load_validated_training_features(
                     feature_path=path,

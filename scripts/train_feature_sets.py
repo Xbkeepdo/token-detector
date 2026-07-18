@@ -687,6 +687,14 @@ def main() -> None:
     from utils.config_utils import get_classifier_cfgs, load_config
 
     config = load_config(args.config)
+    if str((config.get("training") or {}).get("split_protocol", "strict_82_no_validation")) != "strict_82_no_validation":
+        raise ValueError(
+            "Training requires training.split_protocol=strict_82_no_validation"
+        )
+    if str((config.get("training") or {}).get("threshold_selection", "train_f1")) != "train_f1":
+        raise ValueError(
+            "Strict 8:2 training requires training.threshold_selection=train_f1"
+        )
     clf_cfgs = get_classifier_cfgs(config)
 
     feature_path = os.path.join(args.output_dir, "features.pkl")
@@ -700,9 +708,9 @@ def main() -> None:
         raise FileNotFoundError(splits_path)
 
     splits = load_json(splits_path)
-    from utils.split_utils import validate_strict_811_split
+    from utils.split_utils import validate_strict_82_split
 
-    split_counts = validate_strict_811_split(splits)
+    split_counts = validate_strict_82_split(splits)
     configured_count = int((config.get("dataset") or {}).get("num_images", 0))
     if configured_count and sum(split_counts.values()) != configured_count:
         raise ValueError(
@@ -720,7 +728,7 @@ def main() -> None:
     train_feats, val_feats, test_feats = split_by_image_id(
         all_features,
         train_image_ids={int(x) for x in splits["train"]},
-        val_image_ids={int(x) for x in splits["val"]},
+        val_image_ids=set(),
         test_image_ids={int(x) for x in splits["test"]},
     )
 
@@ -749,7 +757,7 @@ def main() -> None:
         for clf_name in args.classifiers:
             grid = deepcopy(clf_cfgs.get(clf_name, {}))
             _sanitise_grid(grid)
-            best_clf, best_params, val_score = grid_search(
+            best_clf, best_params, train_threshold_score = grid_search(
                 clf_name,
                 grid,
                 X_train,
@@ -760,7 +768,11 @@ def main() -> None:
             )
             metrics = evaluate_classifier(best_clf, X_test, y_test)
             metrics["best_params"] = best_params
-            metrics["val_score"] = float(val_score)
+            metrics["val_score"] = None
+            metrics["train_threshold_score"] = float(train_threshold_score)
+            metrics["split_protocol"] = "strict_82_no_validation"
+            metrics["checkpoint_selection"] = "single_fit"
+            metrics["threshold_selection"] = "train_f1"
             metrics["num_features"] = int(X_train.shape[1])
             set_results[clf_name] = _json_ready(metrics)
             print(
@@ -781,16 +793,23 @@ def _require_strict_binary_splits(
     val: tuple[np.ndarray, np.ndarray],
     test: tuple[np.ndarray, np.ndarray],
 ) -> None:
-    """Reject unusable partitions instead of leaking rows across 8:1:1 splits."""
+    """Require pure 80/20 data: binary train/test and no validation rows."""
     for split_name, (matrix, labels) in (
         ("train", train),
         ("val", val),
         ("test", test),
     ):
+        if split_name == "val":
+            if matrix.shape[0] != 0 or labels.size != 0:
+                raise ValueError(
+                    f"Strict 8:2 requires an empty validation split for "
+                    f"feature set {feature_set!r}."
+                )
+            continue
         classes = np.unique(labels)
         if matrix.shape[0] == 0 or classes.size < 2:
             raise ValueError(
-                f"Strict 8:1:1 violation for feature set {feature_set!r}: "
+                f"Strict outer-8:2 training split violation for feature set {feature_set!r}: "
                 f"{split_name} has {matrix.shape[0]} rows and classes "
                 f"{classes.tolist()}. Splits are never substituted; repair the "
                 "labels/image split before training."

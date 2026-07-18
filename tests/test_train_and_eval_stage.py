@@ -44,8 +44,14 @@ class UnifiedTrainStageTests(unittest.TestCase):
             self.assertEqual(root[1], "scripts/train_torch_probe_feature_sets.py")
             self.assertIn("raw_attention_risk", root)
             self.assertIn("ads+cgc", root)
-            self.assertEqual(root[root.index("--positive-class") + 1], "hallucination")
-            self.assertEqual(root[root.index("--batch-size") + 1], "256")
+            self.assertEqual(root[root.index("--positive-class") + 1], "real")
+            self.assertEqual(root[root.index("--batch-size") + 1], "128")
+            self.assertEqual(root[root.index("--num-epochs") + 1], "120")
+            self.assertNotIn("--early-stopping-patience", root)
+            hidden_start = root.index("--hidden-sizes") + 1
+            self.assertEqual(
+                root[hidden_start : hidden_start + 3], ["256", "128", "64"]
+            )
         self.assertEqual(summary[1], "scripts/summarize_torch_probe_seed_runs.py")
         self.assertTrue(
             any(

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 import shlex
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 import yaml
 
@@ -184,6 +184,34 @@ def extraction_mode_flags(mode: str) -> dict[str, bool]:
         "method": value in {"all", "method_only"},
         "ads_cgc": value in {"all", "ads_cgc_only"},
         "baseline": value in {"all", "baseline_only"},
+    }
+
+
+def qa_extraction_family_flags(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve the QA extraction mode against the shared family switches."""
+
+    qa_cfg = config.get("qa_benchmarks") or {}
+    run_cfg = config.get("run") or {}
+    mode = str(
+        qa_cfg.get("extraction_mode", run_cfg.get("extraction_mode", "all"))
+    ).strip().lower()
+    requested = extraction_mode_flags(mode)
+    feature_cfg = config.get("feature_extraction") or {}
+    return {
+        "mode": mode,
+        "method": bool(
+            requested["method"]
+            and (feature_cfg.get("method") or {}).get("enabled", True)
+            and (feature_cfg.get("dgst_t") or {}).get("enabled", True)
+        ),
+        "ads_cgc": bool(
+            requested["ads_cgc"]
+            and (feature_cfg.get("ads_cgc") or {}).get("enabled", True)
+        ),
+        "baseline": bool(
+            requested["baseline"]
+            and (feature_cfg.get("baseline") or {}).get("enabled", True)
+        ),
     }
 
 

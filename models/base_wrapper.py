@@ -82,6 +82,67 @@ class ModelOutput:
     baseline_capture: Optional[dict[str, Any]] = None
 
 
+@dataclass(frozen=True)
+class PromptTargetRequest:
+    """One token target that occurs inside the *actual* user prompt.
+
+    ``target_char_start`` / ``target_char_end`` are offsets in ``prompt`` and
+    are the preferred way to disambiguate repeated object words.  When they
+    are omitted, ``occurrence`` selects an exact surface occurrence in the
+    rendered prompt.  ``expected_target_token_id`` is an optional assertion;
+    wrappers always obtain the operative ID from their real multimodal input
+    IDs, never by encoding ``target_text`` in isolation.
+    """
+
+    prompt: str
+    target_text: str
+    target_char_start: Optional[int] = None
+    target_char_end: Optional[int] = None
+    occurrence: int = 0
+    expected_target_token_id: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        prompt = str(self.prompt)
+        target = str(self.target_text)
+        if not prompt:
+            raise ValueError("prompt-target prompt must be non-empty")
+        if not target:
+            raise ValueError("prompt-target target_text must be non-empty")
+        if int(self.occurrence) < 0:
+            raise ValueError("prompt-target occurrence must be non-negative")
+        has_start = self.target_char_start is not None
+        has_end = self.target_char_end is not None
+        if has_start != has_end:
+            raise ValueError(
+                "target_char_start and target_char_end must be provided together"
+            )
+        if has_start:
+            start = int(self.target_char_start)
+            end = int(self.target_char_end)
+            if start < 0 or end <= start or end > len(prompt):
+                raise ValueError(
+                    f"invalid prompt target character span [{start}, {end})"
+                )
+            if prompt[start:end] != target:
+                raise ValueError(
+                    "prompt target character span does not equal target_text: "
+                    f"{prompt[start:end]!r} != {target!r}"
+                )
+
+
+@dataclass(frozen=True)
+class PromptTargetAlignment:
+    """Resolved prompt target in tokenized and expanded decoder coordinates."""
+
+    target_tokenized_position: int
+    target_expanded_position: int
+    prediction_position: int
+    target_token_id: int
+    tokenized_span: Tuple[int, ...]
+    rendered_char_start: int
+    rendered_char_end: int
+
+
 class AttentionRequirement(str, Enum):
     """Amount of decoder attention requested from a wrapper forward."""
 
@@ -335,6 +396,24 @@ class BaseLVLMWrapper(ABC):
                 )
             )
         return outputs
+
+    def extract_prompt_target_features(
+        self,
+        image: Image.Image,
+        request: PromptTargetRequest,
+        cfg_dgst_t: Optional[dict[str, Any]] = None,
+        requirements: Optional[ExtractionRequirements] = None,
+    ) -> ModelOutput:
+        """Extract the causal row immediately before a target in the prompt.
+
+        This is deliberately separate from ``extract_token_features_batch``:
+        the latter validates saved generated-response IDs and must never be
+        relaxed to accept an unrelated question/object token.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement prompt-target extraction"
+        )
 
     @staticmethod
     def validate_causal_batch_request(

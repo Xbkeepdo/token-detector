@@ -38,7 +38,7 @@ def _metrics(value: float) -> dict:
 
 def _output(seed: int, value: float) -> dict:
     result = {
-        "val_metrics": _metrics(value - 0.1),
+        "train_metrics": _metrics(value - 0.1),
         "test_metrics": _metrics(value),
     }
     return {
@@ -48,8 +48,11 @@ def _output(seed: int, value: float) -> dict:
         "stored_label_semantics": {"0": "hallucination", "1": "real"},
         "detector_target_semantics": {"0": "real", "1": "hallucination"},
         "label_protocol": "test",
-        "counts": {"train": 80, "val": 10, "test": 10},
-        "image_split_counts": {"train": 8, "val": 1, "test": 1},
+        "counts": {"train": 80, "val": 0, "test": 20},
+        "image_split_counts": {"train": 8, "val": 0, "test": 2},
+        "split_protocol": "strict_82_no_validation",
+        "checkpoint_selection": "last_epoch",
+        "threshold_selection": "train_f1",
         "methods": {
             "metatoken": {"lr": result},
             "svar": result,
@@ -83,6 +86,7 @@ class BaselineReportingTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
         self.assertIn("0.7500 ± 0.0816", text)
         self.assertIn("headline 正类：real", text)
+        self.assertIn("严格 8:2 无验证集", text)
         self.assertIn("各随机种子的 Test Real F1", text)
         self.assertIn("seed 42", text)
 

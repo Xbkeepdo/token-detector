@@ -1,12 +1,19 @@
 import numpy as np
 
 from detection.qa_probe import (
+    QA_DGST_METHODS,
+    build_matrix,
+    aggregate_seed_results,
     classification_metrics,
     default_feature_sets,
+    feature_set_position,
     feature_vector,
+    legacy_feature_sets,
     train_one_seed,
+    validate_image_level_splits,
 )
 from features.dgst_t import COST_VARIANT_RISK_KEYS
+from scripts.train_qa_probes import write_markdown_summary
 
 
 def _row():
@@ -26,13 +33,53 @@ def _row():
     }
 
 
-def test_fixed_feature_sets_include_all_ten_risks_and_target_comparison():
+def _current_row():
+    dgst = {
+        method: {
+            "risk": np.array([0.1, 0.2], dtype=np.float32),
+            "target_cosine": np.array([0.3, 0.4], dtype=np.float32),
+            "ev": np.array([0.5, 0.6], dtype=np.float32),
+        }
+        for method in QA_DGST_METHODS
+    }
+    position = {
+        "dgst": dgst,
+        "ads_score": 0.7,
+        "ads_per_layer": np.array([0.8, 0.9], dtype=np.float32),
+        "cgc_score": 0.2,
+        "cgc_per_layer": np.array([0.3, 0.4], dtype=np.float32),
+    }
+    return {
+        "key": "row",
+        "dataset": "pope",
+        "source_split": "random",
+        "image_id": 1,
+        "probe_split": "train",
+        "prediction": "yes",
+        "label": 1,
+        "object_hallucination_yes_only_label": 1,
+        "positions": {
+            "prompt_last_token": position,
+            "question_object_pre_token": position,
+        },
+    }
+
+
+def test_default_feature_sets_cover_six_dgst_branches_at_prompt_last_by_default():
     names = default_feature_sets("pope")
-    for risk in COST_VARIANT_RISK_KEYS:
-        assert f"{risk}@answer" in names
-        assert f"{risk}+hprecosine@answer" in names
-        assert f"{risk}@object" in names
-        assert f"{risk}+hprecosine@object" in names
+    assert len(names) == 9
+    for position in ("prompt_last_token",):
+        assert f"ads@{position}" in names
+        assert f"cgc@{position}" in names
+        assert f"ads+cgc@{position}" in names
+        for method in QA_DGST_METHODS:
+            assert (
+                f"{method}_risk+{method}_target_cosine+"
+                f"{method}_ev_target_dist_mass_x_cosine@{position}"
+            ) in names
+    assert not any(name.endswith("@object") for name in names)
+    assert "risk_geo@object" in legacy_feature_sets("pope")
+    assert feature_set_position("risk_geo@object") == "legacy_object_target"
 
 
 def test_feature_vectors_have_expected_blocks():
@@ -41,6 +88,87 @@ def test_feature_vectors_have_expected_blocks():
     assert feature_vector(row, "token_uncertainty").shape == (3,)
     assert feature_vector(row, "risk_geo+hprecosine@answer").shape == (4,)
     assert feature_vector(row, "best_dgst_legacy:risk_geo+hprecosine@answer").size > 4
+    current = _current_row()
+    assert feature_vector(current, "ads@prompt_last_token").shape == (3,)
+    assert feature_vector(current, "ads+cgc@question_object_pre_token").shape == (6,)
+    assert feature_vector(
+        current,
+        "hpre_softmax_prob_gauss_risk+"
+        "hpre_softmax_prob_gauss_target_cosine+"
+        "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine@prompt_last_token",
+    ).shape == (6,)
+
+
+def test_yes_only_protocol_filters_non_yes_rows():
+    real = _current_row()
+    hallucination = {
+        **_current_row(),
+        "key": "hallucination",
+        "image_id": 2,
+        "label": 0,
+        "object_hallucination_yes_only_label": 0,
+    }
+    excluded = {
+        **_current_row(),
+        "key": "excluded",
+        "image_id": 3,
+        "prediction": "no",
+        "object_hallucination_yes_only_label": None,
+    }
+    features, labels, kept = build_matrix(
+        [real, hallucination, excluded],
+        "ads@prompt_last_token",
+        "object_hallucination_yes_only",
+    )
+    assert features.shape == (2, 3)
+    assert labels.tolist() == [1, 0]
+    assert [row["key"] for row in kept] == ["row", "hallucination"]
+
+
+def test_pope_image_split_leakage_is_rejected_across_strategies():
+    rows = [
+        {"key": "train", "dataset": "pope", "source_split": "random", "image_id": 1, "probe_split": "train"},
+        {"key": "test", "dataset": "pope", "source_split": "adversarial", "image_id": 1, "probe_split": "test"},
+    ]
+    try:
+        validate_image_level_splits(rows)
+    except ValueError as exc:
+        assert "image leakage" in str(exc)
+    else:
+        raise AssertionError("expected POPE image leakage to be rejected")
+
+
+def test_clevr_official_source_split_is_part_of_image_identity():
+    rows = [
+        {"key": "train-1", "dataset": "clevr_exist_5k", "source_split": "train", "image_id": 1, "probe_split": "train"},
+        {"key": "train-2", "dataset": "clevr_exist_5k", "source_split": "train", "image_id": 2, "probe_split": "train"},
+        {"key": "train-3", "dataset": "clevr_exist_5k", "source_split": "train", "image_id": 3, "probe_split": "train"},
+        {"key": "train-4", "dataset": "clevr_exist_5k", "source_split": "train", "image_id": 4, "probe_split": "train"},
+        {"key": "test", "dataset": "clevr_exist_5k", "source_split": "val", "image_id": 2, "probe_split": "test"},
+    ]
+    assert validate_image_level_splits(rows) == {"train": 4, "val": 0, "test": 1}
+
+
+def test_amber_strict_82_is_over_images_not_variable_question_rows():
+    rows = []
+    for image_id in range(1, 5):
+        for question_id in range(image_id):
+            rows.append({
+                "key": f"train-{image_id}-{question_id}",
+                "dataset": "amber_discriminative",
+                "source_split": "attribute",
+                "image_id": image_id,
+                "probe_split": "train",
+            })
+    rows.append({
+        "key": "test-5-0",
+        "dataset": "amber_discriminative",
+        "source_split": "existence",
+        "image_id": 5,
+        "probe_split": "test",
+    })
+    # Question rows are 10:1, but the authoritative physical-image split is 4:1.
+    assert validate_image_level_splits(rows) == {"train": 4, "val": 0, "test": 1}
 
 
 def test_metrics_use_real_as_positive_class():
@@ -52,7 +180,7 @@ def test_metrics_use_real_as_positive_class():
 
 def test_weighted_torch_probe_smoke(tmp_path):
     rows = []
-    for split, count in (("train", 16), ("val", 8), ("test", 8)):
+    for split, count in (("train", 16), ("test", 4)):
         for index in range(count):
             label = index % 2
             rows.append({
@@ -64,6 +192,8 @@ def test_weighted_torch_probe_smoke(tmp_path):
                 "token_nll": 0.8 - label,
                 "source_split": "random",
                 "error_type": "correct_yes" if label else "false_positive",
+                "prediction": "yes",
+                "object_hallucination_yes_only_label": label,
             })
     result = train_one_seed(
         rows,
@@ -74,11 +204,32 @@ def test_weighted_torch_probe_smoke(tmp_path):
             "hidden_sizes": [8, 4, 2],
             "dropout": 0.1,
             "batch_size": 4,
-            "epochs": 3,
+            "epochs": 99,
+            "num_epochs": 3,
             "learning_rate": 0.01,
         },
         device="cpu",
+        label_protocol="object_hallucination_yes_only",
     )
     assert 0.0 <= result["threshold"] <= 1.0
     assert result["positive_class"] == "real"
+    assert result["label_protocol"] == "object_hallucination_yes_only"
+    assert result["position"] == "shared"
     assert (tmp_path / "checkpoint.pt").exists()
+    assert result["epochs_completed"] == 3
+    assert result["best_epoch"] == 3
+    assert result["val_metrics"] is None
+    assert result["checkpoint_selection"] == "last_epoch"
+    assert result["threshold_selection"] == "train_f1"
+    assert result["train_metrics"]["real"]["f1"] >= 0.0
+    summary = aggregate_seed_results([
+        result,
+        {**result, "seed": 43},
+        {**result, "seed": 44},
+    ])
+    summary_path = tmp_path / "summary.md"
+    write_markdown_summary(
+        summary_path, "object_hallucination_yes_only", {"token_uncertainty": summary}
+    )
+    report = summary_path.read_text(encoding="utf-8")
+    assert "Real F1" in report and "Hall. F1" in report and "mean ±" in report

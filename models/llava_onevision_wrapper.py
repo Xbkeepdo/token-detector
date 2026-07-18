@@ -16,6 +16,7 @@ from models.base_wrapper import (
     ExtractionRequirements,
     GenerationOutput,
     ModelOutput,
+    PromptTargetRequest,
     compact_response_logit_statistics,
     configure_image_processor_limits,
 )
@@ -27,6 +28,10 @@ from models.dgst_capture import (
     run_forward_with_layer_hidden_captures,
 )
 from models.prompt_support import resolve_prompt_support_positions
+from models.prompt_target import (
+    extract_prompt_target_from_inputs,
+    resolve_prompt_target_alignment,
+)
 
 
 class LLaVAOneVisionWrapper(BaseLVLMWrapper):
@@ -465,6 +470,60 @@ class LLaVAOneVisionWrapper(BaseLVLMWrapper):
                     **shared_capture["statistics"],
                 }
         return outputs
+
+    def extract_prompt_target_features(
+        self,
+        image: Image.Image,
+        request: PromptTargetRequest,
+        cfg_dgst_t: Optional[dict[str, Any]] = None,
+        requirements: Optional[ExtractionRequirements] = None,
+    ) -> ModelOutput:
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": request.prompt},
+            ],
+        }]
+        rendered = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_inputs = self.processor(
+            text=[rendered],
+            images=[image],
+            return_tensors="pt",
+        )
+        inputs = _append_prefix_token_ids(
+            prompt_inputs,
+            prefix_token_ids=[],
+            device=self.device,
+        )
+        input_ids = inputs["input_ids"][0]
+        visual_start, visual_end = self._find_vision_token_range(input_ids)
+        alignment = resolve_prompt_target_alignment(
+            tokenizer=self.tokenizer,
+            full_input_ids=input_ids.tolist(),
+            request=request,
+            image_token_id=self._image_token_id,
+            visual_token_count=visual_end - visual_start,
+        )
+        return extract_prompt_target_from_inputs(
+            wrapper=self,
+            inputs=inputs,
+            full_input_ids=input_ids.tolist(),
+            alignment=alignment,
+            visual_start=visual_start,
+            visual_end=visual_end,
+            image_token_id=self._image_token_id,
+            visual_grid=self._resolve_visual_grid(inputs, visual_end - visual_start),
+            cfg_dgst_t=cfg_dgst_t,
+            requirements=requirements,
+            model_name="LLaVA-OneVision-1.5",
+            support_scope=self.cfg.get("dgst_t_support_scope", "visual"),
+            semantic_chunk_size_default=int(self.cfg.get("semantic_chunk_size", 8)),
+        )
 
     def _extract_full_response_baseline_capture(
         self,

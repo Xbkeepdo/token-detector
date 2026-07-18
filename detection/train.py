@@ -78,6 +78,12 @@ def build_feature_matrix(
         y_rows.append(int(f[label_key]))
         meta.append(f)
 
+    if not X_rows:
+        return (
+            np.empty((0, 0), dtype=np.float32),
+            np.empty((0,), dtype=np.int32),
+            [],
+        )
     X = np.stack(X_rows, axis=0)
     y = np.array(y_rows, dtype=np.int32)
     return X, y, meta
@@ -91,7 +97,7 @@ def split_by_image_id(
 ) -> Tuple[List[dict], List[dict], List[dict]]:
     """Split feature list by image id to prevent leakage."""
     if test_image_ids is None:
-        raise ValueError("Strict 8:1:1 splitting requires explicit test_image_ids.")
+        raise ValueError("Strict outer-8:2 training requires explicit test_image_ids.")
     overlaps = {
         "train/val": set(train_image_ids) & set(val_image_ids),
         "train/test": set(train_image_ids) & set(test_image_ids),
@@ -163,11 +169,9 @@ def grid_search(
     best_params = {}
     best_score = -1.0
 
-    if X_train.shape[0] == 0 or X_val.shape[0] == 0:
+    if X_train.shape[0] == 0:
         raise ValueError(
-            f"grid_search received empty split: "
-            f"X_train={X_train.shape}, X_val={X_val.shape}. "
-            "Ensure both train and val splits contain labeled object tokens."
+            f"grid_search received empty training split: X_train={X_train.shape}."
         )
     if len(np.unique(y_train)) < 2:
         raise ValueError(
@@ -175,7 +179,43 @@ def grid_search(
             "Need at least one sample of each class (0=hallucinated, 1=real)."
         )
 
-    for params in ParameterGrid(param_grid):
+    candidates = list(ParameterGrid(param_grid))
+    if not candidates:
+        candidates = [{}]
+    if X_val.shape[0] == 0:
+        # Pure strict-8:2 protocol: hyperparameters are fixed to the first
+        # declared configuration, the final estimator is fit on all 80% train
+        # rows, and no score from the 20% test partition influences selection.
+        # Only the decision threshold is selected by training-set F1.
+        params = candidates[0]
+        clf = build_classifier(clf_type, params)
+        clf.fit(X_train, y_train)
+        train_scores = _positive_class_scores(clf, X_train)
+        threshold = select_decision_threshold(
+            y_train,
+            train_scores,
+            scoring="f1",
+        )
+        train_predictions = np.where(
+            train_scores >= threshold,
+            POSITIVE_LABEL,
+            1 - POSITIVE_LABEL,
+        )
+        train_score = f1_score(
+            y_train,
+            train_predictions,
+            pos_label=POSITIVE_LABEL,
+            zero_division=0,
+        )
+        setattr(clf, "_token_detector_threshold", float(threshold))
+        setattr(
+            clf,
+            "_token_detector_selection_protocol",
+            "fixed_hyperparameters_train_f1_threshold",
+        )
+        return clf, params, float(train_score)
+
+    for params in candidates:
         clf = build_classifier(clf_type, params)
         clf.fit(X_train, y_train)
         threshold = None
@@ -267,7 +307,7 @@ def select_decision_threshold(
     *,
     scoring: str = "f1",
 ) -> float:
-    """Select a binary decision threshold using validation rows only."""
+    """Select a binary decision threshold on the caller-provided fit rows."""
     labels = np.asarray(y_true, dtype=np.int32).reshape(-1)
     scores = np.asarray(positive_scores, dtype=np.float64).reshape(-1)
     if labels.size != scores.size or labels.size == 0:
@@ -344,10 +384,12 @@ def train_and_evaluate(
         ("val", X_val, y_val),
         ("test", X_test, y_test),
     ):
+        if split_name == "val" and matrix.shape[0] == 0:
+            continue
         classes = np.unique(labels)
         if matrix.shape[0] == 0 or classes.size < 2:
             raise ValueError(
-                f"[Train] strict 8:1:1 violation: {split_name} has "
+                f"[Train] strict outer-8:2 training violation: {split_name} has "
                 f"{matrix.shape[0]} rows and classes {classes.tolist()}. "
                 "Splits are never substituted; repair labeling/image_splits.json."
             )

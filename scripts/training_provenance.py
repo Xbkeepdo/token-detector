@@ -21,7 +21,7 @@ from utils.config_utils import (
     get_model_cfg,
 )
 from utils.io_utils import load_json, load_pkl
-from utils.split_utils import validate_strict_811_split
+from utils.split_utils import validate_strict_82_split
 
 
 SUPPORTED_ARTIFACT_FAMILIES = frozenset(
@@ -182,7 +182,7 @@ def _validate_feature_completeness(
         raise RuntimeError(f"Invalid generations file: {generations_path}")
 
     label_image_ids = {int(value) for value in labeling}
-    validate_strict_811_split(
+    validate_strict_82_split(
         image_splits,
         expected_image_ids=label_image_ids,
     )

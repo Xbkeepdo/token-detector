@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import pickle
 import tempfile
 import traceback
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import torch
@@ -23,12 +25,17 @@ from data.qa_benchmark import (
 )
 from features.ads import compute_ads
 from features.cgc import compute_cgc
-from features.dgst_t import COST_VARIANT_RISK_KEYS
-from features.extractor import _compute_dgst_t_result
-from features.pope_extractor import _extract_pope_forward
+from features.dgst_t import _target_comparison_state
+from features.extractor import (
+    _compute_dgst_t_result,
+    build_extraction_requirements,
+)
+from models.base_wrapper import PromptTargetRequest
 
 
-HPRE_KEY = "dgst_t_target_visual_hpre_cosine_relative_vll_per_layer"
+QA_FEATURE_SCHEMA_VERSION = "qa-prompt-last-token-v5"
+_IMAGE_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
+DIRECT_SOFTMAX_METHOD = "hpre_softmax_prob_direct"
 
 
 class JSONLCheckpointStore:
@@ -92,10 +99,9 @@ class AtomicFeatureShards:
 
 
 def qa_prompt(model_key: str, question: str) -> str:
-    instruction = f"{question}\nAnswer only yes or no."
-    if model_key.startswith("llava"):
-        return f"USER: <image>\n{instruction}\nASSISTANT:"
-    return instruction
+    """Return the raw user instruction; each wrapper renders its own template."""
+    del model_key  # Kept in the public signature for compatible callers.
+    return f"{question}\nAnswer only yes or no."
 
 
 def generate_questions(
@@ -111,12 +117,15 @@ def generate_questions(
     failures = JSONLCheckpointStore(str(output / "generation_failures.jsonl"), 1)
     for question in tqdm(questions, desc="Generate yes/no"):
         key = question["key"]
-        if key in store.rows:
+        prompt = qa_prompt(model_key, question["question"])
+        existing = store.rows.get(key)
+        if existing is not None and qa_generation_record_is_complete(
+            existing, prompt
+        ):
             continue
         try:
             with Image.open(question["image_path"]) as raw_image:
                 image = raw_image.convert("RGB")
-            prompt = qa_prompt(model_key, question["question"])
             generated = model_wrapper.generate(image, prompt=prompt)
             prediction = normalize_yes_no(generated.generated_text)
             semantic_index = find_answer_semantic_token(
@@ -124,6 +133,11 @@ def generate_questions(
                 model_wrapper.tokenizer,
                 prediction,
             )
+            if semantic_index is None:
+                raise ValueError(
+                    "Model output does not contain a locatable yes/no answer token: "
+                    f"{generated.generated_text!r}"
+                )
             row = {
                 "key": key,
                 "dataset": question["dataset"],
@@ -131,6 +145,8 @@ def generate_questions(
                 "question_id": question["question_id"],
                 "image_id": question["image_id"],
                 "probe_split": question["probe_split"],
+                "prompt": prompt,
+                "generation_protocol": "raw_question_yes_no_v1",
                 "generated_text": generated.generated_text,
                 "prediction": prediction,
                 "response_token_ids": [int(x) for x in generated.response_token_ids],
@@ -161,7 +177,14 @@ def label_generations(
         generation = generations.get(question["key"])
         if generation is None:
             continue
-        label, error_type = label_answer(generation.get("prediction"), question["gt_answer"])
+        prediction = generation.get("prediction")
+        label, error_type = label_answer(prediction, question["gt_answer"])
+        gt_answer = normalize_yes_no(question["gt_answer"])
+        yes_only_label = (
+            (1 if gt_answer == "yes" else 0)
+            if prediction == "yes"
+            else None
+        )
         store.add({
             "key": question["key"],
             "dataset": question["dataset"],
@@ -171,10 +194,21 @@ def label_generations(
             "probe_split": question["probe_split"],
             "question_family_index": question.get("question_family_index"),
             "gt_answer": question["gt_answer"],
-            "prediction": generation.get("prediction"),
+            "prediction": prediction,
             "label": label,
             "class_name": "real" if label == 1 else "hallucination",
             "error_type": error_type,
+            "answer_correctness_all_label": label,
+            "object_hallucination_yes_only_label": yes_only_label,
+            "object_hallucination_yes_only_class_name": (
+                None
+                if yes_only_label is None
+                else ("real" if yes_only_label == 1 else "hallucination")
+            ),
+            "label_protocols": {
+                "answer_correctness_all": label,
+                "object_hallucination_yes_only": yes_only_label,
+            },
         })
     store.flush()
     return list(store.rows.values())
@@ -189,133 +223,444 @@ def extract_questions(
     cfg_ads: dict,
     cfg_cgc: dict,
     shard_size: int = 25,
-    include_object_cgc: bool = True,
+    position_protocols: Iterable[str] = ("prompt_last_token",),
+    extraction_fingerprint: str = "",
+    method_enabled: bool = True,
+    ads_cgc_enabled: bool = True,
+    baseline_consumers: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict]:
+    """Extract every enabled QA family from one shared prompt-last forward.
+
+    ``prompt_last_token`` is the final causal state in the complete prompt and
+    therefore predicts ``response_token_ids[0]``.  It deliberately does not
+    move when a model emits a preamble before its semantic yes/no answer.  The
+    optional ``question_object_pre_token`` ablation predicts the first
+    contextual sub-token of the queried object word in the question.  The
+    default QA YAML enables only ``prompt_last_token`` so no object forward is
+    run in the first VQA experiment. ``baseline_consumers`` maps each active
+    label protocol to an adapter/store pair. Their requirements are merged
+    with DGST/ADS+CGC before the wrapper call, so enabling baselines does not
+    trigger a second LVLM forward.
+    """
+
+    active_positions = tuple(dict.fromkeys(str(value) for value in position_protocols))
+    allowed_positions = {"prompt_last_token", "question_object_pre_token"}
+    unknown_positions = sorted(set(active_positions) - allowed_positions)
+    if unknown_positions:
+        raise ValueError(f"Unknown QA extraction positions: {unknown_positions}")
+    if "prompt_last_token" not in active_positions:
+        raise ValueError("QA extraction currently requires prompt_last_token")
+    object_position_enabled = "question_object_pre_token" in active_positions
+    extraction_fingerprint = str(extraction_fingerprint).strip()
+    if not extraction_fingerprint:
+        raise ValueError("QA extraction requires a non-empty extraction fingerprint")
+    method_enabled = bool(method_enabled)
+    ads_cgc_enabled = bool(ads_cgc_enabled)
+    root_enabled = method_enabled or ads_cgc_enabled
+    consumers = dict(baseline_consumers or {})
+    if not root_enabled and not consumers:
+        raise ValueError("QA extraction has no enabled feature family")
+    for protocol, consumer in consumers.items():
+        if "adapter" not in consumer or "store" not in consumer:
+            raise ValueError(
+                f"QA baseline consumer {protocol!r} requires adapter and store"
+            )
     output = Path(output_dir)
     generations = {row["key"]: row for row in load_jsonl(output / "generations.jsonl")}
     labels = {row["key"]: row for row in load_jsonl(output / "labels.jsonl")}
-    shards = AtomicFeatureShards(output_dir, shard_size)
+    shards = AtomicFeatureShards(output_dir, shard_size) if root_enabled else None
     failures = JSONLCheckpointStore(str(output / "extraction_failures.jsonl"), 1)
 
     for question in tqdm(questions, desc="Extract QA features"):
         key = question["key"]
-        if key in shards.rows:
-            continue
         generation = generations.get(key)
         label_row = labels.get(key)
         if generation is None or label_row is None:
             continue
-        response_ids = [int(x) for x in generation.get("response_token_ids", [])]
-        answer_index = generation.get("answer_token_index")
-        if answer_index is None:
-            answer_index = _first_content_token(response_ids, model_wrapper.tokenizer)
-        if answer_index is None or not response_ids:
-            failures.add({"key": key, "error": "No response token available for extraction"})
-            continue
-        answer_index = int(answer_index)
-        answer_token_id = int(response_ids[answer_index])
-        target_ids = [answer_token_id]
-        target_names = ["answer"]
-        object_token_id = None
-        if question["dataset"] == "pope":
-            object_ids = model_wrapper.tokenizer.encode(
-                question["object_word"], add_special_tokens=False
-            )
-            if object_ids:
-                object_token_id = int(object_ids[0])
-                target_ids.append(object_token_id)
-                target_names.append("object")
         prompt = qa_prompt(model_key, question["question"])
+        generation_fingerprint = qa_generation_fingerprint(generation, prompt)
+        label_fingerprint = qa_label_fingerprint(label_row)
+        question_input_fingerprint = qa_question_input_fingerprint(question, prompt)
+        root_pending = bool(root_enabled)
+        if shards is not None and key in shards.rows:
+            existing = shards.rows[key]
+            existing_schema = existing.get("feature_schema_version")
+            if existing_schema != QA_FEATURE_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Cannot resume {key} from schema {existing_schema!r}; "
+                    f"use a new output directory for {QA_FEATURE_SCHEMA_VERSION}."
+                )
+            if existing.get("generation_fingerprint") != generation_fingerprint:
+                raise RuntimeError(
+                    f"Cannot resume {key}: generation/prompt fingerprint changed; "
+                    "use a new output directory or remove this experiment output."
+                )
+            if existing.get("label_fingerprint") != label_fingerprint:
+                raise RuntimeError(
+                    f"Cannot resume {key}: QA labels changed; use a new output "
+                    "directory or remove this experiment output."
+                )
+            if existing.get("question_input_fingerprint") != question_input_fingerprint:
+                raise RuntimeError(
+                    f"Cannot resume {key}: question, image, or split changed; use "
+                    "a new output directory or remove this experiment output."
+                )
+            if existing.get("extraction_fingerprint") != extraction_fingerprint:
+                raise RuntimeError(
+                    f"Cannot resume {key}: model or extraction configuration changed; "
+                    "use a new output directory or remove this experiment output."
+                )
+            if tuple(existing.get("position_protocols") or ()) != active_positions:
+                raise RuntimeError(
+                    f"Cannot resume {key}: extraction positions changed from "
+                    f"{existing.get('position_protocols')!r} to {list(active_positions)!r}; "
+                    "use a new output directory or remove this experiment output."
+                )
+            object_retry = (
+                object_position_enabled
+                and str(
+                    (existing.get("question_object_position") or {}).get(
+                        "status"
+                    )
+                )
+                == "extraction_failed"
+            )
+            if not object_retry:
+                root_pending = False
+            else:
+                # A later part with the same key supersedes the failed record
+                # when shards are reloaded in sorted order. Recompute both
+                # positions so the row stays internally consistent.
+                del shards.rows[key]
+        pending_baselines: dict[str, Mapping[str, Any]] = {}
+        for protocol, consumer in consumers.items():
+            adapter = consumer["adapter"]
+            store = consumer["store"]
+            label = adapter.label_protocol
+            from features.qa_baseline import qa_label_for_protocol
+
+            if qa_label_for_protocol(label_row, label) is None:
+                continue
+            if key not in store.rows:
+                pending_baselines[protocol] = consumer
+        if not root_pending and not pending_baselines:
+            continue
+        response_ids = [int(x) for x in generation.get("response_token_ids", [])]
+        if not qa_generation_record_is_complete(generation, prompt):
+            failures.add({
+                "key": key,
+                "error": "Generation lacks a valid saved yes/no answer token index",
+            })
+            continue
+        answer_index = int(generation["answer_token_index"])
+        recovered_index = find_answer_semantic_token(
+            response_ids, model_wrapper.tokenizer, generation.get("prediction")
+        )
+        if recovered_index != answer_index:
+            failures.add({
+                "key": key,
+                "error": (
+                    "Saved answer token is not the actual first generated yes/no token: "
+                    f"saved={answer_index}, recovered={recovered_index}"
+                ),
+            })
+            continue
+        # response index 0 is predicted by the prompt's final causal row.  Do
+        # not follow ``answer_index`` here: a later semantic yes/no token would
+        # include generated preamble tokens and would no longer be a
+        # prompt-last feature.
+        prompt_last_response_index = 0
+        prompt_last_target_token_id = int(response_ids[prompt_last_response_index])
+        object_status = {
+            "status": (
+                str(question.get("object_span_status") or "unavailable")
+                if object_position_enabled
+                else "disabled_by_config"
+            ),
+            "protocol": question.get("object_span_protocol"),
+            "surface": question.get("object_surface"),
+            "char_start": question.get("object_char_start"),
+            "char_end": question.get("object_char_end"),
+        }
+        positions: dict[str, dict] = {}
+
         try:
             with Image.open(question["image_path"]) as raw_image:
                 image = raw_image.convert("RGB")
-            outputs = model_wrapper.extract_token_features_batch(
+
+            requirements = build_extraction_requirements(
+                method=bool(method_enabled and root_pending),
+                ads_cgc=bool(ads_cgc_enabled and root_pending),
+                baseline=False,
+            )
+            for consumer in pending_baselines.values():
+                requirements = requirements.merged(
+                    consumer["adapter"].requirements
+                )
+            prompt_last_outputs = model_wrapper.extract_token_features_batch(
                 image=image,
                 response_token_ids=response_ids,
-                response_token_indices=[answer_index] * len(target_ids),
-                target_token_ids=target_ids,
-                cfg_dgst_t=cfg_dgst_t,
+                response_token_indices=[prompt_last_response_index],
+                target_token_ids=[prompt_last_target_token_id],
+                cfg_dgst_t=(cfg_dgst_t if method_enabled and root_pending else None),
                 prompt=prompt,
+                requirements=requirements,
             )
-            if len(outputs) != len(target_ids):
-                raise RuntimeError(f"Expected {len(target_ids)} target outputs, got {len(outputs)}")
-            baseline = _baseline_features(outputs[0], answer_token_id, cfg_ads, cfg_cgc)
-            targets = {
-                name: _compact_dgst(_compute_dgst_t_result(model_out, cfg_dgst_t))
-                for name, model_out in zip(target_names, outputs)
-            }
-            object_cgc = None
-            object_cgc_per_layer = None
-            if question["dataset"] == "pope" and include_object_cgc:
-                try:
-                    legacy = _extract_pope_forward(
-                        model_wrapper, image, prompt, question["object_word"]
-                    )
-                    if legacy is not None:
-                        object_cgc, object_layers = compute_cgc(
-                            legacy["object_hidden_states"],
-                            legacy["patch_hidden_states"],
-                            top_k_patches=cfg_cgc.get("top_k_patches", 5),
-                            top_k_pct=cfg_cgc.get("top_k_pct", 0.0),
-                            text_to_patch_attn=(
-                                legacy["text_to_patch_attn"]
-                                if cfg_cgc.get("use_attn_weighting", False) else None
-                            ),
-                            mid_layer_pct=tuple(cfg_cgc.get("mid_layer_pct", [0.25, 0.75])),
-                        )
-                        object_cgc_per_layer = object_layers.tolist()
-                except Exception as object_exc:
-                    failures.add({
-                        "key": key,
-                        "component": "object_position_cgc",
-                        "error": repr(object_exc),
-                        "traceback": traceback.format_exc(),
-                    })
+            if len(prompt_last_outputs) != 1:
+                raise RuntimeError(
+                    "Expected one prompt-last-position output, got "
+                    f"{len(prompt_last_outputs)}"
+                )
+            prompt_last_output = prompt_last_outputs[0]
+            if root_pending:
+                positions["prompt_last_token"] = _build_position_record(
+                    model_out=prompt_last_output,
+                    cfg_dgst_t=cfg_dgst_t,
+                    cfg_ads=cfg_ads,
+                    cfg_cgc=cfg_cgc,
+                    method_enabled=method_enabled,
+                    ads_cgc_enabled=ads_cgc_enabled,
+                    target_metadata={
+                        "protocol": "prompt_last_token_v1",
+                        "target_token_id": prompt_last_target_token_id,
+                        "response_token_index": prompt_last_response_index,
+                        "semantic_answer_token_index": answer_index,
+                        "prediction_source": "prompt_last_causal_row",
+                    },
+                )
 
-            feature = {
-                "key": key,
-                "dataset": question["dataset"],
-                "source_split": question["source_split"],
-                "question_id": question["question_id"],
-                "image_id": question["image_id"],
-                "probe_split": question["probe_split"],
-                "question_family_index": question.get("question_family_index"),
-                "label": int(label_row["label"]),
-                "class_name": label_row["class_name"],
-                "error_type": label_row["error_type"],
-                "prediction": label_row.get("prediction"),
-                "generated_text": generation.get("generated_text"),
-                "answer_token_index": answer_index,
-                "answer_token_id": answer_token_id,
-                "predicted_token_id": int(outputs[0].token_id),
-                "predicted_token": outputs[0].token_str,
-                "object_token_id": object_token_id,
-                "ot_solver": os.environ.get(
-                    "DGST_OT_SOLVER_OVERRIDE",
-                    str(cfg_dgst_t.get("ot_solver", "emd")),
-                ),
-                "sinkhorn_reg": (
-                    float(os.environ.get("DGST_SINKHORN_REG", "0.05"))
-                    if os.environ.get("DGST_OT_SOLVER_OVERRIDE", "").lower() == "sinkhorn"
-                    else None
-                ),
-                "targets": targets,
-                **baseline,
-                "object_cgc_score": None if object_cgc is None else float(object_cgc),
-                "object_cgc_per_layer": object_cgc_per_layer,
-            }
-            if "gt_answer" in feature or _contains_gt_key(feature):
-                raise AssertionError("GT leakage: feature record contains a GT field")
-            _assert_finite(feature)
-            shards.add(feature)
+            for protocol, consumer in pending_baselines.items():
+                cache_ids = consumer.get("cache_ids") or {}
+                baseline_record = consumer["adapter"].build_record(
+                    image=image,
+                    question=question,
+                    generation=generation,
+                    label_row=label_row,
+                    response_token_ids=response_ids,
+                    target_index=prompt_last_response_index,
+                    model_output=prompt_last_output,
+                    cache_id=cache_ids.get(key),
+                )
+                consumer["store"].add(baseline_record)
+
+            if (
+                root_pending
+                and object_position_enabled
+                and object_status["status"] == "found"
+            ):
+                try:
+                    surface = str(question["object_surface"])
+                    char_start = int(question["object_char_start"])
+                    char_end = int(question["object_char_end"])
+                    if prompt[char_start:char_end] != surface:
+                        raise ValueError(
+                            "Prepared object span does not match the raw QA prompt: "
+                            f"{prompt[char_start:char_end]!r} != {surface!r}"
+                        )
+                    request = PromptTargetRequest(
+                        prompt=prompt,
+                        target_text=surface,
+                        target_char_start=char_start,
+                        target_char_end=char_end,
+                    )
+                    object_output = model_wrapper.extract_prompt_target_features(
+                        image=image,
+                        request=request,
+                        cfg_dgst_t=(cfg_dgst_t if method_enabled else None),
+                        requirements=requirements,
+                    )
+                    alignment = _prompt_alignment_metadata(object_output)
+                    if "target_token_id" not in alignment:
+                        raise RuntimeError(
+                            "Prompt-target wrapper omitted the actual contextual target ID"
+                        )
+                    positions["question_object_pre_token"] = _build_position_record(
+                        model_out=object_output,
+                        cfg_dgst_t=cfg_dgst_t,
+                        cfg_ads=cfg_ads,
+                        cfg_cgc=cfg_cgc,
+                        method_enabled=method_enabled,
+                        ads_cgc_enabled=ads_cgc_enabled,
+                        target_metadata={
+                            "protocol": "question_object_contextual_first_subtoken_v1",
+                            "surface": surface,
+                            "question_char_start": char_start,
+                            "question_char_end": char_end,
+                            **alignment,
+                        },
+                    )
+                    object_status.update(
+                        {
+                            "status": "extracted",
+                            **alignment,
+                        }
+                    )
+                    del object_output
+                except Exception as object_exc:
+                    object_status["status"] = "extraction_failed"
+                    object_status["error"] = repr(object_exc)
+                    failures.add(
+                        {
+                            "key": key,
+                            "component": "question_object_pre_token",
+                            "error": repr(object_exc),
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+
+            if root_pending:
+                yes_only_label = label_row.get("object_hallucination_yes_only_label")
+                feature = {
+                    "feature_schema_version": QA_FEATURE_SCHEMA_VERSION,
+                    "generation_fingerprint": generation_fingerprint,
+                    "label_fingerprint": label_fingerprint,
+                    "question_input_fingerprint": question_input_fingerprint,
+                    "extraction_fingerprint": extraction_fingerprint,
+                    "feature_families": {
+                        "method": method_enabled,
+                        "ads_cgc": ads_cgc_enabled,
+                    },
+                    "position_protocols": list(active_positions),
+                    "key": key,
+                    "dataset": question["dataset"],
+                    "source_split": question["source_split"],
+                    "question_id": question["question_id"],
+                    "image_id": question["image_id"],
+                    "probe_split": question["probe_split"],
+                    "question_family_index": question.get("question_family_index"),
+                    "label": int(label_row["label"]),
+                    "answer_correctness_all_label": int(label_row["label"]),
+                    "object_hallucination_yes_only_label": (
+                        None if yes_only_label is None else int(yes_only_label)
+                    ),
+                    "class_name": label_row["class_name"],
+                    "error_type": label_row["error_type"],
+                    "prediction": label_row.get("prediction"),
+                    "generated_text": generation.get("generated_text"),
+                    "positions": positions,
+                    "question_object_position": object_status,
+                    "ot_solver": (
+                        str(cfg_dgst_t.get("ot_solver", "emd"))
+                        if method_enabled
+                        else None
+                    ),
+                }
+                if "gt_answer" in feature or _contains_gt_key(feature):
+                    raise AssertionError("GT leakage: feature record contains a GT field")
+                _assert_finite(feature)
+                assert shards is not None
+                shards.add(feature)
+            del prompt_last_output, prompt_last_outputs
         except Exception as exc:
             failures.add({"key": key, "error": repr(exc), "traceback": traceback.format_exc()})
         finally:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-    shards.consolidate()
+    if shards is not None:
+        shards.consolidate()
+    for consumer in consumers.values():
+        consumer["store"].flush()
     failures.flush()
-    return list(shards.rows.values())
+    return list(shards.rows.values()) if shards is not None else []
+
+
+def qa_generation_fingerprint(generation: dict, prompt: str) -> str:
+    """Fingerprint the exact prompt/response pair consumed by extraction."""
+
+    payload = {
+        "prompt": str(prompt),
+        "response_token_ids": [
+            int(value) for value in generation.get("response_token_ids", [])
+        ],
+        "generated_text": str(generation.get("generated_text") or ""),
+        "prediction": generation.get("prediction"),
+        "generation_protocol": generation.get("generation_protocol"),
+        "answer_token_index": generation.get("answer_token_index"),
+        "answer_token_id": generation.get("answer_token_id"),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def qa_generation_record_is_complete(generation: dict, prompt: str) -> bool:
+    """Return whether a row names one actual saved yes/no response token."""
+
+    if generation.get("prompt") != prompt:
+        return False
+    if normalize_yes_no(generation.get("prediction")) not in ("yes", "no"):
+        return False
+    raw_ids = generation.get("response_token_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return False
+    try:
+        response_ids = [int(value) for value in raw_ids]
+        index = int(generation["answer_token_index"])
+        token_id = int(generation["answer_token_id"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return 0 <= index < len(response_ids) and response_ids[index] == token_id
+
+
+def qa_question_input_fingerprint(question: dict, prompt: str) -> str:
+    """Fingerprint the exact question, image bytes, and authoritative split."""
+
+    image_path = Path(str(question.get("image_path") or "")).expanduser()
+    if not image_path.is_file():
+        raise FileNotFoundError(f"QA image is missing: {image_path}")
+    stat = image_path.stat()
+    cache_key = (str(image_path.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
+    image_sha256 = _IMAGE_SHA256_CACHE.get(cache_key)
+    if image_sha256 is None:
+        digest = hashlib.sha256()
+        with image_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        image_sha256 = digest.hexdigest()
+        _IMAGE_SHA256_CACHE[cache_key] = image_sha256
+    fields = (
+        "key", "dataset", "source_split", "question_id", "image_id",
+        "probe_split", "question_family_index", "question", "image_path",
+        "object_span_status", "object_span_protocol", "object_surface",
+        "object_char_start", "object_char_end",
+    )
+    payload = {
+        "prompt": str(prompt),
+        "question": {field: question.get(field) for field in fields},
+        "image": {
+            "resolved_path": cache_key[0],
+            "size": cache_key[1],
+            "sha256": image_sha256,
+        },
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def qa_label_fingerprint(label_row: dict) -> str:
+    """Fingerprint the labels embedded into one QA feature row."""
+
+    payload = {
+        "label": label_row.get("label"),
+        "answer_correctness_all_label": label_row.get(
+            "answer_correctness_all_label", label_row.get("label")
+        ),
+        "object_hallucination_yes_only_label": label_row.get(
+            "object_hallucination_yes_only_label"
+        ),
+        "prediction": label_row.get("prediction"),
+        "class_name": label_row.get("class_name"),
+        "error_type": label_row.get("error_type"),
+        "label_protocols": label_row.get("label_protocols"),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def find_answer_semantic_token(response_ids: list[int], tokenizer, answer: str | None) -> int | None:
@@ -334,65 +679,170 @@ def find_answer_semantic_token(response_ids: list[int], tokenizer, answer: str |
         for index, token_id in enumerate(response_ids):
             if normalize_yes_no(tokenizer.decode([token_id], skip_special_tokens=True)) == answer:
                 return index
-    return _first_content_token(response_ids, tokenizer)
+    return None
 
 
 def _compact_dgst(result: dict) -> dict:
-    compact = {}
-    for risk_name in COST_VARIANT_RISK_KEYS:
-        key = f"dgst_t_{risk_name}_per_layer"
-        if key not in result:
-            raise KeyError(f"Missing required QA DGST feature: {key}")
-        compact[risk_name] = _as_float_list(result[key])
-    if HPRE_KEY not in result:
-        raise KeyError(f"Missing required QA DGST feature: {HPRE_KEY}")
-    compact["hprecosine"] = _as_float_list(result[HPRE_KEY])
+    """Serialize the active six-target DGST profile without legacy aliases."""
+
+    methods = tuple(str(value) for value in result.get("dgst_t_four_gate_methods") or ())
+    if not methods:
+        raise KeyError("Missing dgst_t_four_gate_methods in QA DGST result")
+    metadata_keys = (
+        "dgst_t_profile",
+        "dgst_t_mad_axis",
+        "dgst_t_mad_scale",
+        "dgst_t_softmax_axis",
+        "dgst_t_source_distribution_mode",
+        "dgst_t_state_by_method",
+        "dgst_t_transport_top_k",
+        "dgst_t_target_region_top_k",
+        "dgst_t_ev_definition",
+        "dgst_t_cost",
+        "dgst_t_ot_solver",
+    )
+    required = [
+        "dgst_t_attention_support_per_layer",
+        "dgst_t_source_dist_per_layer",
+        *metadata_keys,
+    ]
+    missing = [key for key in required if key not in result]
+    if missing:
+        raise KeyError(f"Missing QA DGST shared fields: {missing}")
+    compact: dict = {
+        "schema_version": "dgst-target-comparison-v3",
+        "methods": list(methods),
+        "metadata": {key: result[key] for key in metadata_keys},
+        "matrices": {
+            "attention_support": _as_float32_array(
+                result["dgst_t_attention_support_per_layer"]
+            ),
+            "source_dist": _as_float32_array(result["dgst_t_source_dist_per_layer"]),
+        },
+    }
+    for method in methods:
+        state = _target_comparison_state(method)
+        keys = {
+            "risk": f"dgst_t_{method}_risk_sqrt_{state}_per_layer",
+            "target_cosine": (
+                f"dgst_t_{method}_target_cosine_topk32_{state}_per_layer"
+            ),
+            "ev": (
+                f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
+                f"topk32_{state}_per_layer"
+            ),
+        }
+        branch_missing = [key for key in keys.values() if key not in result]
+        if branch_missing:
+            raise KeyError(f"Missing QA DGST branch fields for {method}: {branch_missing}")
+        branch = {
+            "state": state,
+            **{name: _as_float32_array(result[key]) for name, key in keys.items()},
+        }
+        if method == DIRECT_SOFTMAX_METHOD:
+            for name, key in (
+                (
+                    "target_prob_matrix",
+                    "dgst_t_hpre_softmax_prob_direct_target_prob_matrix_per_layer",
+                ),
+                (
+                    "target_dist",
+                    "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer",
+                ),
+            ):
+                if key not in result:
+                    raise KeyError(f"Missing direct QA DGST matrix: {key}")
+                branch[name] = _as_float32_array(result[key])
+        else:
+            gate_key = f"dgst_t_{method}_gate_per_layer"
+            if gate_key not in result:
+                raise KeyError(f"Missing QA DGST gate: {gate_key}")
+            branch["gate"] = _as_float32_array(result[gate_key])
+        compact[method] = branch
     return compact
 
 
-def _baseline_features(model_out, target_token_id: int, cfg_ads: dict, cfg_cgc: dict) -> dict:
+def _build_position_record(
+    *,
+    model_out,
+    cfg_dgst_t: dict,
+    cfg_ads: dict,
+    cfg_cgc: dict,
+    target_metadata: dict,
+    method_enabled: bool = True,
+    ads_cgc_enabled: bool = True,
+) -> dict:
+    if not method_enabled and not ads_cgc_enabled:
+        raise ValueError("Position record requires DGST or ADS+CGC")
+    record = {
+        "target": {
+            "predicted_token_id": int(model_out.token_id),
+            "predicted_token": str(model_out.token_str),
+            **target_metadata,
+        },
+    }
+    if method_enabled:
+        record["dgst"] = _compact_dgst(
+            _compute_dgst_t_result(model_out, cfg_dgst_t)
+        )
+    if not ads_cgc_enabled:
+        return record
     ads_score, ads_layers = compute_ads(
         model_out.text_to_patch_attn,
-        top_patch_pct=cfg_ads.get("top_patch_pct", 0.10),
-        connectivity=cfg_ads.get("connectivity", 8),
-        min_blob_area=cfg_ads.get("min_blob_area", 3),
-        top_k_layers=cfg_ads.get("top_k_layers", 10),
-        per_head_min=cfg_ads.get("per_head_min", False),
-        top_k_heads=cfg_ads.get("top_k_heads", 0),
+        top_patch_pct=float(cfg_ads.get("top_patch_pct", 0.10)),
+        connectivity=int(cfg_ads.get("connectivity", 8)),
+        min_blob_area=int(cfg_ads.get("min_blob_area", 3)),
+        top_k_layers=int(cfg_ads.get("top_k_layers", 10)),
+        per_head_min=bool(cfg_ads.get("per_head_min", False)),
+        top_k_heads=int(cfg_ads.get("top_k_heads", 0)),
+        grid_shape=model_out.visual_grid,
     )
     cgc_score, cgc_layers = compute_cgc(
         model_out.token_hidden_states,
         model_out.patch_hidden_states,
-        top_k_patches=cfg_cgc.get("top_k_patches", 5),
-        top_k_pct=cfg_cgc.get("top_k_pct", 0.0),
+        top_k_patches=int(cfg_cgc.get("top_k_patches", 5)),
+        top_k_pct=float(cfg_cgc.get("top_k_pct", 0.05)),
         text_to_patch_attn=(
-            model_out.text_to_patch_attn if cfg_cgc.get("use_attn_weighting", False) else None
+            model_out.text_to_patch_attn
+            if bool(cfg_cgc.get("use_attn_weighting", False))
+            else None
         ),
-        mid_layer_pct=tuple(cfg_cgc.get("mid_layer_pct", [0.25, 0.75])),
+        mid_layer_pct=tuple(cfg_cgc.get("mid_layer_pct", (0.25, 0.75))),
     )
-    if model_out.token_logits is None:
-        raise RuntimeError("Wrapper did not return token logits")
-    logits = model_out.token_logits.float()
-    log_probs = torch.log_softmax(logits, dim=-1)
-    probs = torch.softmax(logits, dim=-1)
-    token_log_prob = float(log_probs[target_token_id].item())
-    entropy = float((-(probs * log_probs).sum() / math.log(probs.numel())).item())
-    attn = model_out.text_to_patch_attn.float()
-    n_layers = int(attn.shape[0])
-    visual_mass = attn.sum(dim=-1).mean(dim=-1)
-    start = max(0, int(n_layers * 0.15))
-    end = min(n_layers, int(n_layers * 0.55))
-    return {
+    record.update({
         "ads_score": float(ads_score),
-        "ads_per_layer": _as_float_list(ads_layers),
-        "answer_cgc_score": float(cgc_score),
-        "answer_cgc_per_layer": _as_float_list(cgc_layers),
-        "token_log_probability": token_log_prob,
-        "token_entropy": entropy,
-        "token_nll": -token_log_prob,
-        "svar_score": float(visual_mass[start:end].sum().item()),
-        "attention_per_head_mid": _as_float_list(attn[n_layers // 2].mean(dim=-1)),
-    }
+        "ads_per_layer": _as_float32_array(ads_layers),
+        "cgc_score": float(cgc_score),
+        "cgc_per_layer": _as_float32_array(cgc_layers),
+    })
+    return record
+
+
+def _prompt_alignment_metadata(model_out) -> dict:
+    capture = model_out.baseline_capture
+    if not isinstance(capture, dict):
+        return {}
+    raw = capture.get("prompt_target_alignment")
+    if raw is None:
+        return {}
+    if hasattr(raw, "__dict__"):
+        raw = vars(raw)
+    if not isinstance(raw, dict):
+        return {}
+    result = {}
+    for key, value in raw.items():
+        if isinstance(value, tuple):
+            value = [int(item) for item in value]
+        elif isinstance(value, (np.integer, int)):
+            value = int(value)
+        result[str(key)] = value
+    return result
+
+
+def _as_float32_array(value) -> np.ndarray:
+    if torch.is_tensor(value):
+        value = value.detach().float().cpu().numpy()
+    return np.asarray(value, dtype=np.float32)
 
 
 def _as_float_list(value) -> list[float]:
@@ -401,13 +851,6 @@ def _as_float_list(value) -> list[float]:
     elif isinstance(value, np.ndarray):
         value = value.astype(np.float32).reshape(-1).tolist()
     return [float(x) for x in value]
-
-
-def _first_content_token(response_ids: list[int], tokenizer) -> int | None:
-    for index, token_id in enumerate(response_ids):
-        if tokenizer.decode([token_id], skip_special_tokens=True).strip():
-            return index
-    return 0 if response_ids else None
 
 
 def _contains_gt_key(value) -> bool:

@@ -11,6 +11,8 @@ from pathlib import Path
 
 
 METRICS = ("precision", "recall", "f1", "accuracy", "auc", "aupr")
+CLASS_METRICS = ("precision", "recall", "f1", "auc", "aupr")
+CLASS_PREFIXES = ("real_positive", "hallucination_positive")
 METRIC_LABELS = {
     "precision": "PR",
     "recall": "RC",
@@ -84,9 +86,28 @@ def main() -> None:
                 row[f"{metric}_mean"] = statistics.fmean(values)
                 row[f"{metric}_std"] = statistics.pstdev(values)
                 row[f"{metric}_values"] = values
+            row["headline_positive_class"] = str(
+                seed_metrics[args.seeds[0]]["reported_positive_class"]
+            )
+            for class_prefix in CLASS_PREFIXES:
+                for metric in CLASS_METRICS:
+                    values = [
+                        float(seed_metrics[seed][class_prefix][metric])
+                        for seed in args.seeds
+                    ]
+                    key = f"{class_prefix}_{metric}"
+                    row[f"{key}_mean"] = statistics.fmean(values)
+                    row[f"{key}_std"] = statistics.pstdev(values)
+                    row[f"{key}_values"] = values
             model_rows.append(row)
 
-        model_rows.sort(key=lambda item: (-item["auc_mean"], -item["f1_mean"], item["feature_set"]))
+        model_rows.sort(
+            key=lambda item: (
+                -item["real_positive_auc_mean"],
+                -item["real_positive_f1_mean"],
+                item["feature_set"],
+            )
+        )
         for rank, row in enumerate(model_rows, start=1):
             row["rank"] = rank
         rows.extend(model_rows)
@@ -115,15 +136,51 @@ def _common_torch_feature_sets(seed_results: dict[int, dict]) -> list[str]:
 
 
 def _validate_seed_metadata(model: str, feature_set: str, seed_metrics: dict[int, dict]) -> None:
+    positive_classes = set()
     for expected_seed, metrics in seed_metrics.items():
         missing = [metric for metric in METRICS if metric not in metrics]
         if missing:
             raise KeyError(f"{model}/{feature_set}/seed{expected_seed} missing metrics: {missing}")
+        for class_prefix in CLASS_PREFIXES:
+            class_metrics = metrics.get(class_prefix)
+            if not isinstance(class_metrics, dict):
+                raise KeyError(
+                    f"{model}/{feature_set}/seed{expected_seed} missing "
+                    f"{class_prefix} metrics"
+                )
+            class_missing = [
+                metric for metric in CLASS_METRICS if metric not in class_metrics
+            ]
+            if class_missing:
+                raise KeyError(
+                    f"{model}/{feature_set}/seed{expected_seed} "
+                    f"{class_prefix} missing metrics: {class_missing}"
+                )
+        positive_classes.add(str(metrics.get("reported_positive_class")))
+        selection = (
+            metrics.get("split_protocol"),
+            metrics.get("checkpoint_selection"),
+            metrics.get("threshold_selection"),
+        )
+        if selection != (
+            "strict_82_no_validation",
+            "last_epoch",
+            "train_f1",
+        ):
+            raise ValueError(
+                f"{model}/{feature_set}/seed{expected_seed}: incompatible "
+                f"selection protocol {selection}"
+            )
         actual_seed = metrics.get("best_params", {}).get("seed")
         if actual_seed is not None and int(actual_seed) != int(expected_seed):
             raise ValueError(
                 f"{model}/{feature_set}: expected seed {expected_seed}, found {actual_seed}."
             )
+    if positive_classes != {"real"}:
+        raise ValueError(
+            f"{model}/{feature_set}: summary headline must be real-positive; "
+            f"found {sorted(positive_classes)}."
+        )
 
 
 def _mean_std(row: dict, metric: str) -> str:
@@ -135,11 +192,14 @@ def _write_markdown(path: Path, title: str, seeds: list[int], rows: list[dict]) 
         f"# {title}",
         "",
         f"Seeds: `{', '.join(str(seed) for seed in seeds)}`. Values are population mean+/-std.",
+        "Real is the headline positive class; hallucination-positive metrics are reported alongside it.",
+        "Strict 8:2 has no validation set: every run uses fixed epochs, the final checkpoint, and a Real-F1 threshold selected on train only.",
+        "Real/Hall AUC values are equal under score inversion, while AUPR differs; hallucination metrics use the complementary prediction at the same fixed boundary.",
         "",
         "## Best by model",
         "",
-        "| Model | Best feature set | PR | RC | F1 | AUC | AUPR |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| Model | Best feature set | Acc | Real PR | Real RC | Real F1 | Real AUC | Real AUPR | Hall. PR | Hall. RC | Hall. F1 | Hall. AUC | Hall. AUPR |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     model_order = []
     for row in rows:
@@ -149,9 +209,17 @@ def _write_markdown(path: Path, title: str, seeds: list[int], rows: list[dict]) 
         best = next(row for row in rows if row["model"] == model)
         lines.append(
             f"| {best['model_label']} | `{best['feature_set']}` | "
-            f"{_mean_std(best, 'precision')} | {_mean_std(best, 'recall')} | "
-            f"{_mean_std(best, 'f1')} | {_mean_std(best, 'auc')} | "
-            f"{_mean_std(best, 'aupr')} |"
+            f"{_mean_std(best, 'accuracy')} | "
+            f"{_mean_std(best, 'real_positive_precision')} | "
+            f"{_mean_std(best, 'real_positive_recall')} | "
+            f"{_mean_std(best, 'real_positive_f1')} | "
+            f"{_mean_std(best, 'real_positive_auc')} | "
+            f"{_mean_std(best, 'real_positive_aupr')} | "
+            f"{_mean_std(best, 'hallucination_positive_precision')} | "
+            f"{_mean_std(best, 'hallucination_positive_recall')} | "
+            f"{_mean_std(best, 'hallucination_positive_f1')} | "
+            f"{_mean_std(best, 'hallucination_positive_auc')} | "
+            f"{_mean_std(best, 'hallucination_positive_aupr')} |"
         )
 
     for model in model_order:
@@ -161,24 +229,44 @@ def _write_markdown(path: Path, title: str, seeds: list[int], rows: list[dict]) 
                 "",
                 f"## {model_rows[0]['model_label']}",
                 "",
-                "| Rank | Feature set | PR | RC | F1 | Acc | AUC | AUPR |",
-                "|---:|---|---:|---:|---:|---:|---:|---:|",
+                "| Rank | Feature set | Acc | Real PR | Real RC | Real F1 | Real AUC | Real AUPR | Hall. PR | Hall. RC | Hall. F1 | Hall. AUC | Hall. AUPR |",
+                "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in model_rows:
             lines.append(
                 f"| {row['rank']} | `{row['feature_set']}` | "
-                f"{_mean_std(row, 'precision')} | {_mean_std(row, 'recall')} | "
-                f"{_mean_std(row, 'f1')} | {_mean_std(row, 'accuracy')} | "
-                f"{_mean_std(row, 'auc')} | {_mean_std(row, 'aupr')} |"
+                f"{_mean_std(row, 'accuracy')} | "
+                f"{_mean_std(row, 'real_positive_precision')} | "
+                f"{_mean_std(row, 'real_positive_recall')} | "
+                f"{_mean_std(row, 'real_positive_f1')} | "
+                f"{_mean_std(row, 'real_positive_auc')} | "
+                f"{_mean_std(row, 'real_positive_aupr')} | "
+                f"{_mean_std(row, 'hallucination_positive_precision')} | "
+                f"{_mean_std(row, 'hallucination_positive_recall')} | "
+                f"{_mean_std(row, 'hallucination_positive_f1')} | "
+                f"{_mean_std(row, 'hallucination_positive_auc')} | "
+                f"{_mean_std(row, 'hallucination_positive_aupr')} |"
             )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _write_csv(path: Path, rows: list[dict]) -> None:
-    fieldnames = ["model", "model_label", "rank", "feature_set", "num_seeds", "seeds"]
+    fieldnames = [
+        "model",
+        "model_label",
+        "rank",
+        "feature_set",
+        "num_seeds",
+        "seeds",
+        "headline_positive_class",
+    ]
     for metric in METRICS:
         fieldnames.extend((f"{metric}_mean", f"{metric}_std"))
+    for class_prefix in CLASS_PREFIXES:
+        for metric in CLASS_METRICS:
+            key = f"{class_prefix}_{metric}"
+            fieldnames.extend((f"{key}_mean", f"{key}_std"))
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()

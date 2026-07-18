@@ -1,5 +1,71 @@
 # Current Task
 
+## 2026-07-18 POPE random-only MetaToken / SVAR 实验
+
+- 从现有 `object_hallucination_yes_only/baseline/features.pkl` 只筛选 POPE `random` strategy，不重新抽取 LVLM 特征；全部选中记录的 `response_token_idx=0`，与当前 `prompt_last_token` 协议数值等价。结果隔离写入 `baseline/object_hallucination_yes_only/random_only/`，未覆盖三种 strategy 合并结果。
+- 沿用现有严格 image-level 8:2：train/test=`1020/258` 条、`398/98` 张物理图；train 的 real/hall=`1006/14`，test=`250/8`。seeds=`42/43/44`，阈值只按 train Real-F1 选择，test 只评估。
+- 三 seed Test：MetaToken-LR Accuracy/Real-F1/AUROC/Hall-F1=`0.9690/0.9843/0.9130/0.0000`；MetaToken-GB=`0.9341±0.0032/0.9658±0.0017/0.8712±0.0016/0.1055±0.0045`；SVAR=`0.9690/0.9843/0.6163±0.0061/0.0000`。
+- MetaToken-LR 与 SVAR 在 train-F1 阈值下均把 258 个 test 样本全部预测为 real，所以高 Accuracy/Real-F1 来自 `250:8` 的严重类别失衡，不能解释为已检测到幻觉；AUROC 不依赖该阈值，MetaToken-LR 的排序能力明显高于 SVAR。
+
+## 2026-07-18 QA 判断位置改为 prompt 最后一个 token
+
+- QA 活动位置协议从 `answer_pre_token` 改为 `prompt_last_token`。DGST、ADS+CGC 与 MetaToken/SVAR/DHCP/ProjectAway/HalLoc 共享同一次 forward，固定请求 `response_token_index=0`；该输出对应完整 prompt 的最后一个因果状态，并预测 `response_token_ids[0]`。
+- 语义 yes/no 的 `answer_token_index` 仍会生成、保存和校验，只用于回答解析与标签正确性审计，不再决定特征抽取位置。因此即使模型以后先输出解释或前缀词，判断特征也不会从 prompt 末位置后移。
+- 根特征 schema 升级为 `qa-prompt-last-token-v5`，baseline protocol 升级为 `qa_prompt_last_token_image_level_probe_split_v3`；YAML、QA probe 特征名、完整性检查和跨方法 Markdown 汇总均同步使用 `prompt_last_token`，防止旧 answer-position 特征被静默当成新协议。
+- 当前 Qwen3 POPE 的 9000/9000 条生成中，语义 yes/no 都是 `response index=0`，因此本批旧特征与新协议的输入状态在数值上等价；协议升级主要消除未来出现回答前缀时的位置歧义。未覆盖或删除任何现有正式特征/训练结果。
+- 验证：新增的非首位 yes/no 测试使用 `response_ids=[99,7]`、`answer_token_index=1`，确认 wrapper 仍收到 `response_token_indices=[0]`、`target_token_ids=[99]`。禁用 CUDA 后 170 项 unittest 全部通过；另手动执行 10 项 pytest 风格 QA 测试全部通过；相关 Python 文件编译通过。当前环境未安装 pytest，直接运行 `python -m pytest` 报 `No module named pytest`，未修改环境。
+
+## 2026-07-18 QA 改为一次 forward 联合抽取所有特征族
+
+- `qa_benchmarks.extraction_mode` 现与 COCO 使用相同四种语义：`all | method_only | ads_cgc_only | baseline_only`；两份统一 YAML 的 QA 默认均为 `all`。family 的 `enabled` 开关仍会与 mode 共同生效。
+- `features/qa_extractor.py` 会先判断每道题缺失的根特征和 baseline protocol，再合并 DGST、ADS+CGC、MetaToken/SVAR/DHCP/ProjectAway/HalLoc 的 `ExtractionRequirements`。答案 token 只执行一次 LVLM forward，同一个 `ModelOutput` 同时提供给所有启用消费者。
+- baseline 特征仍隔离写入 `outputs/qa_benchmarks/<model>/<dataset>/baseline/<label_protocol>/`；`baseline_only` 不创建或覆盖根 `features.pkl`。resume 可以只补缺失 family：根特征已完整时只补 baseline，baseline 已完整时只补根特征。
+- 双卡 worker 继续按问题互斥分片；根特征写 worker 隔离目录，baseline 写 `part-workerNNN-*` 分片，父进程在所有 worker 成功后统一验证 cohort、cache、严格 8:2 split 和 manifest，再原子合并。
+- `run_qa.sh` 已移除第二次 `extract_qa_baselines.py` 调用。当前流程为：准备数据；生成+标注+联合抽取；训练 DGST/ADS+CGC；训练已抽取的 baseline；仅在 `all` 模式生成跨 family 汇总。部分模式会自动跳过不适用的训练器。
+- QA 根特征 schema 升级为 `qa-answer-token-v4`，记录实际 `feature_families`；fingerprint 与完整性检查包含 method/ADS+CGC 组合，防止不同 root schema 静默混用。
+- 验证：新增/更新测试覆盖四种 mode、`all` 一次 wrapper 调用、同一输出对象被根方法和 baseline 共用、`baseline_only` 不生成根特征。`CUDA_VISIBLE_DEVICES='' /opt/conda/private/envs/vicr/bin/python -m unittest discover -v tests` 共 170 项通过；双 YAML 解析、Python 编译、三个 QA shell 的 `bash -n` 与 `git diff --check` 通过。本轮未启动 8B 正式抽取。
+
+## 2026-07-18 QA 正式流水线改为双卡问题分片
+
+- `run_qa.sh` 默认导出 `CUDA_VISIBLE_DEVICES=0,1`，generation 与 DGST/ADS+CGC 特征抽取分别通过 `--generation-devices cuda:0 cuda:1`、`--feature-devices cuda:0 cuda:1` 启动两个 worker；native baseline 特征抽取也使用同一双卡列表。probe 与 baseline 训练仍只在 `DEVICE=cuda:0` 上运行，避免两个训练进程覆盖同一结果目录。
+- `scripts/qa_pipeline.py` 按稳定问题顺序 round-robin 划分互斥分片。generation worker 写入 `.qa_parallel/generation/workers-2/worker-*`，feature worker 写入 `.qa_parallel/features/workers-2/worker-*`；主进程只在所有 worker 正常退出后按原问题顺序原子合并 `generations.jsonl`、`features.pkl` 和失败记录，两个 GPU 不会并发改写同一主产物。
+- 双卡 resume 使用固定 worker 目录和原子 shard：已完成的 generation 会从主文件播种到对应 worker，feature worker 复用自己的 `features.parts`；任一 worker 中断后，下一次运行只重试缺失项。`--no-resume` 同时检查隐藏的并行目录，禁止意外复用旧 worker 数据。
+- `scripts/extract_qa_baselines.py` 增加 `--feature-devices`。worker 使用互斥问题分片以及 `part-workerNNN-*` 特征 shard；已有 `BaselineRuntime(parallel=True)` 负责将 DHCP shard 和 HalLoc cache 写入独立 worker 子目录，主进程最后统一验证 cohort、cache 和 split manifest 后生成正式 `features.pkl`。
+- `features/qa_baseline.py` 的 `QABaselineFeatureStore` 新增安全 `part_prefix`，同时兼容历史单卡 `part-*`，因此双卡与单卡 resume 可以读取同一事务日志。README 已补充双卡默认行为和显式单卡回退命令。
+- 新增 `tests/test_qa_parallel.py`，覆盖设备去重、稳定互斥分片以及两个 baseline worker shard 无文件名冲突并可确定性合并。验证命令：`CUDA_VISIBLE_DEVICES='' /opt/conda/private/envs/vicr/bin/python -m unittest discover -v tests`，共 168 项通过；`py_compile`、三个 QA shell 的 `bash -n` 与 `git diff --check` 均通过。本轮未启动 8B 正式数据运行。
+
+## 2026-07-17 COCO 与 QA 改为纯严格 8:2
+
+- 活动 COCO 与 QA 配置统一改为 train/test=`80%/20%`，顶层 `val=[]` 只作为旧产物结构的兼容字段；训练过程中不再创建任何内部验证集。
+- COCO4000 固定为 `3200/0/800` 张图片；POPE 固定为 `400/0/100` 张图片及 `7200/0/1800` 条问题；CLEVR-Exist 5K 固定从官方 train 取 4000 条、从官方 val 取 1000 条，官方 source split 保证物理图像不跨 train/test。
+- DGST、ADS+CGC、QA probe 与各 baseline 均固定训练 YAML 指定的完整 epochs，保存最后一轮 checkpoint；分类阈值只在训练集上按 Real-positive F1 选择，不 early stop，不根据 test 调参或选阈值。
+- baseline 为兼容旧训练函数可在训练集上额外计算诊断 loss/metrics，字段统一报告为 `train_monitor_loss` / `train_metrics`；它们不参与 checkpoint 或超参选择，阈值仅按前述 train-F1 规则确定。
+- 旧 8:1:1 `image_splits.json` 在下次流水线启动时自动备份后替换；特征本身与 split 无关，可以复用，但所有 probe/baseline 训练结果必须按新划分重跑。
+- YAML 显式设置 `training.threshold_selection=train_f1`；Torch、sklearn、QA 与全部 baseline 都保存 `threshold_selection=train_f1`，旧的固定 0.5/validation 阈值结果不能静默 resume。
+- 验证：166 项 unittest 与 13 项 pytest 风格 QA 纯函数测试通过；真实 POPE 准备结果为 7200/0/1800 条、400/0/100 图，真实 CLEVR 为 4000/0/1000 条、3900/0/975 个 source-image identity；Python/Shell 编译、双 YAML 断言及 `git diff --check` 均通过。未启动 8B 正式训练。
+
+## 2026-07-17 POPE/CLEVR 首轮改为 answer-token 单位置
+
+- POPE 与 CLEVR-Exist 的首轮 VQA 对比默认只启用 `answer_pre_token`；若实际生成的 yes/no token 位于 response index `i`，forward 严格使用 `response_ids[:i]`，最后一行因果状态预测保存的真实 token `response_ids[i]`。
+- QA 配置已合并进 `configs/model_configs_unified.yaml` 与 fj01 镜像；`qa_benchmarks.position_protocols` 只保留 `answer_pre_token`。特征提取每题只运行一次 answer-position forward，不运行 object forward；trainer 复用同一 YAML 的 `training.torch_probe`，因此默认仅训练 9 组：6 个 DGST 的 `risk+target_cosine+EV`、ADS、CGC、ADS+CGC。
+- 已删除独立的 `qa_benchmarks_unified.yaml` 和 `qa_benchmarks_server_fj01.yaml`；所有 QA 脚本、`run_qa.sh` 与服务器 coordinator 默认读取对应的统一模型 YAML。caption 的 `max_new_tokens=512` 保持不变，QA 仅通过 `qa_benchmarks.generation` 覆盖为 8。
+- 问题中 object word 的上下文化定位能力仍保留为可选消融；以后只需在 YAML 追加 `question_object_pre_token`。该路径使用问题字符区间、完整模板实际 token span，以及图像 token 展开后的 `j-1` prediction row，不会单独编码 object。
+- 修复可选 object 路径的重复词风险：模板解码仅改变空白时按整段问题做归一化映射；有精确字符区间却无法映射时直接报错，禁止静默回退到同词第一次出现。
+- answer-only 位置列表写入每条 feature 和 summary，resume 会校验位置配置；从 answer-only 改为双位置时不能错误复用缺少 object 的旧特征。
+- 取消旧 generation 缺位置时的“第一个普通 token”回退：generation 必须保存合法的 `answer_token_index/answer_token_id`，抽取器与 baseline 会重新定位并核验它确为实际生成的第一个 yes/no token；否则立即停止，不会拿错误位置继续训练。
+- QA 特征 schema 升级为 `qa-answer-token-v3`。resume 同时校验 generation、label、question、图片内容、image-level split、模型与 DGST/ADS/CGC 配置；probe 训练前再次核对内嵌标签/划分，旧结果也必须匹配训练输入指纹。
+- 对比汇总只描述 YAML 实际启用的位置；answer-only 报告不会再显示未运行的 object 消融说明或覆盖率。
+- `run_pope.sh` / `run_clevr.sh` 共用三阶段 `run_qa.sh`，并在训练后按实际 baseline label protocol 生成对比汇总。
+- 验证：完整 `unittest discover` 163 项通过；另有 7 项 pytest 风格 QA probe 纯函数测试手动执行通过；Shell、Python 编译与 `git diff --check` 通过。未启动任何 8B 模型正式实验。
+
+## 2026-07-17 VQA prompt object 因果预测 API
+
+- 新增独立 `PromptTargetRequest` 和五模型统一 `extract_prompt_target_features()`；它在真实完整问题的上下文 tokenization 中定位 object surface，多词对象保留完整 span、以首个实际子 token 为目标，并严格截断到该 token 之前。
+- 图像 placeholder 展开后重新计算目标位置，attention、hidden states、logits 和 DGST capture 全部来自同一个 `target_expanded_position - 1` prediction row；实际 target ID 可显式校验，并写入 `baseline_capture.prompt_target_alignment`。
+- 原 `validate_causal_batch_request()` 未修改，仍只允许 saved response index 对应的实际生成 token ID，问题中的 object token 不再伪装成 response target。
+- 新增 mock 测试覆盖 contextual BPE ID、实际 target ID 校验、多 token span、`j-1`、图像展开以及五 wrapper 接口；与旧因果测试共 13 项通过。
+- 完整 CPU unittest 共 152 项，151 项通过；唯一失败是并行开发中的 `detection/qa_probe.py:245` 存在 `IndentationError: expected an indented block`，与本 API 修改无关，待 QA probe 合并完成后重跑。
+
 ## 2026-07-17 Baseline 正类切换为 real
 
 - `training.baseline.positive_class` 默认设为 `real`；后续 MetaToken、SVAR、DHCP、ProjectAway、HalLoc 都在 validation 上使用 real probability 最大化 Real-F1 选择阈值，并同时保留 real/hallucination 两套指标。
@@ -1235,7 +1301,7 @@
 
 ## 2026-07-13 POPE / CLEVR-Exist 问答式幻觉检测
 
-- 新增独立服务器配置 `configs/qa_benchmarks_server_fj01.yaml`，没有覆盖历史实验 YAML。
+- 该阶段最初使用独立 QA 配置；现已将同一套 QA 设置合并到 `configs/model_configs_server_fj01.yaml` 的 `qa_benchmarks` 段，模型与训练参数继续和 COCO 共用。
 - 固定数据协议已生成到 `/root/rivermind-data/dataset/qa_benchmarks/`：
   - POPE：官方 random/popular/adversarial 共 9000 问；seed=42 按 500 张共享图片严格切为 400/50/50，对应 7200/900/900。
   - CLEVR：只使用官方 program 末操作为 `exist` 且有 yes/no GT 的问题；官方 train 抽 4000，官方 val 先切互斥 image pool 再各抽 val/test 500，共 5000。
@@ -1369,3 +1435,26 @@
 - Qwen3 `COCO4000-EV` 总图、PDF、逐层 CSV 和 Markdown 摘要写入实验 `results/`；统计使用完整 11,751 条样本，其中 hallucination 2,625、real 9,126。
 - 五条 Gaussian/raw-attention 分支的最大绝对 Hall-Real 均值差位于第 6 层；hpre direct target-probability 分支位于第 35 层。六个峰值差均为负，表示对应层 real 样本的平均 EV 更高。
 - 验证：脚本 `py_compile` 通过；CSV 严格包含 6 分支 × 36 层 = 216 行，全部均值/SEM/difference 有限；PNG 已人工检查布局与图例，`git diff --check` 通过。
+
+## 2026-07-17 Real-positive Torch probe 与 tuned risk+EV 实验
+
+- 根 Torch probe（DGST 方法和 ADS+CGC 共用）改为以 `real` 为训练/验证阈值选择/headline 正类；标签文件仍保持 `0=hallucination, 1=real`。每次评估同时保存 `real_positive` 和 `hallucination_positive` 的 precision、recall、F1、AUC、AUPR，accuracy 共用。
+- 单 seed Markdown 与三 seed 汇总均把 Real 指标放在前面，并在同一行补充 Hallucination 指标；三 seed 排名按 Real AUC、Real F1。汇总器拒绝混入旧的 Hall-positive headline 结果，避免不同阈值协议静默混算。
+- `model_configs_unified.yaml` 和 fj01 配置的 Torch MLP 参数统一为：hidden `[256,128,64]`、dropout `0.1`、lr `3e-4`、batch `128`、weight decay `0`、epochs `120`、early-stop patience `30`、LR factor/patience `0.5/4`，seeds `42,43,44`。
+- 在 `COCO4000-EV` 上只重跑 `hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine`，写入独立 `results/tuned_hpre_softmax_prob_gauss_risk_ev_seed{42,43,44}/`，未覆盖原 seed 结果。
+- tuned Test 三 seed mean±population-std：Accuracy `0.8370±0.0010`，Real P/R/F1 `0.8558±0.0051 / 0.9472±0.0093 / 0.8991±0.0014`，AUC `0.8867±0.0018`，Real AUPR `0.9597±0.0008`；Hall P/R/F1 `0.7335±0.0227 / 0.4736±0.0267 / 0.5745±0.0122`，Hall AUPR `0.7046±0.0132`。
+- 旧参数且以 Hall 为正类/阈值目标的同一特征组合 AUC 为 `0.8847±0.0046`，新参数 AUC 约提升 `0.0020`；F1 因正类与 validation 阈值目标改变不能直接横向比较。
+- 汇总：`outputs/qwen3_vl_8b/COCO4000-EV/results/qwen3_vl_8b_hpre_softmax_prob_gauss_risk_ev_tuned_3seed_summary.md`。
+- 验证：首次全仓 `unittest discover -v tests` 的 135 项中，旧断言 `test_active_yaml_enables_raw_attention_control` 仍期待 `positive_class=hallucination`，因此 1 项失败；更新为 `real` 后完整重跑 `135/135` 通过，`bash -n run.sh` 与 `git diff --check` 通过。
+
+## 2026-07-18 AMBER discriminative VQA
+
+- 接入用户本机完整 AMBER：`/home/apulis-dev/userdata/AMBER`，读取官方 14,216 条 discriminative Yes/No 问题和 1004 张图片；按 existence 4,924、attribute 7,628、relation 1,664 保存来源维度。
+- 严格 seed-42 物理图片级 8:2：803 train / 201 test，问题行分别为 11,385 / 2,831；同一图片跨三个问题维度始终落在同一 split，避免图片泄漏。
+- `amber_discriminative` 已接入统一 `run_qa.sh`，并新增薄入口 `run_amber.sh`；与 POPE/CLEVR 一样只抽取完整 prompt 的最后一个 token causal row，联合支持 DGST、ADS+CGC 和启用的 baseline。
+- 首次双卡正式生成暴露 AMBER 原图最高 54 MP，Qwen3 动态视觉 eager attention 对单图申请约 116--125 GiB。已中止且完整归档为 `amber_discriminative-uncapped-failed-20260718T183616Z`，没有与正式结果混用。
+- YAML 新增仅对 AMBER 生效的 `dataset_model_overrides.amber_discriminative.max_pixels: 200704`；生成与抽取共享同一视觉网格，不影响 COCO/POPE/CLEVR。最大 6000x9000 图实机 smoke 得到 grid 34x22、输出 `yes`、峰值 allocated 16.459 GiB。
+- 验证：全仓 `unittest discover` 170/170 通过，AMBER 的函数式 split/leakage 检查通过，`py_compile`、`bash -n` 和 `git diff --check` 通过。
+- Qwen3 正式双卡生成 14,216/14,216 完成，generation failure 为 0。原始模型整体 accuracy `0.88555`；existence/attribute/relation 分别为 `0.91511/0.86995/0.86959`，严格 test 图片集为 `0.89686`。错误为 930 false-positive 与 697 false-negative；yes-only cohort 为 4,092 real / 930 hallucination。
+- 随后已启动 prompt-last-token 联合抽取，DGST、ADS+CGC 与 MetaToken/SVAR/DHCP/ProjectAway 共用每题一次 LVLM forward；双卡前 125 条分片成功、extraction failure 为 0，完整任务继续断点运行。
+- 用户随后要求暂不提取 DHCP。已在 500 条 root 分片后安全停止 worker，保留 DGST/ADS+CGC 原子分片；活动 YAML 的抽取和训练 baseline 列表均移除 DHCP，已产生的含 DHCP baseline 子目录整体归档，恢复后 baseline 仅抽取 MetaToken/SVAR/ProjectAway。

@@ -16,6 +16,7 @@ from models.base_wrapper import (
     ExtractionRequirements,
     GenerationOutput,
     ModelOutput,
+    PromptTargetRequest,
     compact_response_logit_statistics,
 )
 from models.dgst_capture import (
@@ -28,6 +29,10 @@ from models.dgst_capture import (
     resolve_prompt_positions,
     run_forward_with_dgst_captures,
     run_forward_with_layer_hidden_captures,
+)
+from models.prompt_target import (
+    extract_prompt_target_from_inputs,
+    resolve_prompt_target_alignment,
 )
 from features.dgst_t import (
     compute_dgst_t_batch_from_captures,
@@ -629,6 +634,57 @@ class LLaVAWrapper(BaseLVLMWrapper):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         return outputs
+
+    def extract_prompt_target_features(
+        self,
+        image: Image.Image,
+        request: PromptTargetRequest,
+        cfg_dgst_t: Optional[dict[str, Any]] = None,
+        requirements: Optional[ExtractionRequirements] = None,
+    ) -> ModelOutput:
+        prompt_text = _format_llava_prompt(request.prompt)
+        prompt_inputs = self.processor(
+            text=prompt_text,
+            images=image,
+            return_tensors="pt",
+        )
+        inputs = _append_prefix_token_ids(
+            prompt_inputs,
+            prefix_token_ids=[],
+            device=self.device,
+            dtype=torch.float16,
+        )
+        input_ids = inputs["input_ids"][0]
+        image_token_id = int(
+            getattr(self.model.config, "image_token_index", IMAGE_TOKEN_INDEX)
+        )
+        image_positions = (input_ids == image_token_id).nonzero(as_tuple=True)[0]
+        if int(image_positions.numel()) > 0:
+            visual_start = int(image_positions[0].item())
+            visual_end = visual_start + NUM_VISUAL_TOKENS
+        else:
+            visual_start, visual_end = self._find_img_range_from_embeds(inputs)
+        alignment = resolve_prompt_target_alignment(
+            tokenizer=self.tokenizer,
+            full_input_ids=input_ids.tolist(),
+            request=request,
+            image_token_id=image_token_id,
+            visual_token_count=visual_end - visual_start,
+        )
+        return extract_prompt_target_from_inputs(
+            wrapper=self,
+            inputs=inputs,
+            full_input_ids=input_ids.tolist(),
+            alignment=alignment,
+            visual_start=visual_start,
+            visual_end=visual_end,
+            image_token_id=image_token_id,
+            visual_grid=(24, 24),
+            cfg_dgst_t=cfg_dgst_t,
+            requirements=requirements,
+            model_name="LLaVA-1.5",
+            support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+        )
 
 
     def _find_img_range_from_embeds(self, inputs: dict) -> Tuple[int, int]:

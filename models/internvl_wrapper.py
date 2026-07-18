@@ -13,6 +13,7 @@ from models.base_wrapper import (
     ExtractionRequirements,
     GenerationOutput,
     ModelOutput,
+    PromptTargetRequest,
     compact_response_logit_statistics,
 )
 from models.dgst_capture import (
@@ -26,6 +27,10 @@ from models.dgst_capture import (
     run_forward_with_layer_hidden_captures,
 )
 from models.prompt_support import resolve_prompt_support_positions
+from models.prompt_target import (
+    extract_prompt_target_from_inputs,
+    resolve_prompt_target_alignment,
+)
 from features.dgst_t import (
     compute_dgst_t_batch_from_captures,
     compute_four_gate_dgst_batch_from_captures,
@@ -676,6 +681,53 @@ class InternVLWrapper(BaseLVLMWrapper):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         return outputs
+
+    def extract_prompt_target_features(
+        self,
+        image: Image.Image,
+        request: PromptTargetRequest,
+        cfg_dgst_t: Optional[dict[str, Any]] = None,
+        requirements: Optional[ExtractionRequirements] = None,
+    ) -> ModelOutput:
+        pixel_values = self._preprocess_image(image)
+        input_ids, visual_start, visual_end = self._build_input_ids_with_image(
+            pixel_values,
+            prefix_token_ids=[],
+            user_prompt=request.prompt,
+        )
+        attention_mask = torch.ones_like(input_ids)
+        image_flags = torch.ones(
+            pixel_values.shape[0],
+            dtype=torch.long,
+            device=self.device,
+        )
+        inputs = {
+            "input_ids": input_ids.to(self.device),
+            "attention_mask": attention_mask.to(self.device),
+            "pixel_values": pixel_values.to(self.device),
+            "image_flags": image_flags,
+        }
+        alignment = resolve_prompt_target_alignment(
+            tokenizer=self.tokenizer,
+            full_input_ids=input_ids[0].tolist(),
+            request=request,
+            image_token_id=self._img_ctx_id,
+            visual_token_count=visual_end - visual_start,
+        )
+        return extract_prompt_target_from_inputs(
+            wrapper=self,
+            inputs=inputs,
+            full_input_ids=input_ids[0].tolist(),
+            alignment=alignment,
+            visual_start=visual_start,
+            visual_end=visual_end,
+            image_token_id=self._img_ctx_id,
+            visual_grid=_square_visual_grid(visual_end - visual_start),
+            cfg_dgst_t=cfg_dgst_t,
+            requirements=requirements,
+            model_name="InternVL",
+            support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
+        )
 
 
     def _preprocess_image(self, image: Image.Image) -> torch.Tensor:

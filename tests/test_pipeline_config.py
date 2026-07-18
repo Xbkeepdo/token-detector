@@ -14,6 +14,7 @@ sys.path.insert(0, ROOT)
 from utils.config_utils import extraction_mode_flags, resolve_run_config
 from utils.generation_provenance import build_generation_manifest
 from utils.split_utils import (
+    build_strict_82_split,
     build_strict_811_split,
     ensure_strict_811_split,
     validate_strict_811_split,
@@ -61,6 +62,18 @@ def _minimal_config() -> dict:
 
 
 class PipelineConfigTests(unittest.TestCase):
+    def test_strict_82_is_deterministic_and_has_no_validation(self) -> None:
+        image_ids = list(range(10_000, 14_000))
+        shuffled = image_ids.copy()
+        random.Random(999).shuffle(shuffled)
+        first = build_strict_82_split(image_ids, seed=42)
+        second = build_strict_82_split(shuffled, seed=42)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            {name: len(values) for name, values in first.items()},
+            {"train": 3200, "val": 0, "test": 800},
+        )
+
     def test_strict_811_is_deterministic_and_order_independent(self) -> None:
         image_ids = list(range(10_000, 14_000))
         shuffled = image_ids.copy()
@@ -445,7 +458,7 @@ class PipelineConfigTests(unittest.TestCase):
             first = json.loads(
                 (output / "pipeline_manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(first["manifest_version"], 3)
+            self.assertEqual(first["manifest_version"], 4)
             self.assertEqual(first["labeling_schema_version"], "2")
             self.assertEqual(
                 first["labeling_primary_locator"],
@@ -522,7 +535,7 @@ class PipelineConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (source / "image_splits.json").write_text(
-                json.dumps(build_strict_811_split(expected_ids, seed=42)),
+                json.dumps(build_strict_82_split(expected_ids, seed=42)),
                 encoding="utf-8",
             )
             (source / "labeling.json").write_text("{}", encoding="utf-8")

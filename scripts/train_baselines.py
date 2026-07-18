@@ -44,7 +44,7 @@ from features.baseline import (
 from scripts.training_provenance import load_validated_training_features
 from utils.config_utils import load_config
 from utils.io_utils import load_json, save_json, save_pkl
-from utils.split_utils import validate_strict_811_split
+from utils.split_utils import validate_strict_82_split
 
 
 DEFAULT_METHODS = ("metatoken", "svar", "dhcp", "projectaway", "halloc")
@@ -96,6 +96,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    if str((config.get("training") or {}).get("split_protocol", "strict_82_no_validation")) != "strict_82_no_validation":
+        raise ValueError(
+            "Training requires training.split_protocol=strict_82_no_validation"
+        )
+    if str((config.get("training") or {}).get("threshold_selection", "train_f1")) != "train_f1":
+        raise ValueError(
+            "Strict 8:2 training requires training.threshold_selection=train_f1"
+        )
     baseline_cfg = baseline_config(config)
     training_cfg = _baseline_training_config(config)
     baseline_dir = Path(args.output_dir) / str(
@@ -105,7 +113,7 @@ def main() -> None:
     if not split_path.exists():
         raise FileNotFoundError(split_path)
     image_splits = load_json(str(split_path))
-    image_split_counts = validate_strict_811_split(image_splits)
+    image_split_counts = validate_strict_82_split(image_splits)
     configured_count = int((config.get("dataset") or {}).get("num_images", 0))
     if configured_count and sum(image_split_counts.values()) != configured_count:
         raise ValueError(
@@ -378,6 +386,7 @@ def _run_training_protocol(
     for seed in seeds:
         seed_cfg = dict(baseline_cfg)
         seed_cfg["seed"] = int(seed)
+        seed_cfg["_strict_82_no_validation"] = True
         effective_run_name = run_name
         if effective_run_name is None and len(seeds) > 1:
             effective_run_name = f"seed{seed}"
@@ -455,22 +464,31 @@ def _train_one_seed(
         "counts": {name: len(rows) for name, rows in split_records.items()},
         "image_split_counts": image_split_counts,
         "methods": {},
+        "split_protocol": "strict_82_no_validation",
+        "checkpoint_selection": "last_epoch",
+        "threshold_selection": "train_f1",
     }
     if sample_audit is not None:
         output["sample_audit"] = dict(sample_audit)
+
+    training_records = dict(split_records)
+    # The baseline implementations retain a ``val_metrics`` compatibility
+    # field. Under pure 8:2 it reports train diagnostics only; it is never used
+    # for checkpoint or threshold selection.
+    training_records["val"] = list(split_records["train"])
 
     for method in methods:
         print(f"[BaselineTrain] seed={seed} method={method} device={device}")
         if method == "metatoken":
             result = _train_metatoken(
-                split_records,
+                training_records,
                 checkpoint_dir,
                 baseline_cfg,
                 positive_class,
             )
         elif method == "svar":
             result = _train_svar(
-                split_records,
+                training_records,
                 checkpoint_dir,
                 baseline_cfg,
                 device,
@@ -478,7 +496,7 @@ def _train_one_seed(
             )
         elif method == "dhcp":
             result = _train_dhcp(
-                split_records,
+                training_records,
                 baseline_dir,
                 checkpoint_dir,
                 baseline_cfg,
@@ -486,21 +504,39 @@ def _train_one_seed(
                 positive_class,
             )
         elif method == "projectaway":
-            result = _evaluate_projectaway(split_records, positive_class)
+            result = _evaluate_projectaway(
+                training_records,
+                positive_class,
+                strict_82_no_validation=True,
+            )
         else:
             result = _train_halloc(
-                split_records,
+                training_records,
                 baseline_dir,
                 checkpoint_dir,
                 baseline_cfg,
                 device,
                 positive_class,
             )
+        _rename_train_diagnostics(result)
         output["methods"][method] = result
         save_json(output, str(result_path))
 
     print(f"[BaselineTrain] saved {result_path}")
     return output, result_path
+
+
+def _rename_train_diagnostics(result: dict[str, Any]) -> None:
+    """Expose compatibility ``val`` evaluations honestly as train diagnostics."""
+
+    variants = result.values() if all(
+        isinstance(value, Mapping) for value in result.values()
+    ) and set(result).issubset({"lr", "gb"}) else (result,)
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        if "val_metrics" in variant:
+            variant["train_metrics"] = variant.pop("val_metrics")
 
 
 def _baseline_training_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -639,7 +675,7 @@ def aggregate_baseline_outputs(
     for key in expected:
         display_name = first_variants[key][0]
         row: dict[str, Any] = {"display_name": display_name}
-        for split in ("val", "test"):
+        for split in ("train", "test"):
             seed_metrics = [
                 _headline_metrics(
                     _baseline_method_variants(output)[key][1],
@@ -675,6 +711,9 @@ def aggregate_baseline_outputs(
         "image_split_counts": outputs[0].get("image_split_counts"),
         "configured_methods": outputs[0].get("configured_methods"),
         "sample_audit": outputs[0].get("sample_audit"),
+        "split_protocol": outputs[0].get("split_protocol"),
+        "checkpoint_selection": outputs[0].get("checkpoint_selection"),
+        "threshold_selection": outputs[0].get("threshold_selection"),
         "methods": rows,
     }
 
@@ -756,10 +795,6 @@ def _write_baseline_markdown(
     )
     positive_label = "Real" if positive_class == "real" else "Hall."
     other_label = "Hall." if positive_class == "real" else "Real"
-    source_positive_classes = set(
-        str(value)
-        for value in summary.get("source_headline_positive_classes", [])
-    )
     experiment_name = (
         "SVAR Official"
         if "official_svar" in label_protocol
@@ -773,13 +808,8 @@ def _write_baseline_markdown(
         f"- 随机种子：`{', '.join(str(seed) for seed in seeds)}`。",
         f"- headline 正类：{positive_class}。",
         f"- 标签协议：`{label_protocol or 'unknown'}`。",
-        (
-            f"- 阈值在 validation set 上按 {positive_label} F1 选择，"
-            "test set 只用于最终评估。"
-            if source_positive_classes == {positive_class}
-            else "- 当前汇总切换为 Real-positive 展示；原始 JSON 的阈值按 "
-            "validation Hallucination-F1 选择，尚未重新选 Real-F1 阈值。"
-        ),
+        "- 严格 8:2 无验证集：固定训练轮数，使用最后一轮权重，阈值只在 train 上按正类 F1 选择。",
+        "- test set 只用于最终评估，不用于调参、早停或选阈值。",
         f"- image split：train/val/test = "
         f"{image_counts.get('train', '?')}/{image_counts.get('val', '?')}/"
         f"{image_counts.get('test', '?')}。",
@@ -848,7 +878,7 @@ def _write_baseline_markdown(
     lines.extend(
         [
             "",
-            "## Validation 结果",
+            "## Train 诊断结果（不用于选模型或阈值）",
             "",
             f"| 方法 | Accuracy | {positive_label} Precision | "
             f"{positive_label} Recall | {positive_label} F1 | AUROC | AUPR | "
@@ -857,7 +887,7 @@ def _write_baseline_markdown(
         ]
     )
     for row in methods.values():
-        metrics = row["val_metrics"]
+        metrics = row["train_metrics"]
         lines.append(
             f"| {row['display_name']} | "
             + " | ".join(
@@ -942,6 +972,7 @@ def _train_metatoken(
         )
         val_scores = sklearn_hallucination_scores(classifier, matrices["val"][0])
         test_scores = sklearn_hallucination_scores(classifier, matrices["test"][0])
+        strict_82 = bool(cfg.get("_strict_82_no_validation", False))
         threshold = select_detection_threshold(
             matrices["val"][1],
             val_scores,
@@ -972,6 +1003,11 @@ def _train_metatoken(
                 positive_class=positive_class,
             ),
             "checkpoint": str(path),
+            "selection_protocol": (
+                "fixed_last_fit_train_f1_threshold"
+                if strict_82
+                else "validation_selected"
+            ),
         }
     return result
 
@@ -989,6 +1025,7 @@ def _train_svar(
     }
     svar_cfg = dict(cfg.get("svar") or {})
     seed = int(cfg.get("seed", 42))
+    strict_82 = bool(cfg.get("_strict_82_no_validation", False))
     # Seed before module construction so the requested run seed controls both
     # SVAR's initial weights and the subsequent minibatch order.
     _seed_everything(seed)
@@ -1015,6 +1052,9 @@ def _train_svar(
         ),
         seed=seed,
         positive_class=positive_class,
+        strict_82_no_validation=bool(
+            cfg.get("_strict_82_no_validation", False)
+        ),
     )
     path = checkpoint_dir / "svar.pt"
     _atomic_torch_save(
@@ -1032,10 +1072,17 @@ def _train_svar(
             "hidden_dim": int(_setting(svar_cfg, "hidden_dim", "hidden_size", default=248)),
             "learning_rate": float(svar_cfg.get("learning_rate", 1e-3)),
             "epochs": int(_setting(svar_cfg, "epochs", "max_epochs", default=50)),
-            "early_stopping_patience": int(
-                svar_cfg.get("early_stopping_patience", 5)
+            "early_stopping_patience": (
+                None
+                if strict_82
+                else int(svar_cfg.get("early_stopping_patience", 5))
             ),
             "positive_class": str(positive_class),
+            "selection_protocol": (
+                "fixed_last_epoch_train_f1_threshold"
+                if strict_82
+                else "validation_selected"
+            ),
         },
         "input_dim": int(matrices["train"][0].shape[1]),
         "threshold": trained.threshold,
@@ -1089,6 +1136,7 @@ def _train_dhcp(
         datasets["train"], batch_size=batch_size, sampler=sampler, num_workers=0
     )
     val_loader = DataLoader(datasets["val"], batch_size=batch_size, num_workers=0)
+    strict_82 = bool(cfg.get("_strict_82_no_validation", False))
     best_loss = math.inf
     best_state = None
     history = []
@@ -1106,14 +1154,19 @@ def _train_dhcp(
             optimizer.step()
             losses.append(float(loss.item()))
         val_loss, _ = _stream_scores(model, val_loader, device, criterion)
-        history.append(
-            {
-                "epoch": epoch + 1,
-                "train_loss": float(np.mean(losses)),
-                "val_loss": val_loss,
+        epoch_row = {
+            "epoch": epoch + 1,
+            "train_loss": float(np.mean(losses)),
+        }
+        epoch_row["train_monitor_loss" if strict_82 else "val_loss"] = val_loss
+        history.append(epoch_row)
+        if strict_82:
+            best_loss = val_loss
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
             }
-        )
-        if val_loss < best_loss:
+        elif val_loss < best_loss:
             best_loss = val_loss
             stale_epochs = 0
             best_state = {
@@ -1160,7 +1213,7 @@ def _train_dhcp(
             "learning_rate": float(dhcp_cfg.get("learning_rate", 1e-3)),
             "batch_size": batch_size,
             "epochs": dhcp_epochs,
-            "early_stopping_patience": patience,
+            "early_stopping_patience": None if strict_82 else patience,
             "weighted_sampler": True,
             "positive_class": str(positive_class),
         },
@@ -1182,10 +1235,20 @@ def _train_dhcp(
         ),
         "history": history,
         "checkpoint": str(path),
+        "selection_protocol": (
+            "fixed_last_epoch_train_f1_threshold"
+            if strict_82
+            else "validation_selected"
+        ),
     }
 
 
-def _evaluate_projectaway(split_records, positive_class) -> dict[str, Any]:
+def _evaluate_projectaway(
+    split_records,
+    positive_class,
+    *,
+    strict_82_no_validation: bool = False,
+) -> dict[str, Any]:
     scores, labels = {}, {}
     for split in ("val", "test"):
         payloads = [
@@ -1206,7 +1269,9 @@ def _evaluate_projectaway(split_records, positive_class) -> dict[str, Any]:
     return {
         "paper_config": {
             "training_free": True,
-            "threshold_selected_on": "val",
+            "threshold_selected_on": (
+                "train_f1" if strict_82_no_validation else "val"
+            ),
             "positive_class": str(positive_class),
         },
         "threshold": threshold,
@@ -1235,6 +1300,7 @@ def _train_halloc(
     positive_class,
 ):
     seed = int(cfg.get("seed", 42))
+    strict_82 = bool(cfg.get("_strict_82_no_validation", False))
     _seed_everything(seed)
     datasets = {
         split: HalLocCachedDataset(split_records[split], baseline_dir)
@@ -1311,17 +1377,22 @@ def _train_halloc(
             losses.append(float(loss.item()))
         val_loss, _ = _halloc_scores(model, loaders["val"], device, criterion)
         learning_rate = float(optimizer.param_groups[0]["lr"])
-        history.append(
-            {
-                "epoch": epoch + 1,
-                "train_loss": float(np.mean(losses)),
-                "val_loss": val_loss,
-                "learning_rate": learning_rate,
-            }
-        )
+        epoch_row = {
+            "epoch": epoch + 1,
+            "train_loss": float(np.mean(losses)),
+            "learning_rate": learning_rate,
+        }
+        epoch_row["train_monitor_loss" if strict_82 else "val_loss"] = val_loss
+        history.append(epoch_row)
         if scheduler is not None:
             scheduler.step()
-        if val_loss < best_loss:
+        if strict_82:
+            best_loss = val_loss
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+        elif val_loss < best_loss:
             best_loss = val_loss
             stale_epochs = 0
             best_state = {
@@ -1369,7 +1440,7 @@ def _train_halloc(
             **paper,
             "max_epochs": halloc_epochs,
             "scheduler": scheduler_name,
-            "early_stopping_patience": patience,
+            "early_stopping_patience": None if strict_82 else patience,
             "positive_class": str(positive_class),
         },
         "threshold": threshold,
@@ -1388,6 +1459,11 @@ def _train_halloc(
         ),
         "history": history,
         "checkpoint": str(path),
+        "selection_protocol": (
+            "fixed_last_epoch_train_f1_threshold"
+            if strict_82
+            else "validation_selected"
+        ),
     }
 
 
@@ -1517,12 +1593,15 @@ def _setting(
 
 
 def _require_strict_splits(split_records) -> None:
-    for name in ("train", "val", "test"):
+    if split_records["val"]:
+        raise ValueError("Strict 8:2 requires an empty validation split")
+    for name in ("train", "test"):
         rows = split_records[name]
         labels = {int(row["label"]) for row in rows}
         if not rows or labels != {0, 1}:
             raise ValueError(
-                f"Strict 8:1:1 requires both classes in {name}; got labels={labels}"
+                "Strict outer-8:2 training requires both classes in the "
+                f"effective {name} partition; got labels={labels}"
             )
 
 

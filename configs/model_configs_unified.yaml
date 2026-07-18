@@ -1,4 +1,4 @@
-# Unified COCO hallucination-detection experiment settings.
+# Unified COCO caption and POPE/CLEVR/AMBER QA hallucination-detection settings.
 #
 # `run.sh` only selects model/output/devices and invokes the three stages.
 # Prompt, extraction families, DGST branches and training behavior live here.
@@ -21,6 +21,43 @@ labeling:
   save_all_mentions: true                  # Preserve occurrence-level CHAIRs/CHAIRi statistics.
   save_svar_official_samples: true         # Also build the paper-code canonical/surface lookup samples.
   alignment_failure_policy: "error"        # error | skip; never substitute a neighbouring token.
+
+# QA-only dataset/protocol settings. Models, DGST, ADS/CGC, baseline heads and
+# probe hyperparameters are shared with the COCO sections below.
+qa_benchmarks:
+  # QA uses the same four extraction modes as COCO. "all" shares one answer-
+  # token forward across DGST, ADS+CGC and every enabled baseline.
+  extraction_mode: "all"                  # all | method_only | ads_cgc_only | baseline_only
+  baseline_label_protocols:
+    - "object_hallucination_yes_only"
+    - "answer_correctness_all"
+  pope_dir: "/home/apulis-dev/userdata/datasets/POPE"
+  coco_image_dir: "/home/apulis-dev/userdata/datasets/POPE/val2014"
+  clevr_root: "/home/apulis-dev/userdata/datasets/CLEVR_v1.0"
+  amber_root: "/home/apulis-dev/userdata/AMBER"
+  prepared_root: "/home/apulis-dev/userdata/datasets/qa_benchmarks"
+  output_root: "/home/apulis-dev/userdata/CODEX/test-cocochair/token-detector/outputs/qa_benchmarks"
+  split: "strict_image_level_82"
+  split_seed: 42
+  generation:
+    max_new_tokens: 8                     # Overrides caption generation's 512 only for QA.
+    temperature: 0.1
+    top_p: 0.5
+  # AMBER contains native images up to 54 MP. Qwen-family dynamic vision must
+  # bound those images or eager attention can request over 100 GiB. This
+  # override is applied to both generation and feature extraction, and does
+  # not change COCO, POPE, or CLEVR preprocessing.
+  dataset_model_overrides:
+    amber_discriminative:
+      max_pixels: 200704
+  # Use the prompt's final causal row (it predicts response_token_ids[0]).
+  # Add "question_object_pre_token" later for the optional object-position ablation.
+  position_protocols:
+    - "prompt_last_token"
+  label_protocols:
+    - "object_hallucination_yes_only"
+    - "answer_correctness_all"
+  clevr_object_coverage_policy: "report_locatable_subset"
 
 models:
   llava_1_5_7b:
@@ -116,7 +153,7 @@ feature_extraction:
   baseline:
     enabled: true
     output_subdir: "baseline"
-    methods: ["metatoken", "svar", "dhcp", "projectaway", "halloc"]
+    methods: ["metatoken", "svar", "projectaway"]           # Optional: "dhcp", "halloc"
     seed: 42
     metatoken:
       classifiers: ["lr", "gb"]             # LR(lbfgs), GB(100 estimators).
@@ -129,7 +166,6 @@ feature_extraction:
       learning_rate: 0.001
       batch_size: 32
       epochs: 50
-      early_stopping_patience: 5             # Validation loss only.
     dhcp:
       # Cross-backbone adaptation: dynamic visual grids are mass-preservingly
       # resized to a fixed shape. The original LLaVA DHCP uses native P=576.
@@ -138,7 +174,6 @@ feature_extraction:
       learning_rate: 0.001
       batch_size: 1024
       epochs: 30
-      early_stopping_patience: 5
       shard_dtype: "float16"
     projectaway:
       detection_only: true
@@ -152,7 +187,6 @@ feature_extraction:
       batch_size: 16
       epochs: 25
       scheduler: "cosine"
-      early_stopping_patience: 3
 
   ads:
     top_patch_pct: 0.10
@@ -215,30 +249,37 @@ dataset:
   annotation_file: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco/annotations/instances_val2014.json"
   captions_file: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco/annotations/captions_val2014.json"
   num_images: 4000
-  split_strategy: "strict_811"               # Mutually exclusive image-level split.
+  split_strategy: "strict_82"                # Outer train/test=80/20, image-disjoint.
   train_ratio: 0.80
-  val_ratio: 0.10
-  test_ratio: 0.10
+  val_ratio: 0.00                             # No validation split in the strict 8:2 protocol.
+  test_ratio: 0.20
   seed: 42
   # Cross-model master split.  A different 4,000-image cohort is rejected.
-  shared_split_path: "outputs/shared/COCO4000_seed42_image_splits_811.json"
+  shared_split_path: "outputs/shared/COCO4000_seed42_image_splits_82.json"
 
 # Root features.pkl probe settings. Names are aliases registered by the
 # feature-training implementation and are read directly by train_and_eval.py.
 training:
   trainer: "torch_mlp"                     # torch_mlp | sklearn
-  positive_class: "hallucination"          # hallucination | real
+  positive_class: "real"                   # real headline; hallucination metrics are also reported.
+  split_protocol: "strict_82_no_validation" # Fixed epochs, last checkpoint, train-F1 threshold.
+  threshold_selection: "train_f1"          # Select the Real-positive F1 threshold on train only.
   baseline:
     # Training-only selection: this does not change/re-extract baseline/features.pkl.
     # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
-    methods: ["metatoken", "svar", "dhcp", "projectaway"]
-    positive_class: "real"                  # real | hallucination; selects val threshold and headline metrics.
+    methods: ["metatoken", "svar", "projectaway"]
+    positive_class: "real"                  # real | hallucination; train F1 selects its threshold.
     seeds: [42, 43, 44]                     # Use [42] for a quick single-seed run.
     write_summary: true                     # Per-seed MD + aggregate mean/std MD.
   torch_probe:
-    batch_size: 256
-    num_epochs: 100
-    early_stopping_patience: 10
+    hidden_sizes: [256, 128, 64]
+    dropout: 0.1
+    learning_rate: 0.0003
+    batch_size: 128
+    weight_decay: 0.0
+    num_epochs: 120
+    lr_factor: 0.5
+    lr_patience: 4
     seeds: [42, 43, 44]                     # Shared by method and ADS+CGC probes.
   feature_sets:
     method:

@@ -14,7 +14,7 @@ export DGST_COST_VARIANT_EMD_BACKEND="${DGST_COST_VARIANT_EMD_BACKEND:-process}"
 exec /opt/conda/envs/td/bin/python scripts/qa_pipeline.py \
   --model "$1" \
   --dataset "$2" \
-  --config configs/qa_benchmarks_server_fj01.yaml \
+  --config configs/model_configs_server_fj01.yaml \
   --output-root outputs/qa_benchmarks \
   --stage all \
   --checkpoint-every 10 \

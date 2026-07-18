@@ -103,7 +103,7 @@ class RawAttentionIntegrationTests(unittest.TestCase):
             method_sets,
         )
         self.assertEqual(config["training"]["trainer"], "torch_mlp")
-        self.assertEqual(config["training"]["positive_class"], "hallucination")
+        self.assertEqual(config["training"]["positive_class"], "real")
 
 
 if __name__ == "__main__":

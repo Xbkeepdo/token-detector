@@ -26,8 +26,13 @@ from features.extractor import (
 )
 from models.base_wrapper import AttentionRequirement, ExtractionRequirements
 from utils.io_utils import load_pkl
-from detection.train import select_decision_threshold
-from train_torch_probe_feature_sets import _select_validation_threshold
+from detection.train import grid_search, select_decision_threshold
+from train_torch_probe_feature_sets import (
+    TorchProbeConfig,
+    _metrics_from_probs,
+    _select_f1_threshold,
+    train_and_evaluate_probe,
+)
 from train_feature_sets import (
     _require_strict_binary_splits,
     build_selected_matrix,
@@ -193,7 +198,7 @@ class ExtractionModeTests(unittest.TestCase):
     def test_strict_trainer_never_substitutes_a_split(self) -> None:
         good_x = np.ones((2, 1), dtype=np.float32)
         good_y = np.array([0, 1], dtype=np.int32)
-        with self.assertRaisesRegex(ValueError, "Splits are never substituted"):
+        with self.assertRaisesRegex(ValueError, "empty validation split"):
             _require_strict_binary_splits(
                 feature_set="ads",
                 train=(good_x, good_y),
@@ -201,14 +206,100 @@ class ExtractionModeTests(unittest.TestCase):
                 test=(good_x, good_y),
             )
 
-    def test_probe_thresholds_are_selected_from_validation_scores(self) -> None:
+    def test_f1_threshold_helpers_select_from_supplied_scores(self) -> None:
         labels = np.array([1, 0, 1, 0], dtype=np.int32)
         scores = np.array([0.40, 0.30, 0.35, 0.20], dtype=np.float32)
         sklearn_threshold = select_decision_threshold(labels, scores)
-        torch_threshold = _select_validation_threshold(labels, scores)
+        torch_threshold = _select_f1_threshold(labels, scores)
         self.assertAlmostEqual(sklearn_threshold, 0.35, places=6)
         self.assertAlmostEqual(torch_threshold, 0.35, places=6)
         self.assertNotEqual(sklearn_threshold, 0.5)
+
+    def test_strict_82_sklearn_threshold_is_selected_on_train(self) -> None:
+        X_train = np.asarray(
+            [[0.0], [0.1], [0.2], [0.8], [0.9], [1.0]],
+            dtype=np.float32,
+        )
+        y_train = np.asarray([0, 0, 0, 1, 1, 1], dtype=np.int32)
+        classifier, _params, train_f1 = grid_search(
+            "rf",
+            {"max_depth": [2], "n_estimators": [8]},
+            X_train,
+            y_train,
+            np.empty((0, 1), dtype=np.float32),
+            np.empty((0,), dtype=np.int32),
+            scoring="f1",
+        )
+        probabilities = classifier.predict_proba(X_train)[
+            :, list(classifier.classes_).index(1)
+        ]
+        expected = select_decision_threshold(y_train, probabilities)
+        self.assertAlmostEqual(
+            classifier._token_detector_threshold,
+            expected,
+        )
+        self.assertEqual(
+            classifier._token_detector_selection_protocol,
+            "fixed_hyperparameters_train_f1_threshold",
+        )
+        self.assertGreaterEqual(train_f1, 0.0)
+
+    def test_torch_probe_reports_real_and_hallucination_positive_metrics(self) -> None:
+        real_targets = np.array([1, 1, 1, 0], dtype=np.int32)
+        real_scores = np.array([0.9, 0.4, 0.8, 0.7], dtype=np.float32)
+        metrics = _metrics_from_probs(
+            real_targets,
+            real_scores,
+            positive_class="real",
+            threshold=0.5,
+        )
+
+        self.assertEqual(metrics["reported_positive_class"], "real")
+        self.assertAlmostEqual(metrics["f1"], metrics["real_positive"]["f1"])
+        self.assertAlmostEqual(metrics["real_positive"]["f1"], 2.0 / 3.0)
+        self.assertEqual(metrics["hallucination_positive"]["f1"], 0.0)
+        self.assertAlmostEqual(
+            metrics["real_positive"]["auc"],
+            metrics["hallucination_positive"]["auc"],
+        )
+
+    def test_strict_82_torch_probe_uses_last_epoch_and_train_f1_threshold(self) -> None:
+        X_train = np.asarray(
+            [[float(index), float(index % 3)] for index in range(16)],
+            dtype=np.float32,
+        )
+        y_train = np.asarray([index % 2 for index in range(16)], dtype=np.int32)
+        X_test = np.asarray(
+            [[20.0, 0.0], [21.0, 1.0], [22.0, 2.0], [23.0, 0.0]],
+            dtype=np.float32,
+        )
+        y_test = np.asarray([0, 1, 0, 1], dtype=np.int32)
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = train_and_evaluate_probe(
+                X_train=X_train,
+                y_train=y_train,
+                X_val=np.empty((0, 2), dtype=np.float32),
+                y_val=np.empty((0,), dtype=np.int32),
+                X_test=X_test,
+                y_test=y_test,
+                config=TorchProbeConfig(
+                    hidden_sizes=(8,),
+                    dropout=0.0,
+                    batch_size=4,
+                    num_epochs=2,
+                    seed=42,
+                ),
+                device=torch.device("cpu"),
+                output_dir=directory,
+            )
+        self.assertEqual(metrics["epochs_ran"], 2)
+        self.assertEqual(metrics["best_epoch"], 2)
+        self.assertGreaterEqual(metrics["decision_threshold"], 0.0)
+        self.assertLessEqual(metrics["decision_threshold"], 1.0)
+        self.assertEqual(metrics["checkpoint_selection"], "last_epoch")
+        self.assertEqual(metrics["threshold_selection"], "train_f1")
+        self.assertIsNotNone(metrics["train_metrics"])
+        self.assertIsNone(metrics["val_metrics"])
 
     def test_joint_extraction_resumes_and_keeps_baseline_isolated(self) -> None:
         class Tokenizer:

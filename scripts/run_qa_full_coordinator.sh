@@ -5,6 +5,7 @@ cd /root/rivermind-data/project/token-detector
 PY=/opt/conda/envs/td/bin/python
 ROOT=outputs/qa_benchmarks
 LOGS="$ROOT/logs"
+CONFIG=configs/model_configs_server_fj01.yaml
 mkdir -p "$LOGS"
 
 wait_for_completion() {
@@ -69,19 +70,19 @@ for model in llava_1_5_7b qwen2_5_vl_7b internvl_2_5_8b; do
   done
 done
 
-echo "[coordinator] starting strict 8:1:1 probes"
+echo "[coordinator] starting strict outer 8:2 probes"
 (
   export CUDA_VISIBLE_DEVICES=0
-  "$PY" scripts/train_qa_probes.py --model llava_1_5_7b --dataset pope --output-root "$ROOT"
-  "$PY" scripts/train_qa_probes.py --model llava_1_5_7b --dataset clevr_exist_5k --output-root "$ROOT"
-  "$PY" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset pope --output-root "$ROOT"
-  "$PY" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset clevr_exist_5k --output-root "$ROOT"
+  "$PY" scripts/train_qa_probes.py --model llava_1_5_7b --dataset pope --config "$CONFIG" --output-root "$ROOT"
+  "$PY" scripts/train_qa_probes.py --model llava_1_5_7b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
+  "$PY" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset pope --config "$CONFIG" --output-root "$ROOT"
+  "$PY" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
 ) > "$LOGS/probes_gpu0.log" 2>&1 &
 pid_probe0=$!
 (
   export CUDA_VISIBLE_DEVICES=1
-  "$PY" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset pope --output-root "$ROOT"
-  "$PY" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset clevr_exist_5k --output-root "$ROOT"
+  "$PY" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset pope --config "$CONFIG" --output-root "$ROOT"
+  "$PY" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
 ) > "$LOGS/probes_gpu1.log" 2>&1 &
 pid_probe1=$!
 wait "$pid_probe0"

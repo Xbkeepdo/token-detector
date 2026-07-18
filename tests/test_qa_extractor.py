@@ -14,12 +14,14 @@ class TinyTokenizer:
 
 def test_find_first_answer_semantic_token():
     assert find_answer_semantic_token([1, 2, 3], TinyTokenizer(), "yes") == 1
-    assert find_answer_semantic_token([4], TinyTokenizer(), None) == 0
+    assert find_answer_semantic_token([4], TinyTokenizer(), None) is None
 
 
-def test_model_specific_prompt_format():
-    assert qa_prompt("llava_1_5_7b", "Is there a cat?").startswith("USER: <image>")
-    assert qa_prompt("qwen2_5_vl_7b", "Is there a cat?") == "Is there a cat?\nAnswer only yes or no."
+def test_wrappers_receive_the_same_raw_qa_instruction():
+    expected = "Is there a cat?\nAnswer only yes or no."
+    assert qa_prompt("llava_1_5_7b", "Is there a cat?") == expected
+    assert qa_prompt("llava_onevision_1_5_8b", "Is there a cat?") == expected
+    assert qa_prompt("qwen2_5_vl_7b", "Is there a cat?") == expected
 
 
 def test_jsonl_resume_does_not_rewrite_identical_row(tmp_path):

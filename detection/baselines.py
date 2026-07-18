@@ -177,8 +177,9 @@ def train_torch_detector(
     early_stopping_patience: int = 5,
     seed: int = 42,
     positive_class: str = "hallucination",
+    strict_82_no_validation: bool = False,
 ) -> TorchDetectorResult:
-    """Train a two-class detector and select threshold only on validation data."""
+    """Train a detector under validation or pure strict-8:2 protocol."""
 
     _validate_train_splits(X_train, raw_y_train, X_val, raw_y_val, X_test, raw_y_test)
     _seed_everything(seed)
@@ -246,14 +247,21 @@ def train_torch_detector(
         model.eval()
         with torch.no_grad():
             val_loss = float(criterion(model(val_x), val_y).item())
-        history.append(
-            {
-                "epoch": float(epoch + 1),
-                "train_loss": float(np.mean(losses)),
-                "val_loss": val_loss,
+        epoch_row = {
+            "epoch": float(epoch + 1),
+            "train_loss": float(np.mean(losses)),
+        }
+        epoch_row[
+            "train_monitor_loss" if strict_82_no_validation else "val_loss"
+        ] = val_loss
+        history.append(epoch_row)
+        if strict_82_no_validation:
+            best_loss = val_loss
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
             }
-        )
-        if val_loss < best_loss:
+        elif val_loss < best_loss:
             best_loss = val_loss
             stale_epochs = 0
             best_state = {

@@ -1,4 +1,11 @@
-from data.qa_benchmark import assert_no_image_leakage, label_answer, normalize_yes_no, question_key
+from data.qa_benchmark import (
+    _amber_dimension,
+    assert_no_image_leakage,
+    infer_clevr_query_object_span,
+    label_answer,
+    normalize_yes_no,
+    question_key,
+)
 
 
 def test_answer_normalization_and_labels():
@@ -17,6 +24,32 @@ def test_question_key_uses_dataset_source_and_id():
     assert question_key(row) == "pope::random::7"
 
 
+def test_amber_dimensions_and_shared_image_namespace():
+    assert _amber_dimension("discriminative-hallucination") == "existence"
+    assert _amber_dimension("discriminative-attribute-state") == "attribute"
+    assert _amber_dimension("discriminative-relation") == "relation"
+    rows = [
+        {
+            "dataset": "amber_discriminative",
+            "source_split": "existence",
+            "image_id": 1,
+            "probe_split": "train",
+        },
+        {
+            "dataset": "amber_discriminative",
+            "source_split": "relation",
+            "image_id": 1,
+            "probe_split": "test",
+        },
+    ]
+    try:
+        assert_no_image_leakage(rows)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("AMBER image leakage across dimensions was accepted")
+
+
 def test_clevr_image_identity_includes_official_source_split():
     rows = [
         {"source_split": "train", "image_id": 1, "probe_split": "train"},
@@ -24,3 +57,39 @@ def test_clevr_image_identity_includes_official_source_split():
         {"source_split": "val", "image_id": 2, "probe_split": "test"},
     ]
     assert_no_image_leakage(rows)
+
+
+def test_clevr_query_object_span_uses_entity_after_final_existential_trigger():
+    program = [
+        {"function": "scene", "inputs": []},
+        {"function": "filter_shape", "inputs": [0], "value_inputs": ["sphere"]},
+        {"function": "exist", "inputs": [1]},
+    ]
+    question = "There is a gray block; are there any spheres to the left of it?"
+    result = infer_clevr_query_object_span(question, program)
+    assert result["status"] == "found"
+    assert result["surface"] == "spheres"
+    assert question[result["char_start"]:result["char_end"]] == "spheres"
+
+
+def test_clevr_generic_query_head_does_not_choose_later_reference_object():
+    program = [
+        {"function": "scene", "inputs": []},
+        {"function": "exist", "inputs": [0]},
+    ]
+    question = (
+        "Are there any other things that are the same shape as the big "
+        "metallic object?"
+    )
+    result = infer_clevr_query_object_span(question, program)
+    assert result["status"] == "found"
+    assert result["surface"] == "things"
+
+
+def test_clevr_object_span_is_explicitly_ambiguous_without_existential_trigger():
+    result = infer_clevr_query_object_span(
+        "Count the cubes.",
+        [{"function": "exist", "inputs": []}],
+    )
+    assert result["status"] == "ambiguous"
+    assert result["reason"] == "no_existential_trigger"

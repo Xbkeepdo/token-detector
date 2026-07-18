@@ -1,4 +1,4 @@
-"""Shared POPE/CLEVR-Exist question schema, deterministic splits, and labels."""
+"""Shared POPE/CLEVR/AMBER question schema, deterministic splits, and labels."""
 
 from __future__ import annotations
 
@@ -14,6 +14,20 @@ from typing import Iterable, Sequence
 
 YES_NO_RE = re.compile(r"(?<![a-z])(yes|no)(?![a-z])", re.IGNORECASE)
 POPE_OBJECT_RE = re.compile(r"Is there (?:a|an)\s+(.+?)\s+in the image", re.IGNORECASE)
+
+_CLEVR_EXISTENTIAL_RE = re.compile(
+    r"\b(?:is|are)\s+there\b|\bare\s+(?:any|some)\b", re.IGNORECASE
+)
+_CLEVR_GENERIC_OBJECT_RE = re.compile(
+    r"\b(?:anything|something|objects?|things?|shapes?|cubes?|blocks?|"
+    r"spheres?|balls?|cylinders?)\b",
+    re.IGNORECASE,
+)
+_CLEVR_SHAPE_SURFACES = {
+    "cube": ("cube", "cubes", "block", "blocks"),
+    "sphere": ("sphere", "spheres", "ball", "balls"),
+    "cylinder": ("cylinder", "cylinders"),
+}
 
 
 def question_key(row: dict) -> str:
@@ -138,6 +152,11 @@ def prepare_pope(
                     "question": question,
                     "gt_answer": gt,
                     "object_word": match.group(1).strip().lower(),
+                    "object_surface": match.group(1),
+                    "object_char_start": int(match.start(1)),
+                    "object_char_end": int(match.end(1)),
+                    "object_span_status": "found",
+                    "object_span_protocol": "pope_official_query_surface_v1",
                     "question_family_index": None,
                 }
                 row["key"] = question_key(row)
@@ -155,10 +174,11 @@ def prepare_pope(
     random.Random(seed).shuffle(images)
     image_splits = {
         "train": sorted(images[:400]),
-        "val": sorted(images[400:450]),
-        "test": sorted(images[450:]),
+        "val": [],
+        "test": sorted(images[400:]),
         "seed": seed,
         "unit": "image_id",
+        "protocol": "strict_outer_image_level_82",
     }
     split_lookup = {
         image_id: split
@@ -170,7 +190,7 @@ def prepare_pope(
         for row in by_strategy[strategy]:
             row["probe_split"] = split_lookup[row["image_id"]]
             questions.append(row)
-    _validate_counts(questions, {"train": 7200, "val": 900, "test": 900})
+    _validate_counts(questions, {"train": 7200, "val": 0, "test": 1800})
     _write_prepared(output_dir, questions, image_splits, seed, "POPE official 9K")
     return questions
 
@@ -180,23 +200,22 @@ def prepare_clevr_exist(
     output_dir: str,
     seed: int = 42,
     train_count: int = 4000,
-    val_count: int = 500,
-    test_count: int = 500,
+    val_count: int = 0,
+    test_count: int = 1000,
 ) -> list[dict]:
+    if int(val_count) != 0:
+        raise ValueError(
+            "Strict outer 8:2 CLEVR protocol requires val_count=0; "
+            "this protocol does not use a validation split"
+        )
     root = Path(clevr_root)
     train = _load_clevr_exist(root, "train")
     official_val = _load_clevr_exist(root, "val")
     rng = random.Random(seed)
     selected_train = rng.sample(train, train_count)
 
-    val_images = sorted({row["image_id"] for row in official_val})
-    rng.shuffle(val_images)
-    midpoint = len(val_images) // 2
-    val_pool, test_pool = set(val_images[:midpoint]), set(val_images[midpoint:])
-    val_candidates = [row for row in official_val if row["image_id"] in val_pool]
-    test_candidates = [row for row in official_val if row["image_id"] in test_pool]
-    selected_val = rng.sample(val_candidates, val_count)
-    selected_test = rng.sample(test_candidates, test_count)
+    selected_val: list[dict] = []
+    selected_test = rng.sample(official_val, test_count)
 
     questions = []
     for split, selected in (
@@ -212,11 +231,12 @@ def prepare_clevr_exist(
         "val": sorted({row["image_id"] for row in selected_val}),
         "test": sorted({row["image_id"] for row in selected_test}),
         "official_val_pool": {
-            "val": sorted(val_pool),
-            "test": sorted(test_pool),
+            "val": [],
+            "test": sorted({row["image_id"] for row in selected_test}),
         },
         "seed": seed,
-        "unit": "official_split_then_image_pool",
+        "unit": "official_source_split_outer_82",
+        "protocol": "strict_outer_image_level_82",
     }
     _validate_counts(questions, {"train": train_count, "val": val_count, "test": test_count})
     assert_no_image_leakage(questions)
@@ -230,16 +250,142 @@ def prepare_clevr_exist(
     return questions
 
 
+def prepare_amber_discriminative(
+    amber_root: str,
+    output_dir: str,
+    seed: int = 42,
+) -> list[dict]:
+    """Prepare all official AMBER discriminative Yes/No questions.
+
+    AMBER has a variable number of questions per image.  The outer 8:2 split
+    is therefore defined over the 1004 physical images, keeping every
+    existence, attribute, and relation question for one image in one split.
+    """
+
+    root = Path(amber_root)
+    query_path = root / "data" / "query" / "query_discriminative.json"
+    annotation_path = root / "data" / "annotations.json"
+    image_root = root / "images"
+    with query_path.open(encoding="utf-8") as handle:
+        queries = json.load(handle)
+    with annotation_path.open(encoding="utf-8") as handle:
+        annotations = json.load(handle)
+    if not isinstance(queries, list) or len(queries) != 14216:
+        raise ValueError(
+            f"Expected 14216 AMBER discriminative queries, got {len(queries)}"
+        )
+    if not isinstance(annotations, list) or len(annotations) < 15220:
+        raise ValueError("AMBER annotations.json is incomplete")
+
+    questions: list[dict] = []
+    image_ids: set[int] = set()
+    for item in queries:
+        official_id = int(item["id"])
+        annotation = annotations[official_id - 1]
+        if int(annotation.get("id", official_id)) != official_id:
+            raise ValueError(f"AMBER annotation ID mismatch at {official_id}")
+        gt = normalize_yes_no(annotation.get("truth"))
+        if gt is None:
+            raise ValueError(f"AMBER question {official_id} has no Yes/No truth")
+        image_file = str(item["image"])
+        match = re.fullmatch(r"AMBER_(\d+)\.jpg", image_file)
+        if match is None:
+            raise ValueError(f"Unexpected AMBER image filename: {image_file!r}")
+        image_id = int(match.group(1))
+        image_path = image_root / image_file
+        if not image_path.is_file():
+            raise FileNotFoundError(image_path)
+        amber_type = str(annotation.get("type") or "").strip()
+        dimension = _amber_dimension(amber_type)
+        row = {
+            "dataset": "amber_discriminative",
+            "source_split": dimension,
+            "question_id": official_id,
+            "image_id": image_id,
+            "image_file": image_file,
+            "image_path": str(image_path),
+            "question": str(item["query"]),
+            "gt_answer": gt,
+            "object_word": None,
+            "object_surface": None,
+            "object_char_start": None,
+            "object_char_end": None,
+            "object_span_status": "unavailable",
+            "object_span_protocol": "amber_prompt_last_only_v1",
+            "question_family_index": None,
+            "amber_question_type": amber_type,
+            "amber_dimension": dimension,
+        }
+        row["key"] = question_key(row)
+        questions.append(row)
+        image_ids.add(image_id)
+
+    if image_ids != set(range(1, 1005)):
+        raise ValueError(
+            "AMBER discriminative queries must cover image IDs 1..1004"
+        )
+    shuffled = sorted(image_ids)
+    random.Random(seed).shuffle(shuffled)
+    train_count = int(len(shuffled) * 0.8)
+    image_splits = {
+        "train": sorted(shuffled[:train_count]),
+        "val": [],
+        "test": sorted(shuffled[train_count:]),
+        "seed": seed,
+        "unit": "amber_physical_image_id",
+        "protocol": "strict_outer_image_level_82",
+    }
+    split_lookup = {
+        image_id: split
+        for split in ("train", "test")
+        for image_id in image_splits[split]
+    }
+    for row in questions:
+        row["probe_split"] = split_lookup[int(row["image_id"])]
+    assert_no_image_leakage(questions)
+    _write_prepared(
+        output_dir,
+        questions,
+        image_splits,
+        seed,
+        "AMBER official discriminative VQA 14,216",
+    )
+    return questions
+
+
+def _amber_dimension(question_type: str) -> str:
+    value = str(question_type).strip()
+    if value == "discriminative-hallucination":
+        return "existence"
+    if value.startswith("discriminative-attribute-"):
+        return "attribute"
+    if value in {"discriminative-relation", "relation"}:
+        return "relation"
+    raise ValueError(f"Unknown AMBER discriminative type: {value!r}")
+
+
 def assert_no_image_leakage(rows: Sequence[dict]) -> None:
     split_images = {
-        split: {(row["source_split"], int(row["image_id"])) for row in rows if row["probe_split"] == split}
+        split: {
+            _physical_image_identity(row)
+            for row in rows
+            if row["probe_split"] == split
+        }
         for split in ("train", "val", "test")
     }
-    # Official CLEVR train and val are physically disjoint; keep source split in identity.
     for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
         overlap = split_images[left] & split_images[right]
         if overlap:
             raise ValueError(f"Image leakage between {left}/{right}: {sorted(overlap)[:5]}")
+
+
+def _physical_image_identity(row: dict) -> tuple:
+    dataset = str(row.get("dataset") or "")
+    image_id = int(row["image_id"])
+    if dataset in {"pope", "amber_discriminative"}:
+        return dataset, image_id
+    # Official CLEVR train and val are separate physical namespaces.
+    return dataset, str(row.get("source_split") or ""), image_id
 
 
 def _load_clevr_exist(root: Path, source_split: str) -> list[dict]:
@@ -254,6 +400,10 @@ def _load_clevr_exist(root: Path, source_split: str) -> list[dict]:
         gt = normalize_yes_no(item.get("answer"))
         if gt is None:
             continue
+        query_span = infer_clevr_query_object_span(
+            str(item["question"]),
+            program,
+        )
         row = {
             "dataset": "clevr_exist_5k",
             "source_split": source_split,
@@ -263,12 +413,111 @@ def _load_clevr_exist(root: Path, source_split: str) -> list[dict]:
             "image_path": str(root / "images" / source_split / item["image_filename"]),
             "question": item["question"],
             "gt_answer": gt,
-            "object_word": None,
+            "object_word": query_span.get("surface"),
+            "object_surface": query_span.get("surface"),
+            "object_char_start": query_span.get("char_start"),
+            "object_char_end": query_span.get("char_end"),
+            "object_span_status": query_span["status"],
+            "object_span_protocol": query_span["protocol"],
+            "object_query_shape": query_span.get("query_shape"),
             "question_family_index": int(item["question_family_index"]),
         }
         row["key"] = question_key(row)
         rows.append(row)
     return rows
+
+
+
+def infer_clevr_query_object_span(question: str, program: Sequence[dict]) -> dict:
+    """Locate the queried entity head for a terminal CLEVR ``exist`` program.
+
+    Search starts after the final existential phrase so an earlier reference
+    object cannot be selected accidentally.
+    """
+
+    text = str(question)
+    protocol = "clevr_terminal_exist_query_head_v1"
+    if not program or str(program[-1].get("function")) != "exist":
+        return {
+            "status": "ambiguous",
+            "protocol": protocol,
+            "reason": "terminal_program_is_not_exist",
+        }
+
+    query_shape = _terminal_query_shape(program)
+    triggers = list(_CLEVR_EXISTENTIAL_RE.finditer(text))
+    if not triggers:
+        return {
+            "status": "ambiguous",
+            "protocol": protocol,
+            "query_shape": query_shape,
+            "reason": "no_existential_trigger",
+        }
+    clause_start = triggers[-1].end()
+    clause = text[clause_start:]
+
+    candidates: list[re.Match[str]] = []
+    if query_shape is not None:
+        surfaces = _CLEVR_SHAPE_SURFACES.get(query_shape, (query_shape,))
+        pattern = re.compile(
+            r"\b(?:" + "|".join(re.escape(value) for value in surfaces) + r")\b",
+            re.IGNORECASE,
+        )
+        candidates = list(pattern.finditer(clause))
+    if not candidates:
+        candidates = list(_CLEVR_GENERIC_OBJECT_RE.finditer(clause))
+    if not candidates:
+        return {
+            "status": "ambiguous",
+            "protocol": protocol,
+            "query_shape": query_shape,
+            "reason": "no_query_head_after_existential_trigger",
+        }
+
+    selected = candidates[0]
+    start = clause_start + selected.start()
+    end = clause_start + selected.end()
+    return {
+        "status": "found",
+        "protocol": protocol,
+        "surface": text[start:end],
+        "char_start": int(start),
+        "char_end": int(end),
+        "query_shape": query_shape,
+    }
+
+
+def _terminal_query_shape(program: Sequence[dict]) -> str | None:
+    """Return an explicit shape filter on the set consumed by ``exist``."""
+
+    try:
+        inputs = list(program[-1].get("inputs") or [])
+        current = int(inputs[0]) if inputs else len(program) - 2
+    except (TypeError, ValueError, IndexError):
+        return None
+    visited: set[int] = set()
+    while 0 <= current < len(program) and current not in visited:
+        visited.add(current)
+        node = program[current]
+        function = str(node.get("function", ""))
+        if function == "filter_shape":
+            values = list(node.get("value_inputs") or [])
+            return str(values[0]).lower() if values else None
+        if function.startswith("filter_"):
+            node_inputs = list(node.get("inputs") or [])
+            if not node_inputs:
+                return None
+            current = int(node_inputs[0])
+            continue
+        if function.startswith("same_") or function in {
+            "relate", "unique", "intersect", "union", "scene",
+        }:
+            return None
+        node_inputs = list(node.get("inputs") or [])
+        if len(node_inputs) != 1:
+            return None
+        current = int(node_inputs[0])
+    return None
 
 
 def _write_prepared(

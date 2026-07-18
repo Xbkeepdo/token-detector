@@ -35,8 +35,8 @@ from utils.generation_provenance import (  # noqa: E402
     validate_generation_manifest,
 )
 from utils.split_utils import (  # noqa: E402
-    ensure_strict_811_split,
-    validate_strict_811_split,
+    ensure_strict_82_split,
+    validate_strict_82_split,
 )
 
 
@@ -190,7 +190,7 @@ def main() -> None:
             )
         shared_path_value = config["dataset"].get("shared_split_path")
         shared_path = _repo_path(shared_path_value) if shared_path_value else None
-        splits, backup = ensure_strict_811_split(
+        splits, backup = ensure_strict_82_split(
             output_dir / "image_splits.json",
             image_ids,
             seed=int(config["dataset"].get("seed", 42)),
@@ -199,9 +199,9 @@ def main() -> None:
         if backup is not None:
             print(f"[Pipeline] Backed up previous split to {backup}")
         print(
-            "[Pipeline] Strict image split: "
-            f"train={len(splits['train'])}, val={len(splits['val'])}, "
-            f"test={len(splits['test'])}"
+            "[Pipeline] Strict image split (no validation): "
+            f"train={len(splits['train'])}, test={len(splits['test'])}; "
+            "fixed epochs, last checkpoint, train-F1 threshold"
         )
 
     flags = _effective_feature_flags(config)
@@ -742,12 +742,12 @@ def _validate_or_write_manifest(
         "labeling_sample_unit",
     )
     current = {
-        "manifest_version": 3,
+        "manifest_version": 4,
         "model": str(run["model"]),
         "prompt": str(run["prompt"]),
         "num_images": int(config["dataset"]["num_images"]),
         "dataset_seed": int(config["dataset"].get("seed", 42)),
-        "split_strategy": "strict_811",
+        "split_strategy": "strict_82",
         # Informational only.  It is deliberately not a global resume key:
         # method_only and baseline_only can safely populate the same output in
         # separate invocations.
@@ -1235,7 +1235,7 @@ def _reuse_generation_artifacts(
         if source_split_path.is_symlink():
             raise ValueError(f"Refusing a symlinked source split: {source_split_path}")
         source_split = _load_json(source_split_path)
-        validate_strict_811_split(
+        validate_strict_82_split(
             source_split,
             expected_image_ids=image_ids,
         )
@@ -1244,7 +1244,7 @@ def _reuse_generation_artifacts(
             raise ValueError(f"Refusing a symlinked target split: {target_split_path}")
         if target_split_path.exists():
             target_split = _load_json(target_split_path)
-            validate_strict_811_split(
+            validate_strict_82_split(
                 target_split,
                 expected_image_ids=image_ids,
             )
