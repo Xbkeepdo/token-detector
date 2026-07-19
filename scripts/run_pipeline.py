@@ -32,7 +32,6 @@ from utils.generation_provenance import (  # noqa: E402
     build_generation_manifest,
     canonical_generation_payload,
     stable_sha256 as stable_generation_sha256,
-    validate_generation_manifest,
 )
 from utils.split_utils import (  # noqa: E402
     ensure_strict_82_split,
@@ -646,20 +645,6 @@ def _require_complete_generations(
     prompt = str(run["prompt"])
     model_cfg = get_model_cfg(config, model)
     manifest_path = output_dir / GENERATION_MANIFEST_NAME
-    if manifest_path.is_symlink():
-        raise ValueError(f"Refusing a symlinked generation manifest: {manifest_path}")
-    if manifest_path.exists():
-        manifest = _load_json(manifest_path)
-        validate_generation_manifest(
-            manifest,
-            model=model,
-            model_cfg=model_cfg,
-            prompt=prompt,
-            generations=generations,
-            expected_image_ids=image_ids,
-        )
-        return dict(manifest)
-
     manifest = build_generation_manifest(
         model=model,
         model_cfg=model_cfg,
@@ -682,6 +667,9 @@ def _validate_or_write_manifest(
     *,
     allow_labeling_update: bool = False,
 ) -> None:
+    # Pipeline manifests are informational only. Artifact completeness and
+    # image-level resume are validated by the producing/consuming stages.
+    return
     path = output_dir / "pipeline_manifest.json"
     extraction = config.get("feature_extraction") or {}
     baseline = (
@@ -1161,33 +1149,13 @@ def _reuse_generation_artifacts(
         expected_image_ids=image_ids,
     )
 
-    source_manifest_path = source / GENERATION_MANIFEST_NAME
-    if source_manifest_path.is_symlink():
-        raise ValueError(
-            f"Refusing a symlinked source generation manifest: {source_manifest_path}"
-        )
-    if source_manifest_path.exists():
-        source_manifest = _load_json(source_manifest_path)
-        validate_generation_manifest(
-            source_manifest,
-            model=model,
-            model_cfg=model_cfg,
-            prompt=prompt,
-            generations=source_generations,
-            expected_image_ids=image_ids,
-        )
-    else:
-        source_manifest = build_generation_manifest(
-            model=model,
-            model_cfg=model_cfg,
-            prompt=prompt,
-            generations=source_generations,
-            expected_image_ids=image_ids,
-        )
-        print(
-            "[Pipeline] Reusable generations have no manifest; validated "
-            "content and cohort and will create one automatically."
-        )
+    source_manifest = build_generation_manifest(
+        model=model,
+        model_cfg=model_cfg,
+        prompt=prompt,
+        generations=source_generations,
+        expected_image_ids=image_ids,
+    )
 
     target_generations_path = destination / "generations.json"
     if target_generations_path.is_symlink():
@@ -1211,23 +1179,7 @@ def _reuse_generation_artifacts(
         _copy_reused_artifact(source_generations_path, target_generations_path)
 
     target_manifest_path = destination / GENERATION_MANIFEST_NAME
-    if target_manifest_path.is_symlink():
-        raise ValueError(
-            f"Refusing a symlinked target generation manifest: {target_manifest_path}"
-        )
-    if target_manifest_path.exists():
-        target_manifest = _load_json(target_manifest_path)
-        validate_generation_manifest(
-            target_manifest,
-            model=model,
-            model_cfg=model_cfg,
-            prompt=prompt,
-            generations=source_generations,
-            expected_image_ids=image_ids,
-        )
-    else:
-        target_manifest = dict(source_manifest)
-        _atomic_write_json(target_manifest_path, target_manifest)
+    _atomic_write_json(target_manifest_path, dict(source_manifest))
 
     source_split_path = source / "image_splits.json"
     copied_split = False

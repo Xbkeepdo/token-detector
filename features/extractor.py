@@ -1085,6 +1085,8 @@ def _build_four_gate_feature_record(
         "dgst_t_source_dist_per_layer",
     )
     direct_softmax_method = "hpre_softmax_prob_direct"
+    target_region_top_k = int(dgst_t["dgst_t_target_region_top_k"])
+    topk_slug = f"topk{target_region_top_k}"
     method_keys = []
     for method in methods:
         state_name = _target_comparison_state(method)
@@ -1101,9 +1103,9 @@ def _build_four_gate_feature_record(
         method_keys.extend(
             [
                 f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer",
-                f"dgst_t_{method}_target_cosine_topk32_{state_name}_per_layer",
+                f"dgst_t_{method}_target_cosine_{topk_slug}_{state_name}_per_layer",
                 f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
-                f"topk32_{state_name}_per_layer",
+                f"{topk_slug}_{state_name}_per_layer",
             ]
         )
     missing = [
@@ -1173,8 +1175,8 @@ def _build_four_gate_feature_record(
             feat[gate_key] = _compact_numpy(dgst_t[gate_key], dtype=np.float32)
         for suffix in (
             f"risk_sqrt_{state_name}_per_layer",
-            f"target_cosine_topk32_{state_name}_per_layer",
-            f"ev_target_dist_mass_x_cosine_topk32_{state_name}_per_layer",
+            f"target_cosine_{topk_slug}_{state_name}_per_layer",
+            f"ev_target_dist_mass_x_cosine_{topk_slug}_{state_name}_per_layer",
         ):
             key = f"dgst_t_{method}_{suffix}"
             feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)

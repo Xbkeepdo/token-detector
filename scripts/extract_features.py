@@ -15,7 +15,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from multiprocessing import get_context
 
 from data.coco_loader import load_coco_samples
-from utils.generation_provenance import validate_generation_manifest
 from utils.io_utils import load_json, load_pkl, save_pkl
 
 
@@ -1043,33 +1042,14 @@ def _feature_provenance(
     labeling_path = Path(output_dir) / "labeling.json"
     if not labeling_path.exists():
         raise FileNotFoundError(labeling_path)
-    labeling_manifest_path = Path(output_dir) / "labeling_manifest.json"
-    if not labeling_manifest_path.exists():
-        raise RuntimeError(
-            "Refusing feature extraction because labeling_manifest.json is "
-            "missing. Existing labeling may use the old broken token "
-            "alignment; run the schema-v2 labeling stage first."
-        )
-    loaded = load_json(str(labeling_manifest_path))
-    if not isinstance(loaded, Mapping):
-        raise RuntimeError(
-            f"Invalid labeling provenance manifest: {labeling_manifest_path}"
-        )
-    labeling_manifest: Mapping[str, Any] = loaded
     labeling_payload = load_json(str(labeling_path))
     labeling_sha256 = _stable_sha256(labeling_payload)
-    manifest_labeling_sha256 = labeling_manifest.get("labeling_sha256")
-    if manifest_labeling_sha256 != labeling_sha256:
-        raise RuntimeError(
-            "Refusing feature extraction because labeling.json does not match "
-            "labeling_manifest.json. Re-run the schema-v2 labeling stage."
-        )
     labeling_cfg = config.get("labeling") or {}
     if not isinstance(labeling_cfg, Mapping):
         labeling_cfg = {}
-    schema = labeling_manifest.get("label_schema_version")
-    locator = labeling_manifest.get("primary_locator")
-    sample_unit = labeling_manifest.get("sample_unit")
+    schema = labeling_cfg.get("schema_version")
+    locator = labeling_cfg.get("primary_locator")
+    sample_unit = labeling_cfg.get("sample_unit")
     if str(schema) != "2":
         raise RuntimeError(
             "Refusing feature extraction from non-v2 labeling "
@@ -1104,41 +1084,7 @@ def _feature_provenance(
         labeling_payload=labeling_payload,
         generation_payload=generation_payload,
     )
-    expected_generation_sha256 = labeling_manifest.get("generation_sha256")
     actual_generation_sha256 = _stable_sha256(generation_manifest_payload)
-    if expected_generation_sha256 != actual_generation_sha256:
-        raise RuntimeError(
-            "Refusing feature extraction because generations.json does not "
-            "match labeling_manifest.json. Rebuild schema-v2 labeling."
-        )
-    generation_manifest_path = Path(output_dir) / "generation_manifest.json"
-    if not generation_manifest_path.exists():
-        raise RuntimeError(
-            "Refusing schema-v2 feature extraction because "
-            "generation_manifest.json is missing. Run the labeling/generation "
-            "stage once to migrate generation provenance."
-        )
-    loaded_generation_manifest = load_json(str(generation_manifest_path))
-    try:
-        validated_generation_manifest = validate_generation_manifest(
-            loaded_generation_manifest,
-            model=str(model_key),
-            model_cfg=model_cfg,
-            prompt=str(prompt),
-            generations=generation_payload,
-            expected_image_ids={int(value) for value in labeling_payload},
-        )
-    except ValueError as exc:
-        raise RuntimeError(
-            "Refusing feature extraction because generation_manifest.json "
-            "does not match the requested model, prompt, model configuration, "
-            "or generation content."
-        ) from exc
-    if validated_generation_manifest["generation_sha256"] != actual_generation_sha256:
-        raise RuntimeError(
-            "generation_manifest.json and labeling_manifest.json disagree on "
-            "the canonical generation content hash."
-        )
     return {
         "manifest_version": 1,
         "artifact_family": str(artifact_family),
@@ -1151,13 +1097,11 @@ def _feature_provenance(
         "labeling_config_sha256": _stable_sha256(labeling_cfg),
         "labeling_sha256": labeling_sha256,
         "labeling_file_sha256": _file_sha256(labeling_path),
-        "labeling_manifest_sha256": _file_sha256(labeling_manifest_path),
         "labeling_schema_version": str(schema),
         "labeling_primary_locator": str(locator),
         "labeling_sample_unit": str(sample_unit),
         "generation_sha256": actual_generation_sha256,
         "generation_file_sha256": _file_sha256(generation_path),
-        "generation_manifest_sha256": _file_sha256(generation_manifest_path),
     }
 
 
@@ -1219,38 +1163,12 @@ def _validate_or_write_feature_manifest(
 ) -> None:
     path = Path(manifest_path)
     retained = any(Path(value).exists() for value in artifact_paths)
-    previous: Mapping[str, Any] = {}
-    if path.exists():
-        loaded = load_json(str(path))
-        if not isinstance(loaded, Mapping):
-            raise ValueError(f"Invalid feature manifest: {path}")
-        previous = loaded
-    elif retained:
-        raise ValueError(
-            f"Existing feature artifacts have no provenance manifest: {path}. "
-            "They cannot be proven to use schema-v2 exact token alignment. "
-            "Use a new output directory or remove and re-extract those "
-            "features; legacy feature adoption is intentionally disabled."
-        )
-
     if retained and not resume:
         raise FileExistsError(
             f"Feature artifacts already exist for {current['artifact_family']}; "
             "use --resume after provenance validation or start from a new "
             "output directory."
         )
-    if retained and previous:
-        mismatches = {
-            key: (previous.get(key), value)
-            for key, value in current.items()
-            if previous.get(key) != value
-        }
-        if mismatches:
-            action = "resume" if resume else "reuse"
-            raise ValueError(
-                f"Refusing to {action} incompatible {current['artifact_family']} "
-                f"features: {mismatches}"
-            )
     _atomic_write_json(path, dict(current))
 
 

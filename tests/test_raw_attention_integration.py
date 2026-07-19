@@ -34,13 +34,14 @@ class RawAttentionIntegrationTests(unittest.TestCase):
 
         record = {
             "label": 1,
+            "dgst_t_target_region_top_k": 16,
             "dgst_t_raw_attention_risk_sqrt_hpre_per_layer": [0.1, 0.2],
-            "dgst_t_raw_attention_target_cosine_topk32_hpre_per_layer": [
+            "dgst_t_raw_attention_target_cosine_topk16_hpre_per_layer": [
                 0.3,
                 0.4,
             ],
             "dgst_t_raw_attention_ev_target_dist_mass_x_cosine_"
-            "topk32_hpre_per_layer": [0.5, 0.6],
+            "topk16_hpre_per_layer": [0.5, 0.6],
         }
         matrix, labels = build_selected_matrix([record], blocks)
         np.testing.assert_allclose(

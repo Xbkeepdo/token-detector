@@ -3,7 +3,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PYTHON_BIN="${PYTHON_BIN:-/opt/conda/private/envs/vicr/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "Python interpreter not found: $PYTHON_BIN" >&2
+    echo "Activate the intended environment or set PYTHON_BIN=/path/to/python." >&2
+    exit 2
+fi
 MODEL="${MODEL:-qwen3_vl_8b}"
 DATASET="${DATASET:-pope}"                 # pope | clevr_exist_5k | amber_discriminative
 CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"

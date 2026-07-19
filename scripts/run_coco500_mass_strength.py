@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -181,10 +182,7 @@ def _run(command: list[str]) -> None:
 
 
 def _default_python() -> str:
-    candidate = Path("/opt/conda/private/envs/vicr/bin/python")
-    if candidate.exists():
-        return str(candidate)
-    return sys.executable
+    return os.environ.get("PYTHON_BIN", sys.executable)
 
 
 if __name__ == "__main__":

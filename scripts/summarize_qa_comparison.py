@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Combine existing QA probe and native-baseline reports without retraining.
+"""Combine existing QA probe and configured-baseline reports without retraining.
 
 This script is deliberately reporting-only. It reads already aggregated test
 metrics (and native baseline per-seed metric JSON only when the aggregate omits
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a read-only three-seed QA comparison of DGST/ADS+CGC and "
-            "native paper baselines."
+            "configured baselines."
         )
     )
     parser.add_argument("--model", required=True)
@@ -118,7 +118,16 @@ def main() -> None:
         Path(args.baseline_summary)
         if args.baseline_summary
         else _discover_baseline_summary(
-            run_dir, args.model, args.dataset, args.label_protocol
+            run_dir,
+            args.model,
+            args.dataset,
+            args.label_protocol,
+            trainer=str(
+                (config.get("qa_benchmarks") or {}).get(
+                    "baseline_trainer", "native_paper"
+                )
+            ),
+            num_seeds=len(args.seeds),
         )
     )
     feature_path = (
@@ -1117,12 +1126,34 @@ def _discover_baseline_summary(
     model: str,
     dataset: str,
     label_protocol: str,
+    *,
+    trainer: str = "native_paper",
+    num_seeds: int = 3,
 ) -> Path:
-    stem = f"{model}_{dataset}_{label_protocol}_qa_baselines_3seed.json"
-    candidates = (
-        run_dir / "baseline" / label_protocol / "results" / stem,
-    )
-    return _first_existing(candidates, "native baseline summary")
+    normalized = str(trainer).strip().lower().replace("-", "_")
+    if normalized in {"torch_mlp", "shared_mlp"}:
+        normalized = "shared_torch_mlp"
+    if normalized in {"native", "paper"}:
+        normalized = "native_paper"
+    base = run_dir / "baseline" / label_protocol / "results"
+    if normalized == "shared_torch_mlp":
+        stem = (
+            f"{model}_{dataset}_{label_protocol}_qa_baselines_"
+            f"shared_torch_mlp_{int(num_seeds)}seed.json"
+        )
+        candidates = (base / "shared_torch_mlp" / stem,)
+    elif normalized == "native_paper":
+        stem = (
+            f"{model}_{dataset}_{label_protocol}_qa_baselines_"
+            f"{int(num_seeds)}seed.json"
+        )
+        candidates = (base / stem,)
+    else:
+        raise ValueError(
+            "qa_benchmarks.baseline_trainer must be native_paper or "
+            f"shared_torch_mlp, got {trainer!r}"
+        )
+    return _first_existing(candidates, "configured baseline summary")
 
 
 def _first_existing(

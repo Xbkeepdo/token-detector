@@ -62,29 +62,6 @@ class QAProbe(nn.Module):
         return self.network(inputs).squeeze(-1)
 
 
-def default_feature_sets(
-    dataset: str,
-    positions: Sequence[str] | None = None,
-) -> list[str]:
-    """Return the current QA comparison matrix for each prediction position."""
-
-    del dataset  # Both prepared QA datasets use the same detector feature families.
-    selected_positions = normalize_positions(positions)
-    names: list[str] = []
-    for position in selected_positions:
-        names.extend(
-            f"{block}@{position}" for block in ("ads", "cgc", "ads+cgc")
-        )
-        for method in QA_DGST_METHODS:
-            risk = f"{method}_risk"
-            cosine = f"{method}_target_cosine"
-            ev = f"{method}_ev_target_dist_mass_x_cosine"
-            names.append(
-                f"{risk}+{cosine}+{ev}@{position}"
-            )
-    return names
-
-
 def normalize_positions(positions: Sequence[str] | None) -> tuple[str, ...]:
     values = (
         ("prompt_last_token",)
@@ -109,6 +86,8 @@ def legacy_feature_sets(dataset: str) -> list[str]:
 
 
 def feature_vector(row: dict, feature_set: str) -> np.ndarray:
+    if feature_set.startswith("baseline:"):
+        return baseline_probe_vector(row, feature_set.split(":", 1)[1])
     position = feature_set_position(feature_set)
     if position in QA_POSITIONS:
         block = feature_set.rsplit("@", 1)[0]
@@ -144,6 +123,47 @@ def feature_vector(row: dict, feature_set: str) -> np.ndarray:
     return _concat(target_data[block])
 
 
+def baseline_probe_vector(row: Mapping[str, object], method: str) -> np.ndarray:
+    """Return one baseline's dense input for the shared QA Torch MLP.
+
+    MetaToken and SVAR already serialize their canonical paper feature vector.
+    ProjectAway is originally training-free, so its shared-MLP adaptation uses
+    the per-layer internal-confidence curve plus its global maximum.  The
+    complementary hallucination score is deliberately omitted because it is
+    exactly ``1 - internal_confidence`` and adds no information.
+    """
+
+    normalized = str(method).strip().lower()
+    baselines = row.get("baselines")
+    if not isinstance(baselines, Mapping):
+        raise KeyError("Missing baseline payload mapping")
+    payload = baselines.get(normalized)
+    if not isinstance(payload, Mapping):
+        raise KeyError(f"Missing baseline payload {normalized!r}")
+    if normalized in {"metatoken", "svar"}:
+        vector = payload.get("vector")
+    elif normalized == "projectaway":
+        per_layer = payload.get("per_layer_internal_confidence")
+        confidence = payload.get("internal_confidence")
+        if per_layer is None or confidence is None:
+            raise KeyError(
+                "ProjectAway shared MLP requires internal_confidence and "
+                "per_layer_internal_confidence"
+            )
+        vector = _concat(confidence, per_layer)
+    else:
+        raise ValueError(
+            "The shared QA MLP currently supports dense MetaToken, SVAR, and "
+            f"ProjectAway features, got {method!r}"
+        )
+    result = np.asarray(vector, dtype=np.float32).reshape(-1)
+    if result.size == 0 or not np.isfinite(result).all():
+        raise ValueError(
+            f"Baseline {normalized!r} has an empty or non-finite MLP vector"
+        )
+    return result
+
+
 def feature_set_position(feature_set: str) -> str:
     """Return the explicit position namespace without aliasing legacy @object."""
 
@@ -160,11 +180,17 @@ def feature_set_position(feature_set: str) -> str:
 def label_for_protocol(row: Mapping[str, object], label_protocol: str) -> int | None:
     if label_protocol not in QA_LABEL_PROTOCOLS:
         raise ValueError(f"Unknown QA label protocol: {label_protocol}")
-    key = (
-        "label"
-        if label_protocol == "answer_correctness_all"
-        else "object_hallucination_yes_only_label"
-    )
+    # QA baseline artifacts are protocol-specific directories.  Their generic
+    # ``label`` field is therefore authoritative only when the saved protocol
+    # explicitly matches the requested one.
+    if str(row.get("qa_label_protocol") or "") == label_protocol:
+        key = "label"
+    else:
+        key = (
+            "label"
+            if label_protocol == "answer_correctness_all"
+            else "object_hallucination_yes_only_label"
+        )
     if key not in row:
         raise KeyError(
             f"QA row {row.get('key')!r} is missing label field {key!r}"
@@ -221,13 +247,20 @@ def _position_single_vector(position_data: Mapping[str, object], block: str) -> 
             if candidate in method_payload:
                 return _concat(method_payload[candidate])
     state = "hmid" if method.startswith("hmid_") else "hpre"
+    metadata = dgst.get("metadata")
+    target_region_top_k = (
+        metadata.get("dgst_t_target_region_top_k", 32)
+        if isinstance(metadata, Mapping)
+        else dgst.get("dgst_t_target_region_top_k", 32)
+    )
+    topk_slug = f"topk{int(target_region_top_k)}"
     raw_candidate = (
         f"dgst_t_{method}_risk_sqrt_{state}_per_layer"
         if component == "risk"
         else (
-            f"dgst_t_{method}_target_cosine_topk32_{state}_per_layer"
+            f"dgst_t_{method}_target_cosine_{topk_slug}_{state}_per_layer"
             if component == "target_cosine"
-            else f"dgst_t_{method}_ev_target_dist_mass_x_cosine_topk32_{state}_per_layer"
+            else f"dgst_t_{method}_ev_target_dist_mass_x_cosine_{topk_slug}_{state}_per_layer"
         )
     )
     if raw_candidate in dgst:
@@ -532,14 +565,41 @@ def choose_real_f1_threshold(y_true, probability) -> tuple[float, float]:
     scores = np.asarray(probability, dtype=np.float64).reshape(-1)
     if targets.size == 0 or targets.size != scores.size:
         raise ValueError("Threshold selection requires equal non-empty arrays")
+    if not np.isfinite(scores).all() or not np.isin(targets, (0, 1)).all():
+        raise ValueError("Threshold selection requires finite scores and binary labels")
     candidates = np.unique(np.concatenate(([0.0], scores, [1.0])))
+    # For threshold t, every sorted score at index >= searchsorted(t) is
+    # predicted Real. Prefix class counts therefore evaluate all unique
+    # thresholds exactly in O(N log N), instead of invoking sklearn over the
+    # full training set once per candidate (O(N^2)).
+    order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
+    sorted_targets = targets[order]
+    positive_prefix = np.concatenate((
+        np.asarray([0], dtype=np.int64),
+        np.cumsum(sorted_targets, dtype=np.int64),
+    ))
+    starts = np.searchsorted(sorted_scores, candidates, side="left")
+    total_positive = int(positive_prefix[-1])
+    true_positive = total_positive - positive_prefix[starts]
+    predicted_positive = targets.size - starts
+    false_positive = predicted_positive - true_positive
+    false_negative = total_positive - true_positive
+    true_negative = starts - positive_prefix[starts]
+    denominators = 2 * true_positive + false_positive + false_negative
+    f1_values = np.divide(
+        2.0 * true_positive,
+        denominators,
+        out=np.zeros_like(candidates, dtype=np.float64),
+        where=denominators != 0,
+    )
+    accuracy_values = (true_positive + true_negative) / float(targets.size)
     best_key = (-np.inf, -np.inf, -np.inf)
     best_threshold = 0.5
-    for threshold in candidates:
-        prediction = (scores >= threshold).astype(np.int64)
+    for index, threshold in enumerate(candidates):
         key = (
-            float(f1_score(targets, prediction, pos_label=1, zero_division=0)),
-            float(accuracy_score(targets, prediction)),
+            float(f1_values[index]),
+            float(accuracy_values[index]),
             -abs(float(threshold) - 0.5),
         )
         if key > best_key:

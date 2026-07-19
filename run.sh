@@ -6,7 +6,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
 MODEL="${MODEL:-qwen3_vl_8b}"
-OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-EV}"
+OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-ACEV-TOP16}"
 CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
@@ -17,9 +17,12 @@ CHAIR_CACHE="${CHAIR_CACHE:-outputs/chair_cache/coco_val2014_chair.pkl}"
 NLTK_DATA="${NLTK_DATA:-$HOME/nltk_data}"
 REUSE_GENERATIONS_FROM="${REUSE_GENERATIONS_FROM:-}"
 
-DEFAULT_PYTHON="/opt/conda/private/envs/vicr/bin/python"
-PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
-[[ -x "$PYTHON_BIN" ]] || PYTHON_BIN=python
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "Python interpreter not found: $PYTHON_BIN" >&2
+    echo "Activate the intended environment or set PYTHON_BIN=/path/to/python." >&2
+    exit 2
+fi
 export CUDA_VISIBLE_DEVICES NLTK_DATA
 
 LABEL_ARGS=()

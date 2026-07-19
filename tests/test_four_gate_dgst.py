@@ -222,7 +222,7 @@ class FourGateDGSTTests(unittest.TestCase):
             places=6,
         )
 
-    def test_p_over_32_uses_each_branch_own_target_region(self) -> None:
+    def test_configured_top16_uses_each_branch_own_target_region(self) -> None:
         patches = 40
         layer = torch.nn.Linear(2, 4, bias=False)
         with torch.no_grad():
@@ -262,7 +262,7 @@ class FourGateDGSTTests(unittest.TestCase):
             visual_end=patches,
             target_token_ids=[0],
             prediction_positions=[patches],
-            target_region_top_k=32,
+            target_region_top_k=16,
         )[0]
         cosine_map = F.cosine_similarity(
             compact["prediction_hpre"][0].unsqueeze(0),
@@ -285,7 +285,7 @@ class FourGateDGSTTests(unittest.TestCase):
             gate = _gaussian_mad_gate(compact[input_key][0], epsilon=1e-6)
             target_dist = compact["attention_support"][0] * gate
             target_dist = target_dist / target_dist.sum()
-            region = _stable_topk_indices(target_dist, 32)
+            region = _stable_topk_indices(target_dist, 16)
             regions.append(tuple(region.tolist()))
             state_name = "hmid" if method.startswith("hmid_") else "hpre"
             branch_cosine = (
@@ -297,13 +297,13 @@ class FourGateDGSTTests(unittest.TestCase):
                 * expected_cosine
             )
             key = (
-                f"dgst_t_{method}_target_cosine_topk32_"
+                f"dgst_t_{method}_target_cosine_topk16_"
                 f"{state_name}_per_layer"
             )
             self.assertAlmostEqual(float(result[key][0]), float(expected_cosine), places=6)
             ev_key = (
                 f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
-                f"topk32_{state_name}_per_layer"
+                f"topk16_{state_name}_per_layer"
             )
             self.assertAlmostEqual(float(result[ev_key][0]), float(expected_ev), places=6)
             cost_states = (

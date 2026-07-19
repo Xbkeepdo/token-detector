@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /root/rivermind-data/project/token-detector
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
 
-PY=/opt/conda/envs/td/bin/python
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "Python interpreter not found: $PYTHON_BIN" >&2
+  exit 2
+fi
+export PYTHON_BIN
 ROOT=outputs/qa_benchmarks
 LOGS="$ROOT/logs"
 CONFIG=configs/model_configs_server_fj01.yaml
@@ -26,7 +32,7 @@ validate_run() {
   if [[ "$dataset" == "pope" ]]; then
     extra+=(--require-object-cgc)
   fi
-  "$PY" scripts/validate_qa_artifacts.py \
+  "$PYTHON_BIN" scripts/validate_qa_artifacts.py \
     --run-dir "$ROOT/$model/$dataset" \
     --expected "$expected" \
     "${extra[@]}"
@@ -66,30 +72,30 @@ validate_run internvl_2_5_8b clevr_exist_5k 5000
 echo "[coordinator] summarizing original-model results"
 for model in llava_1_5_7b qwen2_5_vl_7b internvl_2_5_8b; do
   for dataset in pope clevr_exist_5k; do
-    "$PY" scripts/summarize_qa_generations.py --run-dir "$ROOT/$model/$dataset"
+    "$PYTHON_BIN" scripts/summarize_qa_generations.py --run-dir "$ROOT/$model/$dataset"
   done
 done
 
 echo "[coordinator] starting strict outer 8:2 probes"
 (
   export CUDA_VISIBLE_DEVICES=0
-  "$PY" scripts/train_qa_probes.py --model llava_1_5_7b --dataset pope --config "$CONFIG" --output-root "$ROOT"
-  "$PY" scripts/train_qa_probes.py --model llava_1_5_7b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
-  "$PY" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset pope --config "$CONFIG" --output-root "$ROOT"
-  "$PY" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
+  "$PYTHON_BIN" scripts/train_qa_probes.py --model llava_1_5_7b --dataset pope --config "$CONFIG" --output-root "$ROOT"
+  "$PYTHON_BIN" scripts/train_qa_probes.py --model llava_1_5_7b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
+  "$PYTHON_BIN" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset pope --config "$CONFIG" --output-root "$ROOT"
+  "$PYTHON_BIN" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
 ) > "$LOGS/probes_gpu0.log" 2>&1 &
 pid_probe0=$!
 (
   export CUDA_VISIBLE_DEVICES=1
-  "$PY" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset pope --config "$CONFIG" --output-root "$ROOT"
-  "$PY" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
+  "$PYTHON_BIN" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset pope --config "$CONFIG" --output-root "$ROOT"
+  "$PYTHON_BIN" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
 ) > "$LOGS/probes_gpu1.log" 2>&1 &
 pid_probe1=$!
 wait "$pid_probe0"
 wait "$pid_probe1"
 
 echo "[coordinator] running paper-compatible LLaVA POPE ADS+CGC five-fold"
-"$PY" scripts/train_pope_paper_protocol.py \
+"$PYTHON_BIN" scripts/train_pope_paper_protocol.py \
   --run-dir "$ROOT/llava_1_5_7b/pope" \
   > "$LOGS/pope_paper_protocol.log" 2>&1
 

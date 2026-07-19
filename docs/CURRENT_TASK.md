@@ -1,5 +1,23 @@
 # Current Task
 
+## 2026-07-19 AMBER baseline 原生训练器对照
+
+- `train_qa_baselines.py` 新增 `--trainer native_paper|shared_torch_mlp` 临时覆盖参数，可在不修改 YAML 默认训练器的情况下补跑另一种 head；两类结果继续使用隔离路径。
+- AMBER 原生训练器已按 seeds 42/43/44 完成两种标签协议：MetaToken 使用 LR 与 GB，SVAR 使用原生单隐层 MLP，ProjectAway 保持 training-free。样本、物理图片级严格 8:2、train Real-F1 阈值与统一 MLP 对照完全一致。
+- `object_hallucination_yes_only` Test AUC/Real-F1/Hall-F1/Acc：MetaToken-LR=`0.8244/0.9169/0.3793/0.8534`，MetaToken-GB=`0.8267/0.9211/0.5378/0.8652`，SVAR=`0.8649/0.9403/0.6085/0.8965`，ProjectAway=`0.5500/0.9089/0.0000/0.8330`。
+- `answer_correctness_all` Test AUC/Real-F1/Hall-F1/Acc：MetaToken-LR=`0.8527/0.9458/0.1321/0.8979`，MetaToken-GB=`0.8629/0.9431/0.3660/0.8956`，SVAR=`0.7487/0.9444/0.0277/0.8947`，ProjectAway=`0.3908/0.9456/0.0000/0.8969`。
+- 原生与统一 MLP 的跨 family comparison 分别写入 `comparison_native_paper/` 与原 `comparison/`，未覆盖任何正式结果。验证：相关 baseline 单测 11/11、Python 编译、shell 语法和 `git diff --check` 通过。
+
+## 2026-07-19 AMBER baseline 统一三层 MLP
+
+- QA baseline 训练器现由 YAML 的 `qa_benchmarks.baseline_trainer` 控制：`shared_torch_mlp`（默认）或 `native_paper`。默认路径不再把 MetaToken/SVAR/ProjectAway 分别交给不同 head，而是统一复用 `training.torch_probe` 的 `[256,128,64]`、dropout 0.1、lr 3e-4、batch 128、120 epochs、seeds 42/43/44。
+- 统一输入保持各方法特征定义：MetaToken 为 42 维 canonical `10+H`；SVAR 为 448 维中层 `layer×head`；ProjectAway 为 1 个 global internal confidence 加 36 层曲线，共 37 维。ProjectAway 的 `1-confidence` 未重复拼接。所有方法仍使用物理图片互斥的严格 8:2、最后一轮权重及 train Real-F1 阈值。
+- 结果显式命名 `shared_torch_mlp` 并与原生 baseline 文件隔离。`summarize_qa_comparison.py` 会按 YAML 选择对应汇总，避免将统一 MLP 结果误称为论文原生 head。
+- AMBER `object_hallucination_yes_only` 三 seed Test：MetaToken AUC/Real-F1/Hall-F1/Acc=`0.8771/0.9314/0.6007/0.8829`；SVAR=`0.8793/0.9411/0.6250/0.8982`；ProjectAway=`0.5154/0.9085/0.0000/0.8323`。
+- AMBER `answer_correctness_all` 三 seed Test：MetaToken AUC/Real-F1/Hall-F1/Acc=`0.8862/0.9423/0.4584/0.8957`；SVAR=`0.7782/0.9400/0.3281/0.8898`；ProjectAway=`0.5622/0.9440/0.0086/0.8939`。ProjectAway 的高 Real-F1 伴随几乎为零的 Hall-F1，主要反映类别不平衡，不能当作有效幻觉检出。
+- 将 train Real-F1 阈值搜索从逐候选全量扫描的 O(N²) 改为排序+前缀计数的等价 O(N log N)；12,000 条样本由数十秒降到约 0.007 秒，暴力对齐测试确认阈值与 F1 不变。
+- 验证：全仓 173 项 unittest 通过；新增 baseline 向量、协议标签和 trainer 规范化测试通过；快速阈值与暴力版本等价；Python 编译、shell 语法、`git diff --check` 通过。两套正式三 seed 汇总及跨方法 comparison 均已生成。
+
 ## 2026-07-18 POPE random-only MetaToken / SVAR 实验
 
 - 从现有 `object_hallucination_yes_only/baseline/features.pkl` 只筛选 POPE `random` strategy，不重新抽取 LVLM 特征；全部选中记录的 `response_token_idx=0`，与当前 `prompt_last_token` 协议数值等价。结果隔离写入 `baseline/object_hallucination_yes_only/random_only/`，未覆盖三种 strategy 合并结果。
@@ -1458,3 +1476,22 @@
 - Qwen3 正式双卡生成 14,216/14,216 完成，generation failure 为 0。原始模型整体 accuracy `0.88555`；existence/attribute/relation 分别为 `0.91511/0.86995/0.86959`，严格 test 图片集为 `0.89686`。错误为 930 false-positive 与 697 false-negative；yes-only cohort 为 4,092 real / 930 hallucination。
 - 随后已启动 prompt-last-token 联合抽取，DGST、ADS+CGC 与 MetaToken/SVAR/DHCP/ProjectAway 共用每题一次 LVLM forward；双卡前 125 条分片成功、extraction failure 为 0，完整任务继续断点运行。
 - 用户随后要求暂不提取 DHCP。已在 500 条 root 分片后安全停止 worker，保留 DGST/ADS+CGC 原子分片；活动 YAML 的抽取和训练 baseline 列表均移除 DHCP，已产生的含 DHCP baseline 子目录整体归档，恢复后 baseline 仅抽取 MetaToken/SVAR/ProjectAway。
+
+## 2026-07-18 Python 解释器路径可移植性
+
+- `run.sh`、`run_qa.sh` 及仓库内辅助 shell 入口不再绑定 `/opt/conda/.../bin/python`；默认执行当前已激活环境中的 `python`。
+- 所有入口仍支持 `PYTHON_BIN=/path/to/python` 显式覆盖；找不到解释器时会立即给出可操作的错误提示。
+- 四个 Python 编排脚本默认使用启动自身的 `sys.executable`，同样接受 `PYTHON_BIN` 覆盖，不会因为本机恰好存在旧 vicr 环境而跳入错误环境。
+- 旧 QA coordinator/worker/smoke 脚本同时改为根据脚本位置定位仓库根目录，不再绑定 `/root/rivermind-data/project/token-detector`。
+- 本次修改只影响后续新启动的进程；已经运行中的 AMBER 抽取任务不会切换解释器或被中断。
+- 验证：全部 shell 脚本 `bash -n`、四个 Python 编排脚本 `py_compile`、`tests.test_pipeline_config` 31/31 和 `git diff --check` 通过。首次单测误用缺少 `pyyaml` 的系统 Python，在模块导入阶段报 `ModuleNotFoundError: yaml`；切换到项目测试环境后完整通过，不是实现失败。
+
+## 2026-07-19 QA feature-set YAML 路由修复
+
+- 发现 `train_qa_probes.py` 未读取 YAML 的 `training.feature_sets`，而是通过 `detection.qa_probe.default_feature_sets()` 硬编码每个 DGST 分支的 `risk+target_cosine+EV`。这使 AMBER 首次三层 MLP 训练成为 108 维三向量组合，与 YAML 指定的 risk、risk+EV、EV 实验矩阵不一致。
+- 已删除该硬编码默认矩阵。QA 训练现在严格读取 `training.feature_sets.method` 和 `training.feature_sets.ads_cgc`，只负责为每个 YAML 项追加 `@prompt_last_token`；缺失、空列表或未知 family 会直接报错。
+- 训练 provenance 升级为 `qa-probe-training-provenance-v2`，记录实际 YAML 展开的 feature-set 列表；后续 YAML 组合改变时不会静默复用旧结果。
+- unified 与 fj01 YAML 已重新对齐为 16 个 method 项和 3 个 ADS/CGC 项；两者均不含活动的 target-cosine 组合。
+- Qwen3 AMBER 已用 `[256,128,64]` 三层 MLP、seeds 42/43/44 重跑两种标签协议：每套 19 项、共 114 个 seed-run。汇总中的 method 输入维度严格为 36（单项）或 72（risk+EV），两套汇总 target-cosine 项均为 0。
+- 首次错误硬编码生成的 12 个三特征结果目录未删除，已移入 `results/_obsolete_hardcoded_triple_20260719/`；活动协议目录中 target-cosine 结果目录为 0，避免误读。
+- 验证：YAML 路由单测 6/6、受影响的 QA feature-vector 纯函数测试 2/2、Python 编译和 `git diff --check` 通过。一次附加 `pytest` 命令因 vicr 环境未安装 pytest，在收集前报 `No module named pytest`；随后用项目 Python 直接执行对应纯函数测试并通过。

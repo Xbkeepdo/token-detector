@@ -720,16 +720,18 @@ def _compact_dgst(result: dict) -> dict:
             "source_dist": _as_float32_array(result["dgst_t_source_dist_per_layer"]),
         },
     }
+    target_region_top_k = int(result["dgst_t_target_region_top_k"])
+    topk_slug = f"topk{target_region_top_k}"
     for method in methods:
         state = _target_comparison_state(method)
         keys = {
             "risk": f"dgst_t_{method}_risk_sqrt_{state}_per_layer",
             "target_cosine": (
-                f"dgst_t_{method}_target_cosine_topk32_{state}_per_layer"
+                f"dgst_t_{method}_target_cosine_{topk_slug}_{state}_per_layer"
             ),
             "ev": (
                 f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
-                f"topk32_{state}_per_layer"
+                f"{topk_slug}_{state}_per_layer"
             ),
         }
         branch_missing = [key for key in keys.values() if key not in result]

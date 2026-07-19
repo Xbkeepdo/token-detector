@@ -10,6 +10,11 @@ MODEL="$1"
 DEVICE="${2:-cuda:0}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "Python interpreter not found: $PYTHON_BIN" >&2
+  exit 2
+fi
 
 case "$MODEL" in
   llava_1_5_7b) MODEL_LABEL="LLaVA-1.5-7B" ;;
@@ -79,7 +84,7 @@ for SEED in 42 43 44; do
     exit 1
   fi
   echo "[Main811] model=$MODEL seed=$SEED device=$DEVICE"
-  PYTHONUNBUFFERED=1 /opt/conda/private/envs/vicr/bin/python \
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" \
     scripts/train_torch_probe_feature_sets.py \
     --model "$MODEL" \
     --config configs/model_configs_coco4000_all.yaml \
@@ -91,7 +96,7 @@ for SEED in 42 43 44; do
     --device "$DEVICE"
 done
 
-/opt/conda/private/envs/vicr/bin/python scripts/summarize_torch_probe_seed_runs.py \
+"$PYTHON_BIN" scripts/summarize_torch_probe_seed_runs.py \
   --models "$MODEL" \
   --model-labels "$MODEL_LABEL" \
   --seeds 42 43 44 \

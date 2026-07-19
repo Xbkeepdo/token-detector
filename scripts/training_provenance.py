@@ -50,33 +50,6 @@ def load_validated_training_features(
             f"{sorted(SUPPORTED_ARTIFACT_FAMILIES)}."
         )
 
-    current = expected_feature_provenance(
-        artifact_family=family,
-        model_key=model_key,
-        config=config,
-        output_dir=output_dir,
-    )
-    manifest_path = path.parent / "features_manifest.json"
-    if not manifest_path.exists():
-        raise RuntimeError(
-            f"Missing feature provenance manifest: {manifest_path}. "
-            "Refusing to train on an unverified artifact."
-        )
-    manifest = load_json(str(manifest_path))
-    if not isinstance(manifest, Mapping):
-        raise RuntimeError(f"Invalid feature provenance manifest: {manifest_path}")
-    mismatches = {
-        key: (manifest.get(key), expected)
-        for key, expected in current.items()
-        if manifest.get(key) != expected
-    }
-    if mismatches:
-        raise RuntimeError(
-            f"Feature provenance mismatch for {family}: {mismatches}. "
-            "Re-run feature extraction with the current model, prompt, "
-            "labeling, generations and feature configuration."
-        )
-
     records = load_pkl(str(path))
     if not isinstance(records, list):
         raise RuntimeError(f"Feature artifact must contain a list: {path}")

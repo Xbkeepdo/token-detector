@@ -1082,6 +1082,29 @@ class PipelineConfigTests(unittest.TestCase):
             self.assertFalse((baseline / "dhcp").exists())
             self.assertFalse((baseline / "halloc").exists())
 
+    def test_shell_entrypoints_use_the_active_python_environment(self) -> None:
+        root = Path(ROOT)
+        shell_entrypoints = [root / "run.sh", root / "run_qa.sh"]
+        shell_entrypoints.extend(sorted((root / "scripts").glob("*.sh")))
+        for path in shell_entrypoints:
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("/opt/conda", text, str(path))
+
+        for path in (root / "run.sh", root / "run_qa.sh"):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('PYTHON_BIN="${PYTHON_BIN:-python}"', text)
+
+        python_launchers = (
+            "run_risk_mass_entropy_combos.py",
+            "run_coco500_mass_dist_topk.py",
+            "run_coco500_mass_dist.py",
+            "run_coco500_mass_strength.py",
+        )
+        for filename in python_launchers:
+            text = (root / "scripts" / filename).read_text(encoding="utf-8")
+            self.assertNotIn("/opt/conda", text, filename)
+            self.assertIn('os.environ.get("PYTHON_BIN", sys.executable)', text)
+
 
 if __name__ == "__main__":
     unittest.main()

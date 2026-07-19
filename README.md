@@ -37,6 +37,11 @@ OUTPUT=outputs/qwen3_vl_8b/COCO4000-512 \
 bash run.sh
 ```
 
+Shell entrypoints use the `python` from the currently activated environment.
+Activate the intended Conda/venv before running them; an explicit interpreter
+can still be selected with `PYTHON_BIN=/path/to/python bash run.sh` (or the
+corresponding QA launcher).
+
 To rebuild corrected SVAR-aligned labels and features without regenerating the
 captions, use a new output directory and copy only the old generation artifact:
 
@@ -91,7 +96,7 @@ MODEL=qwen3_vl_8b bash run_amber.sh
 ```
 
 `run_qa.sh` is the common implementation. It prepares the fixed split, resumes
-generation/labeling/extraction, trains seeds 42/43/44, trains the native paper
+generation/labeling/extraction, trains seeds 42/43/44, trains the configured
 baselines, and writes comparison tables. QA extraction is selected in the same
 YAML with `qa_benchmarks.extraction_mode`: `all`, `method_only`,
 `ads_cgc_only`, or `baseline_only`. In `all` mode the prompt-last wrapper is
@@ -100,7 +105,20 @@ ADS+CGC, and every enabled baseline. Baseline payloads remain isolated under
 `baseline/<label_protocol>/`; `baseline_only` never creates or overwrites the
 root `features.pkl`.
 
-By default native baselines use the POPE-style
+QA probe combinations are read verbatim from `training.feature_sets.method`
+and `training.feature_sets.ads_cgc`; the trainer only appends the configured QA
+position suffix. There is no separate hard-coded QA feature matrix.
+
+QA baseline heads are also selected in YAML. The default
+`qa_benchmarks.baseline_trainer: shared_torch_mlp` sends MetaToken's canonical
+`10+H` vector, SVAR's selected `layer×head` vector, and ProjectAway's global
+plus per-layer internal-confidence vector through the same
+`training.torch_probe` MLP used by DGST and ADS+CGC. This is a controlled
+same-trainer comparison and is reported as `shared_torch_mlp`; set the value to
+`native_paper` to run each baseline's original classifier/head instead. The two
+result families use distinct filenames and are never silently mixed.
+
+By default QA baselines use the POPE-style
 `object_hallucination_yes_only` protocol. To additionally run the all-answer
 correctness track:
 

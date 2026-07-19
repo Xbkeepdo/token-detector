@@ -5,7 +5,7 @@ from detection.qa_probe import (
     build_matrix,
     aggregate_seed_results,
     classification_metrics,
-    default_feature_sets,
+    choose_real_f1_threshold,
     feature_set_position,
     feature_vector,
     legacy_feature_sets,
@@ -65,19 +65,7 @@ def _current_row():
     }
 
 
-def test_default_feature_sets_cover_six_dgst_branches_at_prompt_last_by_default():
-    names = default_feature_sets("pope")
-    assert len(names) == 9
-    for position in ("prompt_last_token",):
-        assert f"ads@{position}" in names
-        assert f"cgc@{position}" in names
-        assert f"ads+cgc@{position}" in names
-        for method in QA_DGST_METHODS:
-            assert (
-                f"{method}_risk+{method}_target_cosine+"
-                f"{method}_ev_target_dist_mass_x_cosine@{position}"
-            ) in names
-    assert not any(name.endswith("@object") for name in names)
+def test_legacy_and_current_position_names_remain_distinct():
     assert "risk_geo@object" in legacy_feature_sets("pope")
     assert feature_set_position("risk_geo@object") == "legacy_object_target"
 
@@ -176,6 +164,27 @@ def test_metrics_use_real_as_positive_class():
     assert result["accuracy"] == 1.0
     assert result["real"]["f1"] == 1.0
     assert result["hallucination"]["f1"] == 1.0
+
+
+def test_fast_real_f1_threshold_matches_brute_force_with_ties():
+    labels = np.asarray([0, 1, 1, 0, 1, 0], dtype=np.int64)
+    scores = np.asarray([0.2, 0.2, 0.7, 0.9, 0.7, 0.1], dtype=np.float64)
+    candidates = np.unique(np.concatenate(([0.0], scores, [1.0])))
+    best = (-1.0, -1.0, -np.inf, 0.5)
+    for threshold in candidates:
+        predicted = (scores >= threshold).astype(np.int64)
+        true_positive = int(((predicted == 1) & (labels == 1)).sum())
+        false_positive = int(((predicted == 1) & (labels == 0)).sum())
+        false_negative = int(((predicted == 0) & (labels == 1)).sum())
+        denominator = 2 * true_positive + false_positive + false_negative
+        f1 = 0.0 if denominator == 0 else 2 * true_positive / denominator
+        accuracy = float((predicted == labels).mean())
+        key = (f1, accuracy, -abs(float(threshold) - 0.5), float(threshold))
+        if key[:3] > best[:3]:
+            best = key
+    threshold, f1 = choose_real_f1_threshold(labels, scores)
+    assert threshold == best[3]
+    assert f1 == best[0]
 
 
 def test_weighted_torch_probe_smoke(tmp_path):

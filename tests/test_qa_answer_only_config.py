@@ -13,7 +13,6 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from detection.qa_probe import default_feature_sets
 from data.qa_benchmark import atomic_write_jsonl
 from features.qa_extractor import (
     QA_FEATURE_SCHEMA_VERSION,
@@ -26,6 +25,7 @@ from features.qa_extractor import (
 from models.base_wrapper import AttentionRequirement, ExtractionRequirements
 from scripts.qa_pipeline import _feature_keys_complete, _qa_model_cfg
 from scripts.train_qa_probes import (
+    _configured_qa_feature_sets,
     _qa_training_input_fingerprint,
     _validate_reusable_result,
     _validate_training_artifacts,
@@ -47,9 +47,24 @@ class QAAnswerOnlyConfigTests(unittest.TestCase):
             ],
             200704,
         )
-        feature_sets = default_feature_sets("pope", positions)
-        self.assertEqual(len(feature_sets), 9)
+        feature_sets = _configured_qa_feature_sets(
+            config["training"],
+            tuple(positions),
+            qa_extraction_family_flags(config),
+        )
+        expected_count = sum(
+            len(config["training"]["feature_sets"][family])
+            for family in ("method", "ads_cgc")
+        )
+        self.assertEqual(len(feature_sets), expected_count)
         self.assertTrue(all(name.endswith("@prompt_last_token") for name in feature_sets))
+        self.assertFalse(any("_target_cosine" in name for name in feature_sets))
+        self.assertIn(
+            "hmid_softmax_prob_gauss_risk+"
+            "hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine@"
+            "prompt_last_token",
+            feature_sets,
+        )
         self.assertEqual(
             qa_extraction_family_flags(config),
             {"mode": "all", "method": True, "ads_cgc": True, "baseline": True},

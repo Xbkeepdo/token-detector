@@ -3975,11 +3975,8 @@ def compute_four_gate_dgst_batch_from_captures(
         raise ValueError("four-gate DGST requires at least one decoder-layer capture.")
     if int(visual_end) <= int(visual_start):
         raise ValueError("four-gate DGST requires at least one visual support token.")
-    if int(target_region_top_k) != 32:
-        raise ValueError(
-            "The four-gate feature schema is fixed to target_region_top_k=32; "
-            f"received {target_region_top_k}."
-        )
+    if int(target_region_top_k) <= 0:
+        raise ValueError("target_region_top_k must be a positive integer.")
     methods = _normalize_four_gate_methods(enabled_methods)
     output_layer = resolve_output_embedding_layer(model)
 
@@ -4225,12 +4222,13 @@ def compute_four_gate_dgst_batch_from_captures(
             ] = torch.tensor(
                 risk_series[method], dtype=torch.float32
             )
+            topk_slug = f"topk{int(target_region_top_k)}"
             result[
-                f"dgst_t_{method}_target_cosine_topk32_{state_name}_per_layer"
+                f"dgst_t_{method}_target_cosine_{topk_slug}_{state_name}_per_layer"
             ] = torch.tensor(record["cosines"][method], dtype=torch.float32)
             result[
                 f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
-                f"topk32_{state_name}_per_layer"
+                f"{topk_slug}_{state_name}_per_layer"
             ] = torch.tensor(
                 record["ev"][method], dtype=torch.float32
             )

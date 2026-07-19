@@ -17,7 +17,6 @@ from detection.qa_probe import (
     QA_LABEL_PROTOCOLS,
     QA_POSITIONS,
     aggregate_seed_results,
-    default_feature_sets,
     feature_set_position,
     normalize_positions,
     safe_name,
@@ -99,17 +98,15 @@ def main():
     unknown_protocols = sorted(set(label_protocols) - set(QA_LABEL_PROTOCOLS))
     if unknown_protocols:
         raise ValueError(f"Unknown QA label protocols: {unknown_protocols}")
-    if args.feature_sets:
-        feature_sets = list(args.feature_sets)
-    else:
-        feature_sets = []
-        for feature_set in default_feature_sets(args.dataset, positions):
-            block = feature_set.rsplit("@", 1)[0]
-            is_ads_cgc = block in {"ads", "cgc", "ads+cgc"}
-            if is_ads_cgc and family_flags["ads_cgc"]:
-                feature_sets.append(feature_set)
-            elif not is_ads_cgc and family_flags["method"]:
-                feature_sets.append(feature_set)
+    feature_sets = (
+        list(args.feature_sets)
+        if args.feature_sets
+        else _configured_qa_feature_sets(
+            training_cfg,
+            positions,
+            family_flags,
+        )
+    )
     if not feature_sets:
         raise ValueError("No QA probe feature sets remain for the selected mode")
     for feature_set in feature_sets:
@@ -133,7 +130,12 @@ def main():
         raise ValueError("QA output_root is missing from CLI and qa_benchmarks config")
     run_root = Path(output_root) / args.model / args.dataset
     training_input_fingerprint, training_provenance = (
-        _qa_training_input_fingerprint(run_root, cfg, positions)
+        _qa_training_input_fingerprint(
+            run_root,
+            cfg,
+            positions,
+            feature_sets=feature_sets,
+        )
     )
     with open(run_root / "features.pkl", "rb") as handle:
         rows = pickle.load(handle)
@@ -217,6 +219,7 @@ def main():
         "positive_class": "real",
         "seeds": list(seeds),
         "positions": list(positions),
+        "feature_sets": list(feature_sets),
         "image_counts": image_counts,
         "training_input_fingerprint": training_input_fingerprint,
         "training_provenance": training_provenance,
@@ -226,6 +229,54 @@ def main():
     _atomic_json(summary_path, overall)
     write_overall_markdown(results_root / "summary_mean_std.md", protocol_summaries)
     print(f"[train_qa_probes] Summary: {summary_path}")
+
+
+def _configured_qa_feature_sets(
+    training_cfg: dict,
+    positions: tuple[str, ...],
+    family_flags: dict,
+) -> list[str]:
+    """Expand the YAML feature-set matrix into explicit QA positions."""
+
+    configured = training_cfg.get("feature_sets")
+    if not isinstance(configured, dict):
+        raise ValueError(
+            "training.feature_sets must be a YAML mapping with method and "
+            "ads_cgc lists"
+        )
+    unknown = sorted(set(configured) - {"method", "ads_cgc"})
+    if unknown:
+        raise ValueError(f"Unknown training.feature_sets families: {unknown}")
+
+    selected: list[str] = []
+    for family, enabled in (
+        ("method", bool(family_flags.get("method"))),
+        ("ads_cgc", bool(family_flags.get("ads_cgc"))),
+    ):
+        if not enabled:
+            continue
+        values = configured.get(family)
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(not isinstance(value, str) or not value.strip() for value in values)
+        ):
+            raise ValueError(
+                f"training.feature_sets.{family} must be a non-empty YAML list"
+            )
+        for value in values:
+            name = value.strip()
+            if "@" in name:
+                position = feature_set_position(name)
+                if position not in positions:
+                    raise ValueError(
+                        f"Configured QA feature set {name!r} uses unselected "
+                        f"position {position!r}"
+                    )
+                selected.append(name)
+            else:
+                selected.extend(f"{name}@{position}" for position in positions)
+    return list(dict.fromkeys(selected))
 
 
 def _validate_training_artifacts(
@@ -294,6 +345,8 @@ def _qa_training_input_fingerprint(
     run_root: Path,
     cfg: dict,
     positions: tuple[str, ...],
+    *,
+    feature_sets: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[str, dict]:
     """Fingerprint features, labels, split, probe config, and trainer code."""
 
@@ -313,12 +366,13 @@ def _qa_training_input_fingerprint(
         "scripts/train_qa_probes.py": Path(__file__).resolve(),
     }
     provenance = {
-        "schema_version": "qa-probe-training-provenance-v1",
+        "schema_version": "qa-probe-training-provenance-v2",
         "artifact_sha256": {
             name: _sha256_file(path) for name, path in required.items()
         },
         "qa_probe_cfg": cfg,
         "positions": list(positions),
+        "feature_sets": list(feature_sets or ()),
         "code_sha256": {
             name: _sha256_file(path) for name, path in code_paths.items()
         },

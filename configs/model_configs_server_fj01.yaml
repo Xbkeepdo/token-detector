@@ -27,6 +27,7 @@ qa_benchmarks:
   # QA uses the same four extraction modes as COCO. "all" shares one answer-
   # token forward across DGST, ADS+CGC and every enabled baseline.
   extraction_mode: "all"                  # all | method_only | ads_cgc_only | baseline_only
+  baseline_trainer: "shared_torch_mlp"    # shared_torch_mlp | native_paper; shared uses training.torch_probe for every dense baseline.
   baseline_label_protocols:
     - "object_hallucination_yes_only"
     - "answer_correctness_all"
@@ -293,6 +294,7 @@ training:
       - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       - "hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       - "hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
       - "raw_attention_ev_target_dist_mass_x_cosine"
       # - "hpre_raw_logit_gauss_risk"
       # - "hpre_raw_logit_gauss_target_cosine"

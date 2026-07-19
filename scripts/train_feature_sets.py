@@ -611,14 +611,16 @@ def _register_four_gate_aliases() -> None:
                 f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
             ),
             f"{method}_target_cosine": (
-                f"dgst_t_{method}_target_cosine_topk32_{state_name}_per_layer"
+                f"dgst_t_{method}_target_cosine_"
+                f"topk{{target_region_top_k}}_{state_name}_per_layer"
             ),
             f"{method}_ev": (
-                f"dgst_t_{method}_ev_topk32_{state_name}_per_layer"
+                f"dgst_t_{method}_ev_"
+                f"topk{{target_region_top_k}}_{state_name}_per_layer"
             ),
             f"{method}_ev_target_dist_mass_x_cosine": (
                 f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
-                f"topk32_{state_name}_per_layer"
+                f"topk{{target_region_top_k}}_{state_name}_per_layer"
             ),
         }
         for block, feature_key in specs.items():
@@ -958,6 +960,13 @@ def feature_block(feat: dict, block: str) -> np.ndarray:
         return (evidence * alpha).astype(np.float32)
 
     key = FEATURE_KEYS[block]
+    if "{target_region_top_k}" in key:
+        configured_top_k = feat.get("dgst_t_target_region_top_k")
+        if configured_top_k is None:
+            # Historical four-gate artifacts predate configurable target K and
+            # were always serialized with K=32.
+            configured_top_k = 32
+        key = key.format(target_region_top_k=int(configured_top_k))
     values = feat.get(key)
     if values is None and block == "risk":
         values = feat.get("dgst_t_per_layer")

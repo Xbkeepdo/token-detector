@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from detection.qa_probe import baseline_probe_vector, label_for_protocol
 from features.baseline import attach_baseline, make_baseline_record
 from features.qa_baseline import (
     DEFAULT_QA_LABEL_PROTOCOL,
@@ -28,6 +29,7 @@ from features.qa_baseline import (
 from models.base_wrapper import ModelOutput
 from scripts.train_qa_baselines import (
     DEFAULT_SEEDS,
+    _normalize_qa_baseline_trainer,
     run_qa_baseline_training,
 )
 
@@ -162,6 +164,57 @@ def _projectaway_record(key, image_id, split, label, protocol):
 
 
 class QABaselineTests(unittest.TestCase):
+    def test_qa_baseline_trainer_is_explicit(self):
+        self.assertEqual(
+            _normalize_qa_baseline_trainer("shared_mlp"),
+            "shared_torch_mlp",
+        )
+        self.assertEqual(
+            _normalize_qa_baseline_trainer("paper"),
+            "native_paper",
+        )
+        with self.assertRaisesRegex(ValueError, "baseline_trainer"):
+            _normalize_qa_baseline_trainer("mystery")
+
+    def test_shared_mlp_vectors_and_protocol_specific_label(self):
+        record = _baseline_record(
+            "shared",
+            "attribute",
+            1,
+            "train",
+            0,
+            dataset="amber_discriminative",
+            label_protocol="object_hallucination_yes_only",
+        )
+        attach_baseline(
+            record,
+            "metatoken",
+            {"vector": np.asarray([1.0, 2.0], np.float32)},
+        )
+        attach_baseline(
+            record,
+            "projectaway",
+            {
+                "internal_confidence": 0.4,
+                "hallucination_score": 0.6,
+                "per_layer_internal_confidence": np.asarray(
+                    [0.1, 0.4], np.float32
+                ),
+            },
+        )
+        np.testing.assert_array_equal(
+            baseline_probe_vector(record, "metatoken"),
+            np.asarray([1.0, 2.0], np.float32),
+        )
+        np.testing.assert_allclose(
+            baseline_probe_vector(record, "projectaway"),
+            np.asarray([0.4, 0.1, 0.4], np.float32),
+        )
+        self.assertEqual(
+            label_for_protocol(record, "object_hallucination_yes_only"),
+            0,
+        )
+
     def test_answer_index_uses_actual_saved_response_token(self):
         response_ids, index = resolve_qa_answer_index(
             {
