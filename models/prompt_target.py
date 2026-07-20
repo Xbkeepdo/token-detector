@@ -227,6 +227,7 @@ def extract_prompt_target_from_inputs(
                 .strip()
                 .lower()
                 != "four_gate"
+                or bool(cfg_dgst_t.get("compute_ffn_injection_features", False))
             ),
             **prefix_inputs,
         )
@@ -677,4 +678,6 @@ def _dgst_options(cfg: Mapping[str, Any]) -> dict[str, Any]:
             cfg.get("dgst_t_dual_scope", cfg.get("compute_dual_scope", False))
         ),
         "four_gate_methods": cfg.get("four_gate_methods"),
+        "four_gate_cost_modes": cfg.get("cost_modes"),
+        "four_gate_support_modes": cfg.get("support_modes"),
     }

@@ -1,5 +1,91 @@
 # Current Task
 
+## 2026-07-20 compact four-gate 新增 VP hpre_raw 与 ffn_fad
+
+- unified 配置新增显式 `support_modes` 开关：`["vv"]` 只抽视觉支持，`["vp"]` 只抽“视觉 token ∪ prompt token”，`["vv", "vp"]` 则在同一次 decoder forward/capture 后计算两套特征。当前启用第三种；VP 独立保存为 `dgst_t_vp_*`，不会覆盖或误读 VV。
+- compact 路径重新接入历史 `ffn_fad`：每层预测位置计算 `log((||o_ffn||_2+eps)/(||o_attn||_2+eps))`，保存为 `dgst_t_ffn_attn_dominance_per_layer`。仅恢复该曲线，不重新计算 EIF-dose、logit-lift 等较重的旧 FFN diagnostics；wrapper 仅在启用 FAD 时保留 MHSA 更新张量。
+- 主 cost 已确认为 `sqrt_matched_state`，`sqrt_stateupd_alpha05` 仅作为显式后缀的并行对照，两者仍在一次抽取中计算。FAD 与 VV/VP risk 共用同一次 forward/capture，不存在独立重跑。默认 FAD 训练项为：FAD 单独 32 维、`FAD*VV-hpre_raw-matched-risk` 逐层乘积 32 维、该 VV 乘积再与 VV mass×cosine(EV) 拼接的 64 维输入，以及 `FAD*VP-hpre_raw-matched-risk` 逐层乘积 32 维；`*` 是 Hadamard 逐层乘法，`+` 是向量拼接。VV/VP 的 alpha05 risk 与 risk+EV 保留为消融对照。
+- 训练 alias、compact serializer、单 token/批量/prompt-target 和全部模型共享 capture 路径均已接通。分支过滤同时识别 `support_modes`、`vp_` 前缀及乘积两侧的分支依赖，关闭 VV/hpre 时不会误留 FAD×VV-risk 训练项。
+- 合成回归验证 VV/VP 支持矩阵分别为 3/4 位置、FAD 手算为 `log(1.0/0.5)`，且 `ffn_fad+vp_hpre_raw...risk` 可组成训练矩阵；`tests.test_four_gate_dgst` 17/17 通过，相关 Python 编译通过。系统与 vicr 均无 pytest，改用标准库 unittest；混跑旧 pipeline/stage 测试仍有 manifest 与已关闭 raw-attention/hmid 配置断言失败，属于开始前已有的不一致。
+- LLaVA-NeXT 真实 1 图 smoke 已完成 7 个 object token：FAD、VV risk、VP risk/EV 均为 32 层且全部 finite；VV/VP 支持数为 984/1039。误启动的完整抽取已按用户要求中止，GPU 均已释放；隔离目录 `outputs/llava_next_8b/COCO4000-512-AC-all-fad-vp/` 留有约 158 张图的未合并分片，原 `COCO4000-512-AC-all/features.pkl` 未覆盖。用户确认前不再启动真实抽取。
+- 新开关及三项 FAD 训练配置相关 Python 编译通过。随后运行完整 four-gate unittest 及单独的 `test_dual_scope_hpre_raw_and_ffn_fad_are_serialized_and_trainable` 时，进程都在导入标准库 `unittest` 阶段进入 NFS `rpc_wait_bit_killable`，数分钟无进展后已发送中断；这是文件系统读取等待，测试体尚未开始，因而本轮暂时没有新的 unittest 结果。此前同一合成用例在加入显式开关前已通过。
+
+## 2026-07-20 COCO baseline 统一三层 MLP
+
+- `train_baselines.py` 新增 `native_paper | shared_torch_mlp` 训练器选择；unified 的 `training.baseline.trainer` 已启用 `shared_torch_mlp`。MetaToken、SVAR、ProjectAway 复用 method probe 的同一 `input→128→64→32→1`、Linear-BatchNorm-ReLU-Dropout(0.3)、Adam、plain BCE、train-loss scheduler/early stopping/minimum-loss checkpoint，以及固定 0.5 + train Real-F1 双阈值协议。
+- 输入保持各 baseline 自身定义：MetaToken=`42` 维、SVAR=`448` 维、ProjectAway=`1` 个 global internal confidence + `32` 层曲线=`33` 维；不做额外 z-score 或类别加权。DHCP 不在当前 `training.baseline.methods`，因此没有加入本轮三层 MLP。
+- LLaVA-NeXT COCO4000 seeds `43/44/45` 已完成 3 方法 × 3 seed。train-F1 阈值 Test 的 Real-F1/AUROC/Hall-F1：MetaToken-MLP=`0.9082±0.0001/0.8253±0.0012/0.0404±0.0235`，SVAR=`0.9376±0.0020/0.9123±0.0017/0.6724±0.0198`，ProjectAway=`0.9309±0.0010/0.8725±0.0027/0.5558±0.0240`。
+- 相对原生 head：MetaToken-MLP 对最佳 MetaToken-GB 的 Real-F1/AUROC/Hall-F1 分别下降 `0.0195/0.0612/0.5451`，几乎全部预测 real；SVAR 分别变化 `+0.0013/-0.0069/+0.0156`；ProjectAway 分别提升 `+0.0081/+0.0699/+0.1478`。统一 MLP 下 SVAR 仍为最好方法。
+- 新产物隔离在 `baseline/results/shared_torch_mlp/` 与 `baseline/checkpoints/shared_torch_mlp/`，原生 baseline 结果未覆盖。9/9 checkpoint 均核验为正确的四个 Linear weight shape，三 seed 汇总为 `llava_next_8b_baselines_shared_torch_mlp_3seed_summary.md`。
+- 验证：Python 编译通过；shared-MLP vector/trainer/config、baseline 双阈值汇总与 Torch probe reporting 共 8 项 unittest 通过。联合运行旧 `tests.test_train_and_eval_stage` 时另有 1 failure + 2 errors：旧测试仍要求当前 YAML 启用 raw-attention/hmid feature sets，而当前用户配置已主动关闭这些分支；与本轮 baseline MLP 无关。正式 9 次 GPU 训练、汇总生成、checkpoint shape 审计、统一训练 dry-run 和 `git diff --check` 通过。
+
+## 2026-07-20 alpha05 risk + EV 联合训练
+
+- unified 训练列表新增 `hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha05+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine`；两个 32 层向量直接拼接为 64 维输入，未重新提取特征。
+- 使用正式 Torch probe 配置（`128→64→32`、dropout 0.3、strict image-level 8:2、Real-positive、train-F1 阈值）完成 seeds `43/44/45`，结果隔离写入 `results/alpha05_ev_seed{seed}`，未覆盖已有结果或重跑 baseline。
+- train-F1 阈值三 seed 均值：Accuracy=`0.867±0.002`、Real F1=`0.921±0.002`、AUROC=`0.886±0.005`、Real AUPR=`0.973±0.002`、Hall F1=`0.582±0.010`。相对单独 alpha05 risk，Real F1/AUROC/Hall F1 分别提高约 `0.005/0.045/0.066`；相对单独 EV 分别提高约 `0.003/0.029/0.108`。
+- 该结果与旧的无后缀 `hpre_raw_logit_gauss_risk+...EV` 完全相同：当前 artifact 的 primary `dgst_t_cost` 是 `sqrt_stateupd_alpha05`，因此无后缀 risk 别名与显式 alpha05 risk 读取同一字段。这是同一输入的别名复现，不是两个不同 cost 的独立增益；训练列表已停用重复的无后缀组合，避免后续重复训练。
+- 三 seed 汇总为 `outputs/llava_next_8b/COCO4000-512-AC-all/results/llava_next_8b_alpha05_ev_3seed_summary.{md,csv,json}`；YAML dry-run、三次 64 维训练、汇总生成及 `git diff --check` 通过。
+
+## 2026-07-20 compact four-gate 多 cost 同提取与 matched-state 修正
+
+- compact four-gate 新增 `cost_modes`，可在同一次模型 capture/source/target/top-K support 上同时构造多张 cost matrix 并分别求精确 EMD；`cost_mode` 保留为 primary，旧 `<method>_risk` 别名继续指向 primary，保证兼容。
+- unified 当前 primary 为 `sqrt_stateupd_alpha05`，并同时启用 `sqrt_stateupd_alpha05`、`sqrt_cosine_matched_state`。两个显式训练别名分别为 `<method>_risk_sqrt_stateupd_alpha05`、`<method>_risk_sqrt_matched_state`；按用户最新要求不再提取或训练 `geo_stateupd_lu1`。
+- 按用户公式修正 `sqrt_stateupd_alpha05` 的 state 项为 branch-matched state：hpre 方法使用 `h_prev`，hmid 方法使用 `h_mid`；update 项两者都使用 `h_out-h_mid=o_ffn`。公式为 `C=0.5*sqrt((1-cos(h_state_i,h_state_j))/2)+0.5*sqrt((1-cos(o_ffn_i,o_ffn_j))/2)`。
+- 新结果保存 `dgst_t_cost_modes` 以及每个 method/cost 的独立 risk 字段；serializer、全部 wrapper、prompt-target 路径和训练 alias 均已透传。单 cost 旧产物继续兼容。
+- 现有 LLaVA-NeXT `COCO4000-512-AC-all/features.pkl` 的 9,668 条记录本来就只含上述两种 cost；此前训练列表额外请求 lu1，导致前两项训练完成后在缺失字段处报错。现已移除该训练项，抽样验证当前 7 个活动 feature sets 均可从现有记录解析，无需重提取。
+- 验证：相关 Python 编译通过；逐项手算分别验证 hpre/hmid matched state、0.5/0.5 混合以及多 cost 同时输出；four-gate、prompt-target、extraction、source-target-JS、cost-variant 共 51 项 unittest 全部通过；unified 两 cost 配置和两个显式训练别名通过。
+
+## 2026-07-20 unified 新增并启用 sqrt_stateupd_alpha05 cost
+
+- 新增 compact four-gate canonical cost `sqrt_stateupd_alpha05`，严格实现 `d_state=sqrt((1-cos(h_mid_i,h_mid_j))/2)`、`delta_h_i=h_out_i-h_mid_i=o_ffn_i`、`d_upd=sqrt((1-cos(delta_h_i,delta_h_j))/2)`、`C=(1-alpha)d_state+alpha*d_upd`，本版固定 `alpha=0.5`。
+- `configs/model_configs_unified.yaml` 已从 `geo_stateupd_lu1` 切换到新 cost；旧 `geo_stateupd_lu1` 和 `sqrt_cosine_matched_state` 均继续保留可选。新字段为 `dgst_t_<method>_risk_sqrt_stateupd_alpha05_per_layer`，结果同时保存 `dgst_t_cost=sqrt_stateupd_alpha05` 与 `dgst_t_cost_alpha=0.5`。
+- compact feature serializer 与现有 `<method>_risk` 训练别名已接入新字段，因此无需改 training feature-set 名称。逐项手算测试独立构造两张 sqrt-cosine 距离矩阵及 0.5/0.5 cost，再与 EMD 输出对齐。
+- 验证：相关 Python 编译通过；four-gate、prompt-target、extraction、source-target-JS、cost-variant 共 51 项 unittest 全部通过；unified YAML 加载与 canonical normalize 通过。
+
+## 2026-07-20 unified 启用 geo_stateupd_lu1 cost
+
+- `configs/model_configs_unified.yaml` 的活动 `four_gate` profile 已将 `cost_mode` 切换为 `geo_stateupd_lu1`。此前 compact four-gate 快路径会忽略 YAML 的 cost 选择；现在配置值会经过各模型 wrapper/共享 capture 路径传入并真实参与 OT cost 构造。
+- 逐层 support-token cost 为 `C_ij=(1-cos(h_mid_i,h_mid_j))+(1-cos(o_ffn_i,o_ffn_j))`：`h_out=h_mid+o_ffn`，因此 state-update 向量就是 `h_out-h_mid=o_ffn`，`lambda_u=1.0`。不使用旧活动配置的 `sqrt((1-cos)/2)`。风险仍在 source/target top-K union 上用精确 EMD 计算。
+- 新结果字段为 `dgst_t_<method>_risk_geo_stateupd_lu1_per_layer`，并保存 `dgst_t_cost=geo_stateupd_lu1`；现有 `<method>_risk` 训练别名会按该 metadata 自动读取新字段，旧 `sqrt_cosine_matched_state` 产物继续读取原字段。
+- 验证：相关 Python 文件编译、unified YAML 加载/normalize、`git diff --check` 通过；four-gate/prompt-target/extraction/source-target-JS/cost-variant 共 50 项 unittest 全部通过，其中新增手算同路径 EMD 回归覆盖 hmid 与 FFN update 两项距离。
+- 额外组合运行 `tests.test_extraction_modes tests.test_pipeline_config tests.test_raw_attention_integration` 时，45 项中出现 7 failures + 4 errors：pipeline manifest 旧断言与当前未提交的 pipeline 改动不一致，另一个旧测试要求活动 YAML 启用 `raw_attention`，但本轮开始前该分支已被关闭。这些与本次 cost 路径无关，未为通过旧断言而改回用户现有配置。
+
+## 2026-07-20 LLaVA-NeXT Llama-3 EOT 对齐修复
+
+- LLaVA-NeXT 完成 COCO4000 双卡生成后，CHAIR labeling 在 image `578522` 的最后一个 response token 报错。该 token 为 `128009=<|eot_id|>`：tokenizer backend 与 `added_tokens_decoder` 均将其标为 special，`skip_special_tokens=True` 也会移除它，但该 checkpoint 的 `all_special_ids` 仅包含 128000/128001，旧对齐器因只读取后者而误判为可见 token。
+- `utils/token_alignment.py` 现在合并 `all_special_ids` 与所有 `AddedToken.special=True` 的 ID；decoder fallback 与 SentencePiece visible-index 路径共享同一集合。原始 `response_token_ids` 长度和索引完全保留，EOT 只映射为 `None`，不删除或重编码 token。
+- 新增 `all_special_ids` 不完整的 Llama-3 EOT 回归用例。16/16 项 COCO token alignment unittest 通过；真实失败样本最后 offset 为 `None`；现有 4000/4000 条 LLaVA-NeXT 生成全量只读对齐扫描通过、0 failures。已有生成可直接复用并从 CHAIR labeling 续跑。
+
+## 2026-07-19 默认三层 Torch MLP 与双阈值报告
+
+- 两份活动统一配置已同步切换到同一正式协议：COCO4000 严格按物理图片划分为 train/test=`3200/800`，validation 为空；网络为 `input→128→64→32→1`，每个隐藏层严格执行 Linear-BatchNorm-ReLU-Dropout(0.3)，Linear 使用 Kaiming-uniform-ReLU 初始化。
+- 训练默认值为 Adam、`lr=1e-3`、`weight_decay=1e-5`、batch 256、最多 100 epochs、plain BCEWithLogitsLoss。ReduceLROnPlateau 只监控 train loss（factor 0.5、patience 5）；early stopping 同样只监控 train loss（patience 10），并恢复 minimum-train-loss checkpoint。默认不做额外 z-score 或类别加权，seeds 改为 `43/44/45`。
+- 同一个 minimum-train-loss checkpoint 现在同时报告两套结果：固定阈值 `0.5`，以及只用训练集 Real-F1 搜索的阈值；test 从不参与阈值搜索。为兼容旧 JSON 消费者，顶层 `threshold/train_metrics/test_metrics` 仍对应 `train_f1`，完整双报告写在 `threshold_reports.fixed_0.5` 与 `threshold_reports.train_f1`。
+- COCO Torch probe、QA DGST/ADS/CGC probe，以及默认 `shared_torch_mlp` 的 MetaToken/SVAR/ProjectAway baseline 已统一到上述架构、checkpoint 和双阈值语义；逐 seed JSON、baseline 汇总、Torch probe 汇总和 QA comparison Markdown 都会同时展示两套阈值结果。旧结果的训练指纹与新配置不一致，不能静默复用。
+- 验证：41/41 项针对性 unittest 通过；三 seed CPU 小数据端到端 smoke 确认一个 checkpoint 可同时转换并聚合两套阈值，固定阈值汇总均值严格为 0.5；双 YAML 参数审计、`train_and_eval.py --dry-run`（43/44/45）、Python 编译、shell 语法和 `git diff --check` 通过。默认正式 8B 实验尚未重训，现有历史结果不应当作新配置结果。
+
+## 2026-07-19 AMBER 固定 BN-ReLU MLP 消融
+
+- 新增隔离入口 `scripts/train_qa_fixed_mlp_experiment.py`，在不改动正式 QA probe/baseline 训练语义的前提下联合读取协议专属 MetaToken/SVAR baseline 特征与根 DGST 特征。输入 cohort、标签、物理图片 split、baseline manifest 和文件 SHA 均在训练前校验，结果指纹为 `b3cde613...`。
+- 本次按 `answer_correctness_all`、seeds 42/43/44 训练 MetaToken、SVAR、`hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine@prompt_last_token`。沿用 AMBER 现有 803/0/201 张图片、11385/0/2831 条样本；train/test 的 hall/real 分别为 1335/10050、292/2539。
+- 网络严格为 `input→128→64→32→1`，每个隐藏层使用 Linear-BatchNorm-ReLU-Dropout(0.3)，Linear 用 Kaiming-uniform-ReLU 初始化；plain BCEWithLogitsLoss、Adam(lr=1e-3, weight_decay=1e-5)、batch 256。ReduceLROnPlateau 与 early stopping 均只监控 train loss，patience 分别为 5/10，恢复 minimum-train-loss checkpoint；最多 100 epochs，阈值固定 0.5，不做额外 z-score 或类别加权。
+- 三 seed Test AUROC/Real-F1/Hall-F1/Acc：MetaToken=`0.8284/0.9456/0.0000/0.8969`，SVAR=`0.7849/0.9212/0.3660/0.8604`，hpre risk+EV=`0.8441/0.9369/0.3663/0.8858`。MetaToken 固定阈值下全部预测为 real；hpre risk+EV 平均 AUROC 最好，但 seed 标准差 0.0278，明显不如正式配置的 0.0040 稳定。
+- 复用同一批 checkpoint，新增按每个 feature/seed 的 train Real-F1 精确搜索阈值的隔离评估；test 仍不参与阈值选择。搜索后阈值均值 MetaToken/SVAR/hpre risk+EV=`0.5289/0.3778/0.5117`，Test AUROC/Real-F1/Hall-F1/Acc 分别为 `0.8284/0.9457/0.0424/0.8972`、`0.7849/0.9320/0.3520/0.8770`、`0.8441/0.9439/0.3884/0.8972`。相对固定 0.5，hpre risk+EV 的 Real-F1/Hall-F1/Acc 提升 `+0.0069/+0.0221/+0.0114`；SVAR 的 Hall-F1 下降 `0.0140`；MetaToken 仍基本预测为 real。
+- 9/9 checkpoint 的层形状、固定阈值、输入指纹、best epoch 与 history 最小 train loss 均已核对。新增 2 项架构/协议单测通过，Python 编译与 `git diff --check` 通过；正式结果位于 `outputs/qa_benchmarks/qwen3_vl_8b/amber_discriminative/experiments/mlp_bn_relu_trainloss_es_fixed05/answer_correctness_all/`。
+- train-threshold 结果位于 `outputs/qa_benchmarks/qwen3_vl_8b/amber_discriminative/experiments/mlp_bn_relu_trainloss_es_train_real_f1_threshold/answer_correctness_all/`；入口为 `scripts/evaluate_qa_fixed_mlp_train_threshold.py`，只引用源 checkpoint，不复制或覆盖模型权重。
+
+## 2026-07-19 LLaVA-NeXT-8B wrapper 接入
+
+- 新增 `models/llava_next_wrapper.py`，完整接入 `lmms-lab/llama3-llava-next-8b` 的生成、单/批 token 特征、prompt-target、DGST、ADS/CGC 和 baseline 共用路径。NeXT 复用现有 LLaVA 抽取主干，但使用官方 `llava_llama_3` system/user 模板和 AnyRes 动态连续视觉 span，不再错误继承 LLaVA-1.5 固定 576 token / 24x24 布局。
+- 该公开 checkpoint 是原始 LLaVA 平铺 config/state-dict，而不是原生 Transformers `LlavaNextConfig`。wrapper 在内存中构造 Llama-3 + CLIP-L/14-336 的嵌套配置并映射权重键，不修改磁盘上的 16 GB 权重。验证 index 的 687/687 个键均有唯一目标；当前已存在分片的 604 个张量 shape 全部匹配，无 missing/unexpected/mismatch。
+- 原 checkpoint 将 `<image>` 设为 ID 128256，但 embedding 只有 128256 行；原始 LLaVA 会在查 embedding 前替换占位符，而 Transformers NeXT 会先查 embedding。processor 因此只把 image placeholder 重映射到未使用的保留 ID 128255，模型同样以 128255 做 masked scatter；视觉向量本身不经过该 token embedding，语言 token 与全部模型权重保持不变。
+- AnyRes processor smoke 覆盖 `336x336`、`640x320`、`320x640`：展开 image token 数分别为 `1176/1752/1776`，与 `LlavaNextModel.pack_image_features()` 的实际打包长度逐一相等；原 tokenizer image ID 已全部替换，不残留越界 ID。
+- 模型工厂注册 `llava_next_8b` 和兼容别名 `llava_next_llama3_8b`；本机/服务器统一 YAML、POPE prompt、QA provenance source hash 均已接入。`huggingface-hub` 从与 Transformers 4.57.6 不兼容的 1.8.0 恢复为 0.36.2，并在 `requirements.txt` 固定 `>=0.34,<1.0`。
+- 新增 5 项 wrapper 单测；与 prompt-target 回归合计 14/14 通过。`py_compile`、YAML 加载、`git diff --check`、权重键/shape 审计通过。
+- 完整 CPU unittest 命令 `CUDA_VISIBLE_DEVICES='' /opt/conda/private/envs/vicr/bin/python -m unittest discover -v tests` 共 183 项，出现 11 failures + 4 errors：其中 QA YAML 失败来自本轮开始前未提交的 feature sets 已含 `_target_cosine` 而旧断言禁止；其余 pipeline/stage/training provenance 失败来自现有未提交的 `run.sh` / training 相关改动，表现为旧测试期待 manifest 拒绝或落盘但当前逻辑未执行。本次针对性 LLaVA/NeXT 测试全部通过，未修改这些并行开发文件。
+- 真实 GPU forward 尚未执行：本地模型缺 `model-00001-of-00004.safetensors`。镜像单连接已安全下载前 `549134336` 字节到同目录 `.part`；8/4 路 Range 因镜像 SSL EOF 失败，损坏的 `.parallel` 已删除，正式分片没有伪造。可用单连接 `curl -L --fail -C - -o ...safetensors.part <镜像URL>` 继续，达到官方大小 `4976706872` 且 SHA-256 为 `eda352b5dd159390824859f8a31fb1c015bdf161ae44678602e88e3b4b631e1b` 后再改正式文件名。
+
 ## 2026-07-19 AMBER baseline 原生训练器对照
 
 - `train_qa_baselines.py` 新增 `--trainer native_paper|shared_torch_mlp` 临时覆盖参数，可在不修改 YAML 默认训练器的情况下补跑另一种 head；两类结果继续使用隔离路径。
@@ -15,6 +101,7 @@
 - 结果显式命名 `shared_torch_mlp` 并与原生 baseline 文件隔离。`summarize_qa_comparison.py` 会按 YAML 选择对应汇总，避免将统一 MLP 结果误称为论文原生 head。
 - AMBER `object_hallucination_yes_only` 三 seed Test：MetaToken AUC/Real-F1/Hall-F1/Acc=`0.8771/0.9314/0.6007/0.8829`；SVAR=`0.8793/0.9411/0.6250/0.8982`；ProjectAway=`0.5154/0.9085/0.0000/0.8323`。
 - AMBER `answer_correctness_all` 三 seed Test：MetaToken AUC/Real-F1/Hall-F1/Acc=`0.8862/0.9423/0.4584/0.8957`；SVAR=`0.7782/0.9400/0.3281/0.8898`；ProjectAway=`0.5622/0.9440/0.0086/0.8939`。ProjectAway 的高 Real-F1 伴随几乎为零的 Hall-F1，主要反映类别不平衡，不能当作有效幻觉检出。
+- 2026-07-19 按当前代码指纹 `fc60ba76...` 对 `answer_correctness_all` 重新完成 3 方法 × 3 seeds 的正式 GPU 训练；9/9 checkpoint 均为 `input→256→128→64→1` 且跑满 120 epochs，新汇总与旧指纹结果逐项一致。旧产物完整保留在 `results/shared_torch_mlp_fingerprint_3d0b13e8/`，当前有效产物位于 `results/shared_torch_mlp/`。
 - 将 train Real-F1 阈值搜索从逐候选全量扫描的 O(N²) 改为排序+前缀计数的等价 O(N log N)；12,000 条样本由数十秒降到约 0.007 秒，暴力对齐测试确认阈值与 F1 不变。
 - 验证：全仓 173 项 unittest 通过；新增 baseline 向量、协议标签和 trainer 规范化测试通过；快速阈值与暴力版本等价；Python 编译、shell 语法、`git diff --check` 通过。两套正式三 seed 汇总及跨方法 comparison 均已生成。
 

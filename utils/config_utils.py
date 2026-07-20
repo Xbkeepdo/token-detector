@@ -245,6 +245,29 @@ def get_model_cfg(config: dict, model_key: str) -> dict:
     return cfg
 
 
+def get_extraction_model_cfg(config: dict, model_key: str) -> dict:
+    """Return model config with feature-extraction-only overrides applied.
+
+    Keeping these overrides outside ``models`` lets an existing generation
+    manifest remain bound to the exact settings that produced its captions,
+    while feature extraction can deliberately use a cheaper visual layout.
+    The effective model config is still included in feature provenance.
+    """
+    cfg = get_model_cfg(config, model_key)
+    feature_cfg = config.get("feature_extraction") or {}
+    if not isinstance(feature_cfg, Mapping):
+        raise ValueError("feature_extraction must be a mapping")
+    overrides_by_model = feature_cfg.get("model_overrides") or {}
+    if not isinstance(overrides_by_model, Mapping):
+        raise ValueError("feature_extraction.model_overrides must be a mapping")
+    overrides = overrides_by_model.get(model_key) or {}
+    if not isinstance(overrides, Mapping):
+        raise ValueError(
+            f"feature_extraction.model_overrides.{model_key} must be a mapping"
+        )
+    return _deep_merge(cfg, dict(overrides))
+
+
 def get_ads_cfg(config: dict) -> dict:
     return config["feature_extraction"]["ads"]
 

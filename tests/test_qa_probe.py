@@ -226,10 +226,12 @@ def test_weighted_torch_probe_smoke(tmp_path):
     assert result["position"] == "shared"
     assert (tmp_path / "checkpoint.pt").exists()
     assert result["epochs_completed"] == 3
-    assert result["best_epoch"] == 3
+    assert 1 <= result["best_epoch"] <= 3
     assert result["val_metrics"] is None
-    assert result["checkpoint_selection"] == "last_epoch"
+    assert result["checkpoint_selection"] == "minimum_train_loss"
     assert result["threshold_selection"] == "train_f1"
+    assert result["threshold_reporting"] == ["fixed_0.5", "train_f1"]
+    assert result["threshold_reports"]["fixed_0.5"]["threshold"] == 0.5
     assert result["train_metrics"]["real"]["f1"] >= 0.0
     summary = aggregate_seed_results([
         result,
@@ -242,3 +244,5 @@ def test_weighted_torch_probe_smoke(tmp_path):
     )
     report = summary_path.read_text(encoding="utf-8")
     assert "Real F1" in report and "Hall. F1" in report and "mean ±" in report
+    assert "Fixed threshold = 0.5" in report
+    assert "Threshold selected on train Real-F1" in report

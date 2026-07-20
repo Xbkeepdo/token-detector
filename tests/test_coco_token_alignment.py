@@ -206,6 +206,37 @@ class _ZeroWidthSentencePieceTokenizer:
         return decoded.get(values, "�")
 
 
+class _IncompleteSpecialIdTokenizer:
+    """Mimic Llama-3 eot metadata missing from all_special_ids."""
+
+    is_fast = False
+    all_special_ids = [99]
+    added_tokens_decoder = {
+        99: SimpleNamespace(special=True),
+        100: SimpleNamespace(special=True),
+    }
+
+    def decode(
+        self,
+        token_ids,
+        *,
+        skip_special_tokens: bool = True,
+        clean_up_tokenization_spaces: bool = False,
+    ) -> str:
+        del clean_up_tokenization_spaces
+        pieces = {1: "A", 2: " dog", 3: ".", 99: "<eos>", 100: "<|eot_id|>"}
+        return "".join(
+            pieces[int(value)]
+            for value in token_ids
+            if not (
+                skip_special_tokens and int(value) in {99, 100}
+            )
+        )
+
+    def batch_decode(self, rows, **kwargs):
+        return [self.decode(row, **kwargs) for row in rows]
+
+
 class CocoTokenAlignmentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -280,6 +311,16 @@ class CocoTokenAlignmentTests(unittest.TestCase):
             char_start=2,
             char_end=7,
         )
+
+    def test_added_special_eot_missing_from_all_special_ids_is_ignored(self) -> None:
+        tokenizer = _IncompleteSpecialIdTokenizer()
+        offsets = build_response_token_offsets(
+            tokenizer,
+            [1, 2, 3, 100],
+            "A dog.",
+        )
+        self.assertEqual(offsets[:3], [(0, 1), (1, 5), (5, 6)])
+        self.assertIsNone(offsets[3])
 
     def test_multitoken_unicode_span_preserves_bos_and_eos_indices(self) -> None:
         tokenizer = _FastTokenizer()

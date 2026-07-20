@@ -304,8 +304,9 @@ class PromptTargetForwardTests(unittest.TestCase):
         self.assertEqual(metadata["target_token_id"], 21)
         self.assertEqual(metadata["tokenized_span"], [3, 4])
 
-    def test_all_five_wrappers_override_prompt_target_api(self) -> None:
+    def test_all_six_wrappers_implement_prompt_target_api(self) -> None:
         from models.internvl_wrapper import InternVLWrapper
+        from models.llava_next_wrapper import LLaVANextWrapper
         from models.llava_onevision_wrapper import LLaVAOneVisionWrapper
         from models.llava_wrapper import LLaVAWrapper
         from models.qwen3_vl_wrapper import Qwen3VLWrapper
@@ -313,13 +314,14 @@ class PromptTargetForwardTests(unittest.TestCase):
 
         for wrapper_type in (
             LLaVAWrapper,
+            LLaVANextWrapper,
             InternVLWrapper,
             QwenVLWrapper,
             Qwen3VLWrapper,
             LLaVAOneVisionWrapper,
         ):
             with self.subTest(wrapper=wrapper_type.__name__):
-                self.assertIn("extract_prompt_target_features", wrapper_type.__dict__)
+                self.assertTrue(callable(wrapper_type.extract_prompt_target_features))
 
 
 if __name__ == "__main__":

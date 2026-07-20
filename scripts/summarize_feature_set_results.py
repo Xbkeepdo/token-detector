@@ -104,28 +104,40 @@ def _iter_rows(results: dict) -> Iterable[dict]:
             metrics = classifiers.get(classifier)
             if not isinstance(metrics, dict):
                 continue
-            row = {
-                "feature_set": feature_set,
-                "classifier": classifier,
-            }
-            for metric in METRIC_ORDER:
-                row[metric] = metrics.get(metric)
-            real_metrics = metrics.get("real_positive")
-            hallucination_metrics = metrics.get("hallucination_positive")
-            row["dual_class_metrics"] = isinstance(
-                real_metrics, dict
-            ) and isinstance(hallucination_metrics, dict)
-            for prefix, class_metrics in (
-                ("real", real_metrics),
-                ("hallucination", hallucination_metrics),
-            ):
-                for metric in CLASS_METRIC_ORDER:
-                    row[f"{prefix}_{metric}"] = (
-                        class_metrics.get(metric)
-                        if isinstance(class_metrics, dict)
-                        else None
-                    )
-            yield row
+            reports = metrics.get("threshold_reports") or {}
+            variants = [
+                (
+                    f"{classifier}[{mode}]",
+                    report.get("test_metrics") or {},
+                )
+                for mode, report in reports.items()
+                if isinstance(report, dict)
+            ] or [(classifier, metrics)]
+            for classifier_label, variant_metrics in variants:
+                row = {
+                    "feature_set": feature_set,
+                    "classifier": classifier_label,
+                }
+                for metric in METRIC_ORDER:
+                    row[metric] = variant_metrics.get(metric)
+                real_metrics = variant_metrics.get("real_positive")
+                hallucination_metrics = variant_metrics.get(
+                    "hallucination_positive"
+                )
+                row["dual_class_metrics"] = isinstance(
+                    real_metrics, dict
+                ) and isinstance(hallucination_metrics, dict)
+                for prefix, class_metrics in (
+                    ("real", real_metrics),
+                    ("hallucination", hallucination_metrics),
+                ):
+                    for metric in CLASS_METRIC_ORDER:
+                        row[f"{prefix}_{metric}"] = (
+                            class_metrics.get(metric)
+                            if isinstance(class_metrics, dict)
+                            else None
+                        )
+                yield row
 
 
 def _to_markdown(rows: list[dict], *, dual_class: bool = False) -> str:

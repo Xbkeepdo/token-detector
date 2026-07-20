@@ -44,8 +44,8 @@ class TorchProbeReportingTests(unittest.TestCase):
 
     def test_three_seed_summary_requires_real_headline_and_both_classes(self) -> None:
         metrics = {}
-        for seed in (42, 43, 44):
-            metrics[seed] = {
+        for seed in (43, 44, 45):
+            payload = {
                 "precision": 0.8,
                 "recall": 0.8,
                 "f1": 0.8,
@@ -57,21 +57,40 @@ class TorchProbeReportingTests(unittest.TestCase):
                 "hallucination_positive": _class_metrics(0.5),
                 "best_params": {"seed": seed},
                 "split_protocol": "strict_82_no_validation",
-                "checkpoint_selection": "last_epoch",
+                "checkpoint_selection": "minimum_train_loss",
                 "threshold_selection": "train_f1",
+                "threshold_reporting": ["fixed_0.5", "train_f1"],
             }
+            payload["threshold_reports"] = {
+                mode: {
+                    "threshold": 0.5 if mode == "fixed_0.5" else 0.4,
+                    "test_metrics": {
+                        key: value
+                        for key, value in payload.items()
+                        if key in {
+                            "precision", "recall", "f1", "accuracy", "auc",
+                            "aupr", "reported_positive_class",
+                            "real_positive", "hallucination_positive",
+                        }
+                    },
+                }
+                for mode in ("fixed_0.5", "train_f1")
+            }
+            metrics[seed] = payload
         _validate_seed_metadata("model", "risk+ev", metrics)
 
-        metrics[44]["reported_positive_class"] = "hallucination"
+        metrics[45]["reported_positive_class"] = "hallucination"
         with self.assertRaisesRegex(ValueError, "must be real-positive"):
             _validate_seed_metadata("model", "risk+ev", metrics)
 
     def test_three_seed_markdown_reports_real_headline_and_hall_metrics(self) -> None:
-        row = {
+        base_row = {
             "model": "model",
             "model_label": "Model",
             "feature_set": "risk+ev",
             "rank": 1,
+            "threshold_mean": 0.5,
+            "threshold_std": 0.01,
             "accuracy_mean": 0.8,
             "accuracy_std": 0.01,
         }
@@ -80,12 +99,16 @@ class TorchProbeReportingTests(unittest.TestCase):
             ("hallucination_positive", 0.5),
         ):
             for offset, metric in enumerate(CLASS_METRICS):
-                row[f"{prefix}_{metric}_mean"] = base + offset * 0.01
-                row[f"{prefix}_{metric}_std"] = 0.01
+                base_row[f"{prefix}_{metric}_mean"] = base + offset * 0.01
+                base_row[f"{prefix}_{metric}_std"] = 0.01
+        rows = [
+            {**base_row, "threshold_mode": "fixed_0.5"},
+            {**base_row, "threshold_mode": "train_f1"},
+        ]
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "summary.md"
-            _write_markdown(path, "Summary", [42, 43, 44], [row])
+            _write_markdown(path, "Summary", [43, 44, 45], rows)
             markdown = path.read_text(encoding="utf-8")
 
         self.assertIn("Real is the headline positive class", markdown)

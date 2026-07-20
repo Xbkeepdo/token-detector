@@ -20,6 +20,7 @@ from features.dgst_t import (
     RAW_ATTENTION_METHOD,
     build_compact_four_gate_layer_capture,
     compute_four_gate_dgst_batch_from_captures,
+    _cosine_distance_matrix,
     _gaussian_mad_gate,
     _prepare_transport_problem_for_state_cost,
     _solve_transport_problem,
@@ -28,9 +29,12 @@ from features.dgst_t import (
 )
 from features.extractor import _build_four_gate_feature_record
 from models.dgst_capture import (
+    attention_row_from_capture,
+    chunked_eager_attention_forward,
     final_normalized_hidden_slice,
     hidden_states_from_captures,
     hidden_states_from_layer_outputs,
+    run_forward_with_dgst_captures,
     target_logits_and_probabilities_multi,
 )
 from models.base_wrapper import configure_image_processor_limits
@@ -38,6 +42,101 @@ from train_feature_sets import build_selected_matrix, parse_feature_set
 
 
 class FourGateDGSTTests(unittest.TestCase):
+    def test_chunked_eager_attention_matches_full_formula(self) -> None:
+        torch.manual_seed(7)
+        query = torch.randn(1, 4, 5, 3, dtype=torch.float32)
+        key = torch.randn(1, 2, 5, 3, dtype=torch.float32)
+        value = torch.randn(1, 2, 5, 3, dtype=torch.float32)
+        mask = torch.full((1, 1, 5, 5), float("-inf"))
+        mask = torch.triu(mask, diagonal=1)
+        module = SimpleNamespace(
+            num_key_value_groups=2,
+            training=False,
+            _dgst_attention_query_chunk_size=2,
+            _dgst_attention_query_positions=(1, -1),
+        )
+        actual_output, actual_rows = chunked_eager_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            mask,
+            scaling=3.0 ** -0.5,
+        )
+
+        repeated_key = key.repeat_interleave(2, dim=1)
+        repeated_value = value.repeat_interleave(2, dim=1)
+        expected_weights = torch.softmax(
+            torch.matmul(query, repeated_key.transpose(2, 3)) * (3.0 ** -0.5)
+            + mask,
+            dim=-1,
+            dtype=torch.float32,
+        )
+        expected_output = torch.matmul(expected_weights, repeated_value).transpose(1, 2)
+        self.assertTrue(torch.allclose(actual_output, expected_output, atol=1e-6))
+        self.assertTrue(
+            torch.allclose(actual_rows, expected_weights[:, :, [1, 4], :], atol=1e-6)
+        )
+
+    def test_forward_capture_retains_only_requested_attention_rows(self) -> None:
+        class FakeAttention(torch.nn.Module):
+            def forward(self, hidden):
+                batch, sequence, _hidden = hidden.shape
+                values = torch.arange(
+                    sequence * sequence,
+                    dtype=hidden.dtype,
+                    device=hidden.device,
+                ).reshape(1, 1, sequence, sequence)
+                return torch.zeros_like(hidden), values.expand(batch, 2, -1, -1)
+
+        class FakeLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = FakeAttention()
+                self.mlp = torch.nn.Identity()
+
+            def forward(self, hidden):
+                attention_update, attention = self.self_attn(hidden)
+                h_mid = hidden + attention_update
+                return h_mid + self.mlp(h_mid), attention
+
+        class FakeBody(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([FakeLayer(), FakeLayer()])
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = FakeBody()
+
+            def forward(self, input_ids, **_kwargs):
+                hidden = input_ids.float().unsqueeze(-1).expand(-1, -1, 2)
+                attentions = []
+                for layer in self.model.layers:
+                    hidden, attention = layer(hidden)
+                    attentions.append(attention)
+                return SimpleNamespace(
+                    logits=torch.zeros(*input_ids.shape, 3),
+                    attentions=tuple(attentions),
+                    hidden_states=None,
+                )
+
+        outputs, captures = run_forward_with_dgst_captures(
+            FakeModel(),
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            output_hidden_states=False,
+            attention_query_positions=[1, -1],
+        )
+        self.assertEqual(outputs.attentions[0].shape, (1, 2, 2, 4))
+        self.assertEqual(captures[0]["attention_query_positions"], (1, 3))
+        self.assertTrue(
+            torch.equal(
+                attention_row_from_capture(captures[0], 3),
+                torch.tensor([[12.0, 13.0, 14.0, 15.0]]).expand(2, -1),
+            )
+        )
+
     def test_dynamic_image_pixel_limit_updates_fast_and_slow_fields(self):
         image_processor = SimpleNamespace(
             max_pixels=3_240_000,
@@ -333,6 +432,223 @@ class FourGateDGSTTests(unittest.TestCase):
                 places=6,
             )
         self.assertGreater(len(set(regions)), 1)
+
+    def test_geo_stateupd_lu1_uses_hmid_and_ffn_update_distances(self) -> None:
+        layer = self._output_layer()
+        h_prev = torch.tensor(
+            [[[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [1.0, 1.0]]],
+            dtype=torch.float32,
+        )
+        o_attn = torch.tensor(
+            [[[0.0, 0.2], [0.1, 0.0], [0.2, -0.1], [0.0, 0.0]]],
+            dtype=torch.float32,
+        )
+        o_ffn = torch.tensor(
+            [[[0.2, 0.0], [0.0, 0.3], [-0.1, 0.2], [0.3, -0.1]]],
+            dtype=torch.float32,
+        )
+        attention = torch.zeros(1, 2, 4, 4, dtype=torch.float32)
+        attention[0, 0, 3, :3] = torch.tensor([0.6, 0.3, 0.1])
+        attention[0, 1, 3, :3] = torch.tensor([0.2, 0.3, 0.5])
+        h_mid = h_prev + o_attn
+        capture = {
+            "h_prev": h_prev,
+            "h_mid": h_mid,
+            "o_attn": o_attn,
+            "o_ffn": o_ffn,
+            "attn_weights": attention,
+        }
+        result = compute_four_gate_dgst_batch_from_captures(
+            model=SimpleNamespace(get_output_embeddings=lambda: layer),
+            captures=[capture],
+            visual_start=0,
+            visual_end=3,
+            target_token_ids=[1],
+            prediction_positions=[3],
+            transport_top_k=3,
+            cost_mode="geo_stateupd_lu1",
+            enabled_methods=[RAW_ATTENTION_METHOD],
+        )[0]
+
+        source = result["dgst_t_source_dist_per_layer"][0]
+        target = result["dgst_t_attention_support_per_layer"][0]
+        support = _topk_union_indices(source, target, 3)
+        expected_problem = _prepare_transport_problem_for_state_cost(
+            source_dist=source,
+            target_dist=target,
+            states=h_mid[0, :3],
+            output_states=(h_mid + o_ffn)[0, :3],
+            support=support,
+            sqrt_cosine=False,
+            cost_state_mode="state_update",
+            update_lambda=1.0,
+        )
+        expected_risk = _solve_transport_problem(expected_problem, "emd")
+        risk_key = "dgst_t_raw_attention_risk_geo_stateupd_lu1_per_layer"
+        self.assertEqual(result["dgst_t_cost"], "geo_stateupd_lu1")
+        self.assertAlmostEqual(float(result[risk_key][0]), expected_risk, places=6)
+
+        record = _build_four_gate_feature_record(
+            image_id=11,
+            span={"word": "bus", "label": 1},
+            response_index=3,
+            target_token_id=1,
+            model_out=SimpleNamespace(token_id=1),
+            dgst_t=result,
+        )
+        matrix, labels = build_selected_matrix(
+            [record], parse_feature_set("raw_attention_risk")
+        )
+        self.assertEqual(matrix.shape, (1, 1))
+        self.assertAlmostEqual(float(matrix[0, 0]), expected_risk, places=6)
+        self.assertEqual(labels.tolist(), [1])
+
+    def test_sqrt_stateupd_alpha05_matches_requested_mixture(self) -> None:
+        layer = self._output_layer()
+        h_prev = torch.tensor(
+            [[[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [1.0, 1.0]]],
+            dtype=torch.float32,
+        )
+        o_attn = torch.tensor(
+            [[[0.0, 0.2], [0.1, 0.0], [0.2, -0.1], [0.0, 0.0]]],
+            dtype=torch.float32,
+        )
+        o_ffn = torch.tensor(
+            [[[0.2, 0.0], [0.0, 0.3], [-0.1, 0.2], [0.3, -0.1]]],
+            dtype=torch.float32,
+        )
+        attention = torch.zeros(1, 2, 4, 4, dtype=torch.float32)
+        attention[0, 0, 3, :3] = torch.tensor([0.6, 0.3, 0.1])
+        attention[0, 1, 3, :3] = torch.tensor([0.2, 0.3, 0.5])
+        h_mid = h_prev + o_attn
+        capture = {
+            "h_prev": h_prev,
+            "h_mid": h_mid,
+            "o_attn": o_attn,
+            "o_ffn": o_ffn,
+            "attn_weights": attention,
+        }
+        result = compute_four_gate_dgst_batch_from_captures(
+            model=SimpleNamespace(get_output_embeddings=lambda: layer),
+            captures=[capture],
+            visual_start=0,
+            visual_end=3,
+            target_token_ids=[1],
+            prediction_positions=[3],
+            transport_top_k=3,
+            cost_mode="sqrt_stateupd_alpha05",
+            cost_modes=[
+                "sqrt_stateupd_alpha05",
+                "sqrt_matched_state",
+                "geo_stateupd_lu1",
+            ],
+            enabled_methods=[RAW_ATTENTION_METHOD],
+        )[0]
+
+        source = result["dgst_t_source_dist_per_layer"][0]
+        target = result["dgst_t_attention_support_per_layer"][0]
+        support = _topk_union_indices(source, target, 3)
+        local_source = source.index_select(0, support)
+        local_source = local_source / local_source.sum()
+        local_target = target.index_select(0, support)
+        local_target = local_target / local_target.sum()
+        local_state = h_prev[0, :3].index_select(0, support)
+        local_update = o_ffn[0, :3].index_select(0, support)
+        state_distance = torch.sqrt(
+            (_cosine_distance_matrix(local_state) / 2.0).clamp_min(0.0)
+        )
+        update_distance = torch.sqrt(
+            (_cosine_distance_matrix(local_update) / 2.0).clamp_min(0.0)
+        )
+        expected_cost = 0.5 * state_distance + 0.5 * update_distance
+        expected_risk = _solve_transport_problem(
+            (local_source, local_target, expected_cost), "emd"
+        )
+        risk_key = "dgst_t_raw_attention_risk_sqrt_stateupd_alpha05_per_layer"
+        self.assertEqual(result["dgst_t_cost"], "sqrt_stateupd_alpha05")
+        self.assertEqual(
+            result["dgst_t_cost_modes"],
+            [
+                "sqrt_stateupd_alpha05",
+                "sqrt_cosine_matched_state",
+                "geo_stateupd_lu1",
+            ],
+        )
+        self.assertEqual(result["dgst_t_cost_alpha"], 0.5)
+        self.assertAlmostEqual(float(result[risk_key][0]), expected_risk, places=6)
+        self.assertIn("dgst_t_raw_attention_risk_sqrt_hpre_per_layer", result)
+        self.assertIn("dgst_t_raw_attention_risk_geo_stateupd_lu1_per_layer", result)
+
+        record = _build_four_gate_feature_record(
+            image_id=12,
+            span={"word": "car", "label": 0},
+            response_index=3,
+            target_token_id=1,
+            model_out=SimpleNamespace(token_id=1),
+            dgst_t=result,
+        )
+        matrix, labels = build_selected_matrix(
+            [record],
+            parse_feature_set(
+                "raw_attention_risk_sqrt_stateupd_alpha05+"
+                "raw_attention_risk_sqrt_matched_state+"
+                "raw_attention_risk_geo_stateupd_lu1"
+            ),
+        )
+        self.assertEqual(matrix.shape, (1, 3))
+        self.assertAlmostEqual(float(matrix[0, 0]), expected_risk, places=6)
+        self.assertEqual(record["dgst_t_cost_alpha"], 0.5)
+        self.assertEqual(labels.tolist(), [0])
+
+        hmid_result = compute_four_gate_dgst_batch_from_captures(
+            model=SimpleNamespace(get_output_embeddings=lambda: layer),
+            captures=[capture],
+            visual_start=0,
+            visual_end=3,
+            target_token_ids=[1],
+            prediction_positions=[3],
+            transport_top_k=3,
+            cost_mode="sqrt_stateupd_alpha05",
+            enabled_methods=["hmid_raw_logit_gauss"],
+        )[0]
+        hmid_source = hmid_result["dgst_t_source_dist_per_layer"][0]
+        hmid_attention = hmid_result["dgst_t_attention_support_per_layer"][0]
+        hmid_gate = hmid_result[
+            "dgst_t_hmid_raw_logit_gauss_gate_per_layer"
+        ][0]
+        hmid_target = hmid_attention * hmid_gate
+        hmid_target = hmid_target / hmid_target.sum()
+        hmid_support = _topk_union_indices(hmid_source, hmid_target, 3)
+        hmid_local_source = hmid_source.index_select(0, hmid_support)
+        hmid_local_source = hmid_local_source / hmid_local_source.sum()
+        hmid_local_target = hmid_target.index_select(0, hmid_support)
+        hmid_local_target = hmid_local_target / hmid_local_target.sum()
+        hmid_local_state = h_mid[0, :3].index_select(0, hmid_support)
+        hmid_local_update = o_ffn[0, :3].index_select(0, hmid_support)
+        hmid_state_distance = torch.sqrt(
+            (_cosine_distance_matrix(hmid_local_state) / 2.0).clamp_min(0.0)
+        )
+        hmid_update_distance = torch.sqrt(
+            (_cosine_distance_matrix(hmid_local_update) / 2.0).clamp_min(0.0)
+        )
+        hmid_expected_risk = _solve_transport_problem(
+            (
+                hmid_local_source,
+                hmid_local_target,
+                0.5 * hmid_state_distance + 0.5 * hmid_update_distance,
+            ),
+            "emd",
+        )
+        self.assertAlmostEqual(
+            float(
+                hmid_result[
+                    "dgst_t_hmid_raw_logit_gauss_"
+                    "risk_sqrt_stateupd_alpha05_per_layer"
+                ][0]
+            ),
+            hmid_expected_risk,
+            places=6,
+        )
 
     def test_four_methods_emit_distinct_named_matrices_and_curves(self) -> None:
         layer = self._output_layer()
@@ -680,6 +996,178 @@ class FourGateDGSTTests(unittest.TestCase):
         )
         for key in ("h_prev", "h_mid", "o_attn", "o_ffn", "attn_weights"):
             self.assertIsNone(capture[key])
+
+    def test_dual_scope_hpre_raw_and_ffn_fad_are_serialized_and_trainable(self) -> None:
+        layer = self._output_layer()
+        model = SimpleNamespace(get_output_embeddings=lambda: layer)
+        h_prev = torch.tensor(
+            [[
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [-1.0, 0.0],
+                [0.5, 0.5],
+                [1.0, 1.0],
+            ]],
+            dtype=torch.float32,
+        )
+        o_attn = torch.zeros_like(h_prev)
+        o_attn[0, 4] = torch.tensor([0.3, 0.4])
+        o_ffn = torch.zeros_like(h_prev)
+        o_ffn[0, :4] = torch.tensor(
+            [[0.1, 0.0], [0.0, 0.2], [-0.1, 0.1], [0.2, 0.1]]
+        )
+        o_ffn[0, 4] = torch.tensor([0.6, 0.8])
+        attention = torch.zeros(1, 2, 5, 5, dtype=torch.float32)
+        attention[0, 0, 4, :4] = torch.tensor([0.4, 0.2, 0.1, 0.3])
+        attention[0, 1, 4, :4] = torch.tensor([0.1, 0.3, 0.2, 0.4])
+        capture = {
+            "h_prev": h_prev,
+            "h_mid": h_prev + o_attn,
+            "o_attn": o_attn,
+            "o_ffn": o_ffn,
+            "attn_weights": attention,
+        }
+
+        result = compute_four_gate_dgst_batch_from_captures(
+            model=model,
+            captures=[capture],
+            visual_start=0,
+            visual_end=3,
+            prompt_positions=[3],
+            target_token_ids=[1],
+            prediction_positions=[4],
+            transport_top_k=4,
+            target_region_top_k=4,
+            cost_mode="sqrt_matched_state",
+            cost_modes=["sqrt_matched_state", "sqrt_stateupd_alpha05"],
+            enabled_methods=["hpre_raw_logit_gauss"],
+            support_modes=["vv", "vp"],
+            compute_ffn_injection_features=True,
+        )[0]
+
+        self.assertEqual(
+            result["dgst_t_four_gate_support_scopes"],
+            ["visual", "visual_prompt"],
+        )
+        self.assertEqual(
+            tuple(result["dgst_t_attention_support_per_layer"].shape), (1, 3)
+        )
+        self.assertEqual(
+            tuple(result["dgst_t_vp_attention_support_per_layer"].shape), (1, 4)
+        )
+        expected_fad = torch.log(torch.tensor(1.0 / 0.5))
+        self.assertAlmostEqual(
+            float(result["dgst_t_ffn_attn_dominance_per_layer"][0]),
+            float(expected_fad),
+            places=6,
+        )
+
+        record = _build_four_gate_feature_record(
+            image_id=12,
+            span={"word": "chair", "label": 1},
+            response_index=4,
+            target_token_id=1,
+            model_out=SimpleNamespace(token_id=1),
+            dgst_t=result,
+        )
+        matrix, labels = build_selected_matrix(
+            [record],
+            parse_feature_set(
+                "ffn_fad+vp_hpre_raw_logit_gauss_risk_sqrt_matched_state"
+            ),
+        )
+        self.assertEqual(matrix.shape, (1, 2))
+        self.assertEqual(labels.tolist(), [1])
+
+        fad = record["dgst_t_ffn_attn_dominance_per_layer"]
+        risk = record[
+            "dgst_t_hpre_raw_logit_gauss_"
+            "risk_sqrt_hpre_per_layer"
+        ]
+        ev = record[
+            "dgst_t_hpre_raw_logit_gauss_"
+            "ev_target_dist_mass_x_cosine_topk4_hpre_per_layer"
+        ]
+        product_name = (
+            "ffn_fad*"
+            "hpre_raw_logit_gauss_risk_sqrt_matched_state"
+        )
+        expected_product = fad * risk
+        vp_risk = record[
+            "dgst_t_vp_hpre_raw_logit_gauss_"
+            "risk_sqrt_hpre_per_layer"
+        ]
+        for feature_set, expected in (
+            ("ffn_fad", fad),
+            (product_name, expected_product),
+            (
+                product_name
+                + "+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
+                torch.cat(
+                    (
+                        torch.as_tensor(expected_product),
+                        torch.as_tensor(ev),
+                    )
+                ).numpy(),
+            ),
+            (
+                "ffn_fad*"
+                "vp_hpre_raw_logit_gauss_risk_sqrt_matched_state",
+                fad * vp_risk,
+            ),
+        ):
+            selected, _ = build_selected_matrix(
+                [record], parse_feature_set(feature_set)
+            )
+            self.assertEqual(selected.shape, (1, len(expected)))
+            self.assertTrue(
+                torch.allclose(
+                    torch.as_tensor(selected[0]),
+                    torch.as_tensor(expected),
+                    atol=1e-6,
+                )
+            )
+
+        vv_only = compute_four_gate_dgst_batch_from_captures(
+            model=model,
+            captures=[capture],
+            visual_start=0,
+            visual_end=3,
+            prompt_positions=[3],
+            target_token_ids=[1],
+            prediction_positions=[4],
+            enabled_methods=["hpre_raw_logit_gauss"],
+            support_modes=["vv"],
+        )[0]
+        self.assertIn("dgst_t_hpre_raw_logit_gauss_gate_per_layer", vv_only)
+        self.assertNotIn("dgst_t_vp_hpre_raw_logit_gauss_gate_per_layer", vv_only)
+
+        vp_only = compute_four_gate_dgst_batch_from_captures(
+            model=model,
+            captures=[capture],
+            visual_start=0,
+            visual_end=3,
+            prompt_positions=[3],
+            target_token_ids=[1],
+            prediction_positions=[4],
+            enabled_methods=["hpre_raw_logit_gauss"],
+            support_modes=["vp"],
+        )[0]
+        self.assertNotIn("dgst_t_hpre_raw_logit_gauss_gate_per_layer", vp_only)
+        self.assertIn("dgst_t_vp_hpre_raw_logit_gauss_gate_per_layer", vp_only)
+        vp_record = _build_four_gate_feature_record(
+            image_id=12,
+            span={"word": "chair", "label": 1},
+            response_index=4,
+            target_token_id=1,
+            model_out=SimpleNamespace(token_id=1),
+            dgst_t=vp_only,
+        )
+        vp_matrix, _ = build_selected_matrix(
+            [vp_record],
+            parse_feature_set("vp_hpre_raw_logit_gauss_risk"),
+        )
+        self.assertEqual(vp_matrix.shape, (1, 1))
 
     def test_hook_and_model_response_hidden_use_same_final_norm(self) -> None:
         norm = torch.nn.LayerNorm(3)

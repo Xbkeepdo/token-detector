@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train all fixed QA feature-set probes for seeds 42/43/44."""
+"""Train all configured QA feature-set probes for seeds 43/44/45 by default."""
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ def main():
     if not cfg:
         raise ValueError("training.torch_probe is required for QA probe training")
     seeds = tuple(dict.fromkeys(
-        int(value) for value in (args.seeds or cfg.get("seeds", [42, 43, 44]))
+        int(value) for value in (args.seeds or cfg.get("seeds", [43, 44, 45]))
     ))
     if not seeds:
         raise ValueError("At least one QA probe seed is required")
@@ -420,7 +420,7 @@ def _validate_reusable_result(
         "position": position,
         "positive_class": "real",
         "split_protocol": "strict_82_no_validation",
-        "checkpoint_selection": "last_epoch",
+        "checkpoint_selection": "minimum_train_loss",
         "threshold_selection": "train_f1",
         "training_input_fingerprint": training_input_fingerprint,
     }
@@ -455,35 +455,51 @@ def _markdown_lines(label_protocol: str, summaries: dict) -> list[str]:
         f"# QA probe results: {label_protocol}",
         "",
         "Labels use 0=hallucination and 1=real; the headline positive class is real.",
-        "Strict 8:2 with no validation: fixed epochs, final checkpoint, and a Real-F1 threshold selected on train only; test is final evaluation only.",
-        "",
-        "| Feature set | Position | Test n | AUROC | Real AUPR | Real P | Real R | Real F1 | Hall. AUPR | Hall. P | Hall. R | Hall. F1 | Accuracy | Balanced acc. | Macro-F1 |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "Strict 8:2 with no validation: train-loss early stopping restores the minimum-train-loss checkpoint; test is final evaluation only.",
+        "The same checkpoint reports both a fixed 0.5 threshold and a Real-F1 threshold selected on train.",
     ]
-    for feature_set, summary in summaries.items():
-        escaped = str(feature_set).replace("|", "\\|")
-        counts = summary.get("counts") or {}
-        lines.append(
-            "| "
-            + " | ".join((
-                escaped,
-                str(summary.get("position")),
-                str(counts.get("test", "")),
-                _metric(summary, "auroc"),
-                _metric(summary, "real_aupr"),
-                _metric(summary, "real.precision"),
-                _metric(summary, "real.recall"),
-                _metric(summary, "real.f1"),
-                _metric(summary, "hallucination_aupr"),
-                _metric(summary, "hallucination.precision"),
-                _metric(summary, "hallucination.recall"),
-                _metric(summary, "hallucination.f1"),
-                _metric(summary, "accuracy"),
-                _metric(summary, "balanced_accuracy"),
-                _metric(summary, "macro_f1"),
-            ))
-            + " |"
-        )
+    for mode, title in (
+        ("fixed_0.5", "Fixed threshold = 0.5"),
+        ("train_f1", "Threshold selected on train Real-F1"),
+    ):
+        lines.extend((
+            "",
+            f"## {title}",
+            "",
+            "| Feature set | Position | Test n | Threshold | AUROC | Real AUPR | Real P | Real R | Real F1 | Hall. AUPR | Hall. P | Hall. R | Hall. F1 | Accuracy | Balanced acc. | Macro-F1 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ))
+        for feature_set, summary in summaries.items():
+            escaped = str(feature_set).replace("|", "\\|")
+            counts = summary.get("counts") or {}
+            report = (summary.get("threshold_reports") or {}).get(mode)
+            if not isinstance(report, dict):
+                if mode == "train_f1":
+                    report = summary
+                else:
+                    continue
+            lines.append(
+                "| "
+                + " | ".join((
+                    escaped,
+                    str(summary.get("position")),
+                    str(counts.get("test", "")),
+                    _metric(report, "threshold") if "threshold" in report else "n/a",
+                    _metric(report, "auroc"),
+                    _metric(report, "real_aupr"),
+                    _metric(report, "real.precision"),
+                    _metric(report, "real.recall"),
+                    _metric(report, "real.f1"),
+                    _metric(report, "hallucination_aupr"),
+                    _metric(report, "hallucination.precision"),
+                    _metric(report, "hallucination.recall"),
+                    _metric(report, "hallucination.f1"),
+                    _metric(report, "accuracy"),
+                    _metric(report, "balanced_accuracy"),
+                    _metric(report, "macro_f1"),
+                ))
+                + " |"
+            )
     lines.extend(("", "All values are mean ± population standard deviation across seeds.", ""))
     return lines
 

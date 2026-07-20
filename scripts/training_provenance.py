@@ -18,7 +18,7 @@ from scripts.extract_features import (
 from utils.config_utils import (
     extraction_mode_flags,
     get_dgst_t_cfg,
-    get_model_cfg,
+    get_extraction_model_cfg,
 )
 from utils.io_utils import load_json, load_pkl
 from utils.split_utils import validate_strict_82_split
@@ -75,7 +75,7 @@ def expected_feature_provenance(
     if family not in SUPPORTED_ARTIFACT_FAMILIES:
         raise ValueError(f"Unsupported feature artifact family {family!r}.")
     effective_config = copy.deepcopy(dict(config))
-    model_cfg = get_model_cfg(effective_config, model_key)
+    model_cfg = get_extraction_model_cfg(effective_config, model_key)
     run_cfg = effective_config.get("run") or {}
     prompt = str(
         (run_cfg.get("prompt") if isinstance(run_cfg, Mapping) else None)

@@ -11,7 +11,12 @@ from pathlib import Path
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from utils.config_utils import extraction_mode_flags, resolve_run_config
+from utils.config_utils import (
+    extraction_mode_flags,
+    get_extraction_model_cfg,
+    get_model_cfg,
+    resolve_run_config,
+)
 from utils.generation_provenance import build_generation_manifest
 from utils.split_utils import (
     build_strict_82_split,
@@ -62,6 +67,25 @@ def _minimal_config() -> dict:
 
 
 class PipelineConfigTests(unittest.TestCase):
+    def test_extraction_model_overrides_do_not_change_generation_config(self) -> None:
+        config = {
+            "models": {"model_a": {"hf_name": "unused", "image_size": 672}},
+            "feature_extraction": {
+                "model_overrides": {
+                    "model_a": {
+                        "image_size": 336,
+                        "image_grid_pinpoints": [[336, 336]],
+                    }
+                }
+            },
+        }
+        generation_cfg = get_model_cfg(config, "model_a")
+        extraction_cfg = get_extraction_model_cfg(config, "model_a")
+        self.assertEqual(generation_cfg["image_size"], 672)
+        self.assertNotIn("image_grid_pinpoints", generation_cfg)
+        self.assertEqual(extraction_cfg["image_size"], 336)
+        self.assertEqual(extraction_cfg["image_grid_pinpoints"], [[336, 336]])
+
     def test_strict_82_is_deterministic_and_has_no_validation(self) -> None:
         image_ids = list(range(10_000, 14_000))
         shuffled = image_ids.copy()

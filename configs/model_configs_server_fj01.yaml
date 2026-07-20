@@ -68,6 +68,19 @@ models:
     top_p: 0.5
     prompt_template: "USER: <image>\nDescribe this image.\nASSISTANT:"
 
+  llava_next_8b:
+    hf_name: "/root/rivermind-fs/xiongbo/models/LLaVA-NeXT-8B"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    image_size: 336
+    patch_size: 14
+    num_layers: 32
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    image_token: "<image>"
+    prompt_template: null
+
   llava_onevision_1_5_8b:
     hf_name: "/root/rivermind-fs/xiongbo/models/LLaVA-OneVision-1.5-8B-Instruct"
     architecture: "concatenation"
@@ -249,6 +262,9 @@ dataset:
   train_ratio: 0.80
   val_ratio: 0.00                             # No validation split in the strict 8:2 protocol.
   test_ratio: 0.20
+  train_images: 3200
+  test_images: 800
+  validation: null
   seed: 42
   # Cross-model master split.  A different 4,000-image cohort is rejected.
   shared_split_path: "outputs/shared/COCO4000_seed42_image_splits_82.json"
@@ -258,25 +274,39 @@ dataset:
 training:
   trainer: "torch_mlp"                     # torch_mlp | sklearn
   positive_class: "real"                   # real headline; hallucination metrics are also reported.
-  split_protocol: "strict_82_no_validation" # Fixed epochs, last checkpoint, train-F1 threshold.
-  threshold_selection: "train_f1"          # Select the Real-positive F1 threshold on train only.
+  split_protocol: "strict_82_no_validation" # Image-disjoint 80/20; validation is empty.
+  threshold_selection: "train_f1"          # Backward-compatible headline; both thresholds are reported.
   baseline:
     # Training-only selection: this does not change/re-extract baseline/features.pkl.
     # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
     methods: ["metatoken", "svar", "projectaway"]
     positive_class: "real"                  # real | hallucination; train F1 selects its threshold.
-    seeds: [42, 43, 44]                     # Use [42] for a quick single-seed run.
+    seeds: [43, 44, 45]                     # Use [43] for a quick single-seed run.
     write_summary: true                     # Per-seed MD + aggregate mean/std MD.
   torch_probe:
-    hidden_sizes: [256, 128, 64]
-    dropout: 0.1
-    learning_rate: 0.0003
-    batch_size: 128
-    weight_decay: 0.0
-    num_epochs: 120
+    hidden_sizes: [128, 64, 32]
+    structure: "Linear-BatchNorm-ReLU-Dropout"
+    activation: "relu"
+    batch_norm: true
+    dropout: 0.3
+    initialization: "kaiming_uniform_relu"
+    output_dim: 1
+    optimizer: "adam"
+    learning_rate: 0.001
+    weight_decay: 0.00001
+    batch_size: 256
+    max_epochs: 100
+    loss: "bce_with_logits"
+    feature_normalization: "none"
+    scheduler_monitor: "train_loss"
     lr_factor: 0.5
-    lr_patience: 4
-    seeds: [42, 43, 44]                     # Shared by method and ADS+CGC probes.
+    lr_patience: 5
+    early_stopping_monitor: "train_loss"
+    early_stopping_patience: 10
+    checkpoint_selection: "minimum_train_loss"
+    fixed_threshold: 0.5
+    threshold_reporting: ["fixed_0.5", "train_f1"]
+    seeds: [43, 44, 45]                     # Shared by method, ADS+CGC, and QA dense baselines.
   feature_sets:
     method:
 
@@ -351,6 +381,7 @@ pope:
   splits: ["random", "popular", "adversarial"]
   prompt_templates:
     llava_1_5_7b: "USER: <image>\n{question}\nAnswer the question using a single word or phrase.\nASSISTANT:"
+    llava_next_8b: "{question}\nAnswer the question using a single word or phrase."
     llava_onevision_1_5_8b: "{question}\nAnswer the question using a single word or phrase."
     llava_onevision_1_5_8b_instruct: "{question}\nAnswer the question using a single word or phrase."
     internvl_2_5_8b: "{question}\nAnswer the question using a single word or phrase."

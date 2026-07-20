@@ -79,7 +79,7 @@ def main():
         extraction_mode_flags,
         get_dataset_cfg,
         get_dgst_t_cfg,
-        get_model_cfg,
+        get_extraction_model_cfg,
         load_config,
     )
 
@@ -99,7 +99,7 @@ def main():
         _run_baseline_only(args)
         return
 
-    model_cfg   = get_model_cfg(config, args.model)
+    model_cfg   = get_extraction_model_cfg(config, args.model)
     if args.max_pixels is not None:
         if args.max_pixels <= 0:
             raise ValueError("--max-pixels must be a positive integer")
@@ -959,9 +959,9 @@ def _feature_key(feat: dict) -> tuple:
 def _prepare_baseline_only_provenance(args, config: dict) -> None:
     """Protect the delegated standalone baseline extractor with provenance."""
 
-    from utils.config_utils import get_model_cfg
+    from utils.config_utils import get_extraction_model_cfg
 
-    model_cfg = get_model_cfg(config, args.model)
+    model_cfg = get_extraction_model_cfg(config, args.model)
     if args.max_pixels is not None:
         model_cfg["max_pixels"] = int(args.max_pixels)
     baseline_cfg = _combined_baseline_config(config)

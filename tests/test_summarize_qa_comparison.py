@@ -294,9 +294,9 @@ class QAComparisonSummaryTests(unittest.TestCase):
             self.assertEqual(
                 comparison["report_policy"],
                 (
-                    "read existing test metrics only; preserve train-F1-selected "
-                    "threshold and final checkpoint; no test-set method selection "
-                    "or ranking"
+                    "read existing test metrics only; report fixed-0.5 and "
+                    "train-F1-selected thresholds from the same minimum-train-loss "
+                    "checkpoint; no test-set method selection or ranking"
                 ),
             )
 

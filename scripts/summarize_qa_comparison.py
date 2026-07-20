@@ -34,7 +34,7 @@ METRIC_KEYS = (
     "hallucination_precision",
     "hallucination_recall",
 )
-DEFAULT_SEEDS = (42, 43, 44)
+DEFAULT_SEEDS = (43, 44, 45)
 
 
 def parse_args() -> argparse.Namespace:
@@ -235,6 +235,7 @@ def build_comparison(
                     cohort_total=probe_cohort_total,
                 ),
                 "metrics": _probe_metrics(aggregate),
+                "metrics_by_threshold": _probe_threshold_metrics(aggregate),
                 "source": str(probe_summary_path),
             }
         )
@@ -254,6 +255,9 @@ def build_comparison(
                 f"Baseline aggregate for {method!r} must be a mapping"
             )
         metrics = _baseline_metrics_from_aggregate(aggregate)
+        threshold_metrics = _baseline_threshold_metrics_from_aggregate(
+            aggregate
+        )
         if baseline_seed_outputs:
             seed_metrics = [
                 _baseline_seed_metrics(output, str(method))
@@ -266,6 +270,16 @@ def build_comparison(
                 source=f"native baseline {method!r}",
             )
             metrics = complete
+            if threshold_metrics:
+                threshold_metrics = {
+                    mode: _aggregate_metric_rows([
+                        _baseline_seed_metrics(
+                            output, str(method), threshold_mode=mode
+                        )
+                        for output in baseline_seed_outputs
+                    ])
+                    for mode in threshold_metrics
+                }
         rows.append(
             {
                 "family": "native_baseline",
@@ -280,6 +294,7 @@ def build_comparison(
                 ),
                 "coverage": baseline_coverage,
                 "metrics": metrics,
+                "metrics_by_threshold": threshold_metrics,
                 "source": str(baseline_summary_path),
             }
         )
@@ -312,8 +327,9 @@ def build_comparison(
         "num_seeds": len(seeds),
         "std_definition": "population",
         "report_policy": (
-            "read existing test metrics only; preserve train-F1-selected "
-            "threshold and final checkpoint; no test-set method selection or ranking"
+            "read existing test metrics only; report fixed-0.5 and "
+            "train-F1-selected thresholds from the same minimum-train-loss "
+            "checkpoint; no test-set method selection or ranking"
         ),
         "probe_scope_provenance": (
             "summary_metadata" if scoped else "cli_asserted_legacy_summary"
@@ -377,10 +393,7 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
         "",
         f"- 随机种子：{seeds}；总体均值 ± 总体标准差。",
         "- 标签：0=hallucination，1=real；主报告正类为 real。",
-        (
-            "- 该脚本只汇总已有 test 指标，沿用训练阶段在 train "
-            "上按 F1 确定的阈值；不按 test 选择、排序或挑选方法。"
-        ),
+        "- 该脚本只汇总已有 test 指标；同一 minimum-train-loss checkpoint 同时报告固定 0.5 和 train Real-F1 搜索阈值，不按 test 选择、排序或挑选方法。",
     ]
     for position in active_positions:
         lines.append(_position_markdown_bullet(position))
@@ -390,33 +403,37 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
                 "- Native baselines 与主方法共享 prompt 最后一个 token 的 "
                 "因果状态，位置统一记为 prompt_last_token。"
             ),
-            "",
-            "## Test 对比",
-            "",
-            (
-                "| 类型 | 方法 | 位置 | 覆盖率 | AUROC | Real AUPR | Real F1 | "
-                "Real P | Real R | Hall. AUPR | Hall. F1 | Hall. P | Hall. R |"
-            ),
-            (
-                "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-            ),
         ]
     )
-    for row in comparison["rows"]:
-        metrics = row["metrics"]
-        values = [
-            _format_stat(metrics.get(key))
-            for key in METRIC_KEYS
-        ]
-        lines.append(
-            "| {} | {} | {} | {} | {} |".format(
-                row["family"],
-                row["display_name"],
-                row["position"],
-                _format_coverage(row.get("coverage")),
-                " | ".join(values),
+    for mode, title in (
+        ("fixed_0.5", "固定阈值 0.5"),
+        ("train_f1", "Train Real-F1 搜索阈值"),
+    ):
+        lines.extend((
+            "",
+            f"## Test 对比（{title}）",
+            "",
+            "| 类型 | 方法 | 位置 | 覆盖率 | AUROC | Real AUPR | Real F1 | Real P | Real R | Hall. AUPR | Hall. F1 | Hall. P | Hall. R |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ))
+        for row in comparison["rows"]:
+            by_threshold = row.get("metrics_by_threshold") or {}
+            metrics = by_threshold.get(mode)
+            if not isinstance(metrics, Mapping):
+                if mode == "train_f1":
+                    metrics = row["metrics"]
+                else:
+                    continue
+            values = [_format_stat(metrics.get(key)) for key in METRIC_KEYS]
+            lines.append(
+                "| {} | {} | {} | {} | {} |".format(
+                    row["family"],
+                    row["display_name"],
+                    row["position"],
+                    _format_coverage(row.get("coverage")),
+                    " | ".join(values),
+                )
             )
-        )
     lines.extend(
         [
             "",
@@ -625,6 +642,17 @@ def _probe_metrics(aggregate: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _probe_threshold_metrics(
+    aggregate: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    reports = aggregate.get("threshold_reports") or {}
+    return {
+        str(mode): _probe_metrics(report)
+        for mode, report in reports.items()
+        if isinstance(report, Mapping)
+    }
+
+
 def _baseline_metrics_from_aggregate(
     aggregate: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -656,8 +684,22 @@ def _baseline_metrics_from_aggregate(
     }
 
 
+def _baseline_threshold_metrics_from_aggregate(
+    aggregate: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    reports = aggregate.get("threshold_reports") or {}
+    return {
+        str(mode): _baseline_metrics_from_aggregate(report)
+        for mode, report in reports.items()
+        if isinstance(report, Mapping)
+    }
+
+
 def _baseline_seed_metrics(
-    output: Mapping[str, Any], method: str
+    output: Mapping[str, Any],
+    method: str,
+    *,
+    threshold_mode: str | None = None,
 ) -> dict[str, float]:
     methods = output.get("methods")
     if not isinstance(methods, Mapping):
@@ -674,6 +716,14 @@ def _baseline_seed_metrics(
         result = methods.get(method)
     if not isinstance(result, Mapping):
         raise ValueError(f"Seed result has no baseline method {method!r}")
+    if threshold_mode is not None:
+        reports = result.get("threshold_reports") or {}
+        result = reports.get(threshold_mode)
+        if not isinstance(result, Mapping):
+            raise ValueError(
+                f"Baseline method {method!r} lacks threshold report "
+                f"{threshold_mode!r}"
+            )
     metrics = result.get("test_metrics")
     if not isinstance(metrics, Mapping):
         raise ValueError(f"Baseline method {method!r} has no test metrics")

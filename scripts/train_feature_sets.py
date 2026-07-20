@@ -607,6 +607,9 @@ def _register_four_gate_aliases() -> None:
     for method in methods:
         state_name = "hmid" if method.startswith("hmid_") else "hpre"
         specs = {
+            f"{method}_source_target_js": None,
+            f"{method}_source_target_union_topk_js": None,
+            f"{method}_one_minus_target_dist_mass_x_cosine": None,
             f"{method}_risk": (
                 f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
             ),
@@ -625,7 +628,60 @@ def _register_four_gate_aliases() -> None:
         }
         for block, feature_key in specs.items():
             FEATURE_ALIASES[block] = block
+            if feature_key is not None:
+                FEATURE_KEYS[block] = feature_key
+        cost_risk_specs = {
+            f"{method}_risk_sqrt_matched_state": (
+                f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
+            ),
+            f"{method}_risk_geo_stateupd_lu1": (
+                f"dgst_t_{method}_risk_geo_stateupd_lu1_per_layer"
+            ),
+            f"{method}_risk_sqrt_stateupd_alpha05": (
+                f"dgst_t_{method}_risk_sqrt_stateupd_alpha05_per_layer"
+            ),
+        }
+        for block, feature_key in cost_risk_specs.items():
+            FEATURE_ALIASES[block] = block
             FEATURE_KEYS[block] = feature_key
+        FEATURE_ALIASES[
+            f"{method}_risk_sqrt_cosine_matched_state"
+        ] = f"{method}_risk_sqrt_matched_state"
+
+    # VP uses the same hpre/hmid construction over visual+prompt support.
+    # Prefixing the training block and serialized field keeps it impossible to
+    # accidentally compare a VP curve against the backward-compatible VV key.
+    for method in methods:
+        scoped_method = f"vp_{method}"
+        state_name = "hmid" if method.startswith("hmid_") else "hpre"
+        specs = {
+            f"{scoped_method}_risk": (
+                f"dgst_t_{scoped_method}_risk_sqrt_{state_name}_per_layer"
+            ),
+            f"{scoped_method}_target_cosine": (
+                f"dgst_t_{scoped_method}_target_cosine_"
+                f"topk{{target_region_top_k}}_{state_name}_per_layer"
+            ),
+            f"{scoped_method}_ev_target_dist_mass_x_cosine": (
+                f"dgst_t_{scoped_method}_ev_target_dist_mass_x_cosine_"
+                f"topk{{target_region_top_k}}_{state_name}_per_layer"
+            ),
+            f"{scoped_method}_risk_sqrt_matched_state": (
+                f"dgst_t_{scoped_method}_risk_sqrt_{state_name}_per_layer"
+            ),
+            f"{scoped_method}_risk_geo_stateupd_lu1": (
+                f"dgst_t_{scoped_method}_risk_geo_stateupd_lu1_per_layer"
+            ),
+            f"{scoped_method}_risk_sqrt_stateupd_alpha05": (
+                f"dgst_t_{scoped_method}_risk_sqrt_stateupd_alpha05_per_layer"
+            ),
+        }
+        for block, feature_key in specs.items():
+            FEATURE_ALIASES[block] = block
+            FEATURE_KEYS[block] = feature_key
+        FEATURE_ALIASES[
+            f"{scoped_method}_risk_sqrt_cosine_matched_state"
+        ] = f"{scoped_method}_risk_sqrt_matched_state"
 
 
 def _register_ads_cgc_aliases() -> None:
@@ -656,6 +712,73 @@ ATTENTION_TOPK_DIVERGENCE_BLOCKS = {
 }
 ATTENTION_TOPK_DIVERGENCE_CACHE_KEY = "_computed_attention_topk32_source_divergence"
 ATTENTION_TOPK_DIVERGENCE_EPS = 1e-12
+FOUR_GATE_SOURCE_TARGET_JS_BLOCKS = {
+    f"{method}_source_target_js": method
+    for method in (
+        "hpre_raw_logit_gauss",
+        "hpre_softmax_prob_gauss",
+        "hmid_raw_logit_gauss",
+        "hmid_softmax_prob_gauss",
+        "hpre_softmax_prob_direct",
+        "raw_attention",
+    )
+}
+FOUR_GATE_RISK_BLOCKS = {}
+for _four_gate_method in (
+    "hpre_raw_logit_gauss",
+    "hpre_softmax_prob_gauss",
+    "hmid_raw_logit_gauss",
+    "hmid_softmax_prob_gauss",
+    "hpre_softmax_prob_direct",
+    "raw_attention",
+    "vp_hpre_raw_logit_gauss",
+    "vp_hpre_softmax_prob_gauss",
+    "vp_hmid_raw_logit_gauss",
+    "vp_hmid_softmax_prob_gauss",
+    "vp_hpre_softmax_prob_direct",
+    "vp_raw_attention",
+):
+    FOUR_GATE_RISK_BLOCKS[f"{_four_gate_method}_risk"] = (
+        _four_gate_method,
+        None,
+    )
+    for _cost_alias, _cost_mode in (
+        ("sqrt_matched_state", "sqrt_cosine_matched_state"),
+        ("geo_stateupd_lu1", "geo_stateupd_lu1"),
+        ("sqrt_stateupd_alpha05", "sqrt_stateupd_alpha05"),
+    ):
+        FOUR_GATE_RISK_BLOCKS[
+            f"{_four_gate_method}_risk_{_cost_alias}"
+        ] = (_four_gate_method, _cost_mode)
+FOUR_GATE_SOURCE_TARGET_JS_CACHE_KEY = "_computed_four_gate_source_target_js"
+FOUR_GATE_SOURCE_TARGET_UNION_TOPK_JS_BLOCKS = {
+    f"{method}_source_target_union_topk_js": method
+    for method in (
+        "hpre_raw_logit_gauss",
+        "hpre_softmax_prob_gauss",
+        "hmid_raw_logit_gauss",
+        "hmid_softmax_prob_gauss",
+        "hpre_softmax_prob_direct",
+        "raw_attention",
+    )
+}
+FOUR_GATE_SOURCE_TARGET_UNION_TOPK_JS_CACHE_KEY = (
+    "_computed_four_gate_source_target_union_topk_js"
+)
+FOUR_GATE_ONE_MINUS_TARGET_MASS_COSINE_BLOCKS = {
+    f"{method}_one_minus_target_dist_mass_x_cosine": method
+    for method in (
+        "hpre_raw_logit_gauss",
+        "hpre_softmax_prob_gauss",
+        "hmid_raw_logit_gauss",
+        "hmid_softmax_prob_gauss",
+        "hpre_softmax_prob_direct",
+        "raw_attention",
+    )
+}
+FOUR_GATE_ONE_MINUS_TARGET_MASS_COSINE_CACHE_KEY = (
+    "_computed_four_gate_one_minus_target_mass_x_cosine"
+)
 
 
 def parse_args():
@@ -874,6 +997,18 @@ def build_selected_matrix(features: Sequence[dict], blocks: Sequence[str]) -> tu
 
 
 def feature_block(feat: dict, block: str) -> np.ndarray:
+    if block in FOUR_GATE_RISK_BLOCKS:
+        return _four_gate_risk_block(feat, block)
+
+    if block in FOUR_GATE_ONE_MINUS_TARGET_MASS_COSINE_BLOCKS:
+        return _four_gate_one_minus_target_mass_x_cosine_block(feat, block)
+
+    if block in FOUR_GATE_SOURCE_TARGET_JS_BLOCKS:
+        return _four_gate_source_target_js_block(feat, block)
+
+    if block in FOUR_GATE_SOURCE_TARGET_UNION_TOPK_JS_BLOCKS:
+        return _four_gate_source_target_union_topk_js_block(feat, block)
+
     if block in ATTENTION_TOPK_DIVERGENCE_BLOCKS:
         return _attention_topk_source_divergence_block(feat, block)
 
@@ -979,6 +1114,199 @@ def feature_block(feat: dict, block: str) -> np.ndarray:
     return np.asarray(values, dtype=np.float32).reshape(-1)
 
 
+def _four_gate_risk_block(feat: dict, block: str) -> np.ndarray:
+    method, explicit_cost_mode = FOUR_GATE_RISK_BLOCKS[block]
+    cost_mode = explicit_cost_mode or feat.get("dgst_t_cost")
+    if cost_mode == "geo_stateupd_lu1":
+        key = f"dgst_t_{method}_risk_geo_stateupd_lu1_per_layer"
+    elif cost_mode == "sqrt_stateupd_alpha05":
+        key = f"dgst_t_{method}_risk_sqrt_stateupd_alpha05_per_layer"
+    else:
+        key = FEATURE_KEYS[block]
+    values = feat.get(key)
+    if values is None:
+        raise KeyError(f"Feature block {block!r} requires missing key {key!r}.")
+    return np.asarray(values, dtype=np.float32).reshape(-1)
+
+
+def _four_gate_source_target_js_block(feat: dict, block: str) -> np.ndarray:
+    method = FOUR_GATE_SOURCE_TARGET_JS_BLOCKS[block]
+    cache = feat.setdefault(FOUR_GATE_SOURCE_TARGET_JS_CACHE_KEY, {})
+    if method not in cache:
+        source_key = "dgst_t_source_dist_per_layer"
+        source_values = feat.get(source_key)
+        if source_values is None:
+            raise KeyError(f"Feature block {block!r} requires {source_key!r}.")
+
+        source = np.asarray(source_values, dtype=np.float64)
+        target = _four_gate_target_values(feat, method, block)
+        if source.ndim != 2 or source.shape != target.shape:
+            raise ValueError(
+                "Four-gate source-target JS requires matching [layers, visual_tokens] "
+                f"matrices, got source={source.shape}, target={target.shape}."
+            )
+        source_prob = _smooth_probability_rows_numpy(source)
+        target_prob = _smooth_probability_rows_numpy(target)
+        midpoint = 0.5 * (source_prob + target_prob)
+        cache[method] = (
+            0.5
+            * np.sum(
+                target_prob * (np.log(target_prob) - np.log(midpoint)), axis=-1
+            )
+            + 0.5
+            * np.sum(
+                source_prob * (np.log(source_prob) - np.log(midpoint)), axis=-1
+            )
+        ).astype(np.float32)
+    return np.asarray(cache[method], dtype=np.float32).reshape(-1)
+
+
+def _four_gate_source_target_union_topk_js_block(
+    feat: dict,
+    block: str,
+) -> np.ndarray:
+    method = FOUR_GATE_SOURCE_TARGET_UNION_TOPK_JS_BLOCKS[block]
+    cache = feat.setdefault(FOUR_GATE_SOURCE_TARGET_UNION_TOPK_JS_CACHE_KEY, {})
+    if method not in cache:
+        source_key = "dgst_t_source_dist_per_layer"
+        source_values = feat.get(source_key)
+        if source_values is None:
+            raise KeyError(f"Feature block {block!r} requires {source_key!r}.")
+        source = _normalize_probability_rows_numpy(source_values)
+        target = _normalize_probability_rows_numpy(
+            _four_gate_target_values(feat, method, block)
+        )
+        if source.ndim != 2 or source.shape != target.shape:
+            raise ValueError(
+                "Four-gate union-topK JS requires matching "
+                "[layers, visual_tokens] matrices, got "
+                f"source={source.shape}, target={target.shape}."
+            )
+        if source.shape[-1] <= 0:
+            raise ValueError("DGST distributions must contain visual tokens.")
+
+        transport_top_k = int(feat.get("dgst_t_transport_top_k", 32))
+        if transport_top_k <= 0:
+            raise ValueError("DGST transport top-K must be positive.")
+        side_top_k = min(
+            max(transport_top_k // 2, 1),
+            int(source.shape[-1]),
+        )
+        source_topk_cache_key = f"_source_topk_{transport_top_k}"
+        source_indices = cache.get(source_topk_cache_key)
+        if source_indices is None:
+            source_indices = np.argsort(
+                -source, axis=-1, kind="stable"
+            )[:, :side_top_k]
+            cache[source_topk_cache_key] = source_indices
+        target_indices = np.argsort(
+            -target, axis=-1, kind="stable"
+        )[:, :side_top_k]
+
+        layer_indices = np.arange(source.shape[0])[:, None]
+        union_mask = np.zeros(source.shape, dtype=bool)
+        union_mask[layer_indices, source_indices] = True
+        union_mask[layer_indices, target_indices] = True
+        source_region = _smooth_masked_probability_rows_numpy(source, union_mask)
+        target_region = _smooth_masked_probability_rows_numpy(target, union_mask)
+        midpoint = 0.5 * (source_region + target_region)
+        source_safe = np.maximum(source_region, ATTENTION_TOPK_DIVERGENCE_EPS)
+        target_safe = np.maximum(target_region, ATTENTION_TOPK_DIVERGENCE_EPS)
+        midpoint_safe = np.maximum(midpoint, ATTENTION_TOPK_DIVERGENCE_EPS)
+        js = 0.5 * np.sum(
+            np.where(
+                union_mask,
+                target_region * (np.log(target_safe) - np.log(midpoint_safe)),
+                0.0,
+            ),
+            axis=-1,
+        )
+        js += 0.5 * np.sum(
+            np.where(
+                union_mask,
+                source_region * (np.log(source_safe) - np.log(midpoint_safe)),
+                0.0,
+            ),
+            axis=-1,
+        )
+        cache[method] = js.astype(np.float32)
+    return np.asarray(cache[method], dtype=np.float32).reshape(-1)
+
+
+def _four_gate_one_minus_target_mass_x_cosine_block(
+    feat: dict,
+    block: str,
+) -> np.ndarray:
+    method = FOUR_GATE_ONE_MINUS_TARGET_MASS_COSINE_BLOCKS[block]
+    cache = feat.setdefault(FOUR_GATE_ONE_MINUS_TARGET_MASS_COSINE_CACHE_KEY, {})
+    if method not in cache:
+        target = _normalize_probability_rows_numpy(
+            _four_gate_target_values(feat, method, block)
+        )
+        if target.shape[-1] <= 0:
+            raise ValueError("DGST target distribution must contain visual tokens.")
+        configured_top_k = int(feat.get("dgst_t_target_region_top_k", 32))
+        if configured_top_k <= 0:
+            raise ValueError("DGST target-region top-K must be positive.")
+        top_k = min(configured_top_k, int(target.shape[-1]))
+        target_mass = np.partition(
+            target,
+            kth=target.shape[-1] - top_k,
+            axis=-1,
+        )[:, -top_k:].sum(axis=-1)
+        target_mass = np.clip(target_mass, 0.0, 1.0)
+        cosine = feature_block(feat, f"{method}_target_cosine").astype(
+            np.float64, copy=False
+        )
+        if cosine.shape != target_mass.shape:
+            raise ValueError(
+                f"Feature block {block!r} requires matching layer curves, got "
+                f"mass={target_mass.shape}, cosine={cosine.shape}."
+            )
+        cache[method] = ((1.0 - target_mass) * cosine).astype(np.float32)
+    return np.asarray(cache[method], dtype=np.float32).reshape(-1)
+
+
+def _four_gate_target_values(feat: dict, method: str, block: str) -> np.ndarray:
+    attention_key = "dgst_t_attention_support_per_layer"
+    attention_values = feat.get(attention_key)
+    if attention_values is None:
+        raise KeyError(f"Feature block {block!r} requires {attention_key!r}.")
+    attention = np.asarray(attention_values, dtype=np.float64)
+    if attention.ndim != 2:
+        raise ValueError(
+            f"Feature block {block!r} requires a [layers, visual_tokens] attention "
+            f"matrix, got {attention.shape}."
+        )
+
+    if method == "raw_attention":
+        return attention
+    if method == "hpre_softmax_prob_direct":
+        target_key = "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer"
+        target_values = feat.get(target_key)
+        if target_values is None:
+            raise KeyError(f"Feature block {block!r} requires {target_key!r}.")
+        target = np.asarray(target_values, dtype=np.float64)
+    else:
+        gate_key = f"dgst_t_{method}_gate_per_layer"
+        gate_values = feat.get(gate_key)
+        if gate_values is None:
+            raise KeyError(f"Feature block {block!r} requires {gate_key!r}.")
+        gate = np.asarray(gate_values, dtype=np.float64)
+        if gate.shape != attention.shape:
+            raise ValueError(
+                f"Feature block {block!r} requires matching gate and attention "
+                f"matrices, got gate={gate.shape}, attention={attention.shape}."
+            )
+        target = attention * gate
+    if target.ndim != 2 or target.shape != attention.shape:
+        raise ValueError(
+            f"Feature block {block!r} requires target and attention to have the "
+            f"same shape, got target={target.shape}, attention={attention.shape}."
+        )
+    return target
+
+
 def _attention_topk_source_divergence_block(feat: dict, block: str) -> np.ndarray:
     scope, metric = ATTENTION_TOPK_DIVERGENCE_BLOCKS[block]
     cache = feat.setdefault(ATTENTION_TOPK_DIVERGENCE_CACHE_KEY, {})
@@ -1054,6 +1382,46 @@ def _smooth_probability_rows(values: torch.Tensor) -> torch.Tensor:
     )
     probabilities = probabilities.clamp_min(ATTENTION_TOPK_DIVERGENCE_EPS)
     return probabilities / probabilities.sum(dim=-1, keepdim=True)
+
+
+def _smooth_probability_rows_numpy(values: np.ndarray) -> np.ndarray:
+    probabilities = _normalize_probability_rows_numpy(values)
+    probabilities = np.maximum(probabilities, ATTENTION_TOPK_DIVERGENCE_EPS)
+    return probabilities / probabilities.sum(axis=-1, keepdims=True)
+
+
+def _normalize_probability_rows_numpy(values: np.ndarray) -> np.ndarray:
+    values = np.nan_to_num(
+        np.asarray(values, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    values = np.maximum(values, 0.0)
+    totals = values.sum(axis=-1, keepdims=True)
+    uniform = np.full_like(values, 1.0 / float(values.shape[-1]))
+    probabilities = np.divide(
+        values,
+        np.maximum(totals, ATTENTION_TOPK_DIVERGENCE_EPS),
+        out=uniform,
+        where=totals > 0.0,
+    )
+    return probabilities
+
+
+def _smooth_masked_probability_rows_numpy(
+    probabilities: np.ndarray,
+    mask: np.ndarray,
+) -> np.ndarray:
+    values = np.where(mask, probabilities, 0.0)
+    totals = values.sum(axis=-1, keepdims=True)
+    support_sizes = mask.sum(axis=-1, keepdims=True)
+    if np.any(totals <= 0.0) or np.any(support_sizes <= 0):
+        raise ValueError("Union-topK support must have positive probability mass.")
+    values = values / totals
+    values = np.where(
+        mask,
+        np.maximum(values, ATTENTION_TOPK_DIVERGENCE_EPS),
+        0.0,
+    )
+    return values / values.sum(axis=-1, keepdims=True)
 
 
 def _shift_right_one_layer(values: np.ndarray) -> np.ndarray:

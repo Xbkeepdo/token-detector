@@ -6,11 +6,16 @@ import sys
 import tempfile
 import unittest
 
+import numpy as np
+
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from scripts.train_baselines import (  # noqa: E402
+    _normalize_baseline_trainer,
+    _shared_mlp_baseline_matrix,
+    _shared_probe_config,
     _write_baseline_markdown,
     aggregate_baseline_outputs,
 )
@@ -61,6 +66,92 @@ def _output(seed: int, value: float) -> dict:
 
 
 class BaselineReportingTests(unittest.TestCase):
+    def test_shared_mlp_trainer_aliases_and_three_layer_config(self) -> None:
+        self.assertEqual(
+            _normalize_baseline_trainer("3layer_mlp"),
+            "shared_torch_mlp",
+        )
+        config = _shared_probe_config(
+            {"hidden_sizes": [128, 64, 32], "max_epochs": 7},
+            seed=44,
+            positive_class="real",
+        )
+        self.assertEqual(config.hidden_sizes, (128, 64, 32))
+        self.assertEqual(config.num_epochs, 7)
+        self.assertEqual(config.seed, 44)
+        with self.assertRaisesRegex(ValueError, "exactly three"):
+            _shared_probe_config(
+                {"hidden_sizes": [128, 64]},
+                seed=44,
+                positive_class="real",
+            )
+
+    def test_shared_mlp_dense_vectors_include_projectaway_curve(self) -> None:
+        records = []
+        for index, label in enumerate((0, 1)):
+            records.append({
+                "baseline_schema_version": "1.0",
+                "image_id": index,
+                "response_token_idx": 0,
+                "label": label,
+                "baselines": {
+                    "metatoken": {"vector": [1.0, 2.0]},
+                    "svar": {"vector": [3.0, 4.0, 5.0]},
+                    "projectaway": {
+                        "internal_confidence": 0.8,
+                        "per_layer_internal_confidence": [0.1, 0.2, 0.3],
+                    },
+                },
+            })
+        metatoken, labels = _shared_mlp_baseline_matrix(records, "metatoken")
+        svar, _ = _shared_mlp_baseline_matrix(records, "svar")
+        projectaway, _ = _shared_mlp_baseline_matrix(records, "projectaway")
+        self.assertEqual(metatoken.shape, (2, 2))
+        self.assertEqual(svar.shape, (2, 3))
+        self.assertEqual(projectaway.shape, (2, 4))
+        np.testing.assert_allclose(projectaway[0], [0.8, 0.1, 0.2, 0.3])
+        np.testing.assert_array_equal(labels, [0, 1])
+
+    def test_shared_mlp_aggregate_and_markdown_report_both_thresholds(self) -> None:
+        outputs = [_output(seed, value) for seed, value in zip(
+            (43, 44, 45), (0.6, 0.7, 0.8)
+        )]
+        for output in outputs:
+            output["checkpoint_selection"] = "minimum_train_loss"
+            output["threshold_reporting"] = ["fixed_0.5", "train_f1"]
+            for result in (
+                output["methods"]["metatoken"]["lr"],
+                output["methods"]["svar"],
+            ):
+                result["threshold_reports"] = {
+                    "fixed_0.5": {
+                        "threshold": 0.5,
+                        "train_metrics": result["train_metrics"],
+                        "test_metrics": result["test_metrics"],
+                    },
+                    "train_f1": {
+                        "threshold": 0.4,
+                        "train_metrics": result["train_metrics"],
+                        "test_metrics": result["test_metrics"],
+                    },
+                }
+        summary = aggregate_baseline_outputs(outputs)
+        self.assertEqual(
+            summary["methods"]["svar"]["threshold_reports"]
+            ["fixed_0.5"]["threshold"]["mean"],
+            0.5,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.md"
+            _write_baseline_markdown(
+                path,
+                summary,
+                source_paths=[Path(f"seed{seed}.json") for seed in (43, 44, 45)],
+            )
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("固定阈值 0.5", text)
+        self.assertIn("Train Real-F1 搜索阈值", text)
+
     def test_three_seed_population_mean_std_and_markdown(self) -> None:
         outputs = [
             _output(42, 0.6),

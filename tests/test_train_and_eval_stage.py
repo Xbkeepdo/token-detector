@@ -34,23 +34,25 @@ class UnifiedTrainStageTests(unittest.TestCase):
         roots, summary, baseline = commands[:3], commands[3], commands[4]
         self.assertEqual(
             [command[command.index("--seed") + 1] for command in roots],
-            ["42", "43", "44"],
+            ["43", "44", "45"],
         )
         self.assertEqual(
             [command[command.index("--run-name") + 1] for command in roots],
-            ["seed42", "seed43", "seed44"],
+            ["seed43", "seed44", "seed45"],
         )
         for root in roots:
             self.assertEqual(root[1], "scripts/train_torch_probe_feature_sets.py")
             self.assertIn("raw_attention_risk", root)
             self.assertIn("ads+cgc", root)
             self.assertEqual(root[root.index("--positive-class") + 1], "real")
-            self.assertEqual(root[root.index("--batch-size") + 1], "128")
-            self.assertEqual(root[root.index("--num-epochs") + 1], "120")
-            self.assertNotIn("--early-stopping-patience", root)
+            self.assertEqual(root[root.index("--batch-size") + 1], "256")
+            self.assertEqual(root[root.index("--num-epochs") + 1], "100")
+            self.assertEqual(
+                root[root.index("--early-stopping-patience") + 1], "10"
+            )
             hidden_start = root.index("--hidden-sizes") + 1
             self.assertEqual(
-                root[hidden_start : hidden_start + 3], ["256", "128", "64"]
+                root[hidden_start : hidden_start + 3], ["128", "64", "32"]
             )
         self.assertEqual(summary[1], "scripts/summarize_torch_probe_seed_runs.py")
         self.assertTrue(
@@ -62,7 +64,7 @@ class UnifiedTrainStageTests(unittest.TestCase):
         self.assertEqual(baseline[1], "scripts/train_baselines.py")
         self.assertEqual(baseline[baseline.index("--device") + 1], "cuda:0")
         baseline_training = self.config["training"]["baseline"]
-        self.assertEqual(baseline_training["seeds"], [42, 43, 44])
+        self.assertEqual(baseline_training["seeds"], [43, 44, 45])
         self.assertNotIn("halloc", baseline_training["methods"])
 
     def test_method_mode_and_branch_switch_filter_training(self) -> None:
@@ -123,6 +125,36 @@ class UnifiedTrainStageTests(unittest.TestCase):
         self.assertNotIn("--run-name", root)
         self.assertEqual(root[root.index("--seed") + 1], "42")
         self.assertEqual(baseline[1], "scripts/train_baselines.py")
+
+    def test_feature_override_and_run_name_isolate_seed_outputs(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["run"]["extraction_mode"] = "method_only"
+        feature_set = (
+            "raw_attention_source_target_js+"
+            "raw_attention_ev_target_dist_mass_x_cosine"
+        )
+        commands = build_training_commands(
+            config=config,
+            model="qwen3_vl_8b",
+            config_path="config.yaml",
+            output_dir="output",
+            device="cpu",
+            feature_sets_override=[feature_set],
+            run_name="js_ev",
+        )
+        self.assertEqual(len(commands), 4)
+        for seed, command in zip((43, 44, 45), commands[:3]):
+            self.assertEqual(
+                command[command.index("--run-name") + 1], f"js_ev_seed{seed}"
+            )
+            self.assertIn(feature_set, command)
+        summary = commands[-1]
+        self.assertIn("js_ev_seed{seed}", summary[summary.index("--run-template") + 1])
+        self.assertTrue(
+            summary[summary.index("--output-prefix") + 1].endswith(
+                "qwen3_vl_8b_js_ev_3seed_summary"
+            )
+        )
 
 
 if __name__ == "__main__":

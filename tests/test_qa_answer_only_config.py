@@ -515,7 +515,7 @@ class QAAnswerOnlyConfigTests(unittest.TestCase):
                 "position": "prompt_last_token",
                 "positive_class": "real",
                 "split_protocol": "strict_82_no_validation",
-                "checkpoint_selection": "last_epoch",
+                "checkpoint_selection": "minimum_train_loss",
                 "threshold_selection": "train_f1",
                 "training_input_fingerprint": fingerprint,
             }

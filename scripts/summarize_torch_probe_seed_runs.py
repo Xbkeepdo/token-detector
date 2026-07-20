@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--models", nargs="+", required=True)
     parser.add_argument("--model-labels", nargs="+", default=None)
-    parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
+    parser.add_argument("--seeds", nargs="+", type=int, default=[43, 44, 45])
     parser.add_argument(
         "--run-template",
         required=True,
@@ -74,42 +74,77 @@ def main() -> None:
                 for seed in args.seeds
             }
             _validate_seed_metadata(model, feature_set, seed_metrics)
-            row = {
-                "model": model,
-                "model_label": label,
-                "feature_set": feature_set,
-                "num_seeds": len(args.seeds),
-                "seeds": list(args.seeds),
-            }
-            for metric in METRICS:
-                values = [float(seed_metrics[seed][metric]) for seed in args.seeds]
-                row[f"{metric}_mean"] = statistics.fmean(values)
-                row[f"{metric}_std"] = statistics.pstdev(values)
-                row[f"{metric}_values"] = values
-            row["headline_positive_class"] = str(
-                seed_metrics[args.seeds[0]]["reported_positive_class"]
-            )
-            for class_prefix in CLASS_PREFIXES:
-                for metric in CLASS_METRICS:
+            reporting = tuple(
+                seed_metrics[args.seeds[0]].get("threshold_reporting") or ()
+            ) or ("train_f1",)
+            for threshold_mode in reporting:
+                metrics_by_seed = {
+                    seed: (
+                        seed_metrics[seed]["threshold_reports"][threshold_mode]
+                        ["test_metrics"]
+                        if seed_metrics[seed].get("threshold_reports")
+                        else seed_metrics[seed]
+                    )
+                    for seed in args.seeds
+                }
+                threshold_values = [
+                    float(
+                        seed_metrics[seed]["threshold_reports"][threshold_mode]
+                        ["threshold"]
+                    )
+                    if seed_metrics[seed].get("threshold_reports")
+                    else float(seed_metrics[seed]["decision_threshold"])
+                    for seed in args.seeds
+                ]
+                row = {
+                    "model": model,
+                    "model_label": label,
+                    "feature_set": feature_set,
+                    "threshold_mode": threshold_mode,
+                    "threshold_mean": statistics.fmean(threshold_values),
+                    "threshold_std": statistics.pstdev(threshold_values),
+                    "threshold_values": threshold_values,
+                    "num_seeds": len(args.seeds),
+                    "seeds": list(args.seeds),
+                }
+                for metric in METRICS:
                     values = [
-                        float(seed_metrics[seed][class_prefix][metric])
+                        float(metrics_by_seed[seed][metric])
                         for seed in args.seeds
                     ]
-                    key = f"{class_prefix}_{metric}"
-                    row[f"{key}_mean"] = statistics.fmean(values)
-                    row[f"{key}_std"] = statistics.pstdev(values)
-                    row[f"{key}_values"] = values
-            model_rows.append(row)
+                    row[f"{metric}_mean"] = statistics.fmean(values)
+                    row[f"{metric}_std"] = statistics.pstdev(values)
+                    row[f"{metric}_values"] = values
+                row["headline_positive_class"] = str(
+                    metrics_by_seed[args.seeds[0]]["reported_positive_class"]
+                )
+                for class_prefix in CLASS_PREFIXES:
+                    for metric in CLASS_METRICS:
+                        values = [
+                            float(metrics_by_seed[seed][class_prefix][metric])
+                            for seed in args.seeds
+                        ]
+                        key = f"{class_prefix}_{metric}"
+                        row[f"{key}_mean"] = statistics.fmean(values)
+                        row[f"{key}_std"] = statistics.pstdev(values)
+                        row[f"{key}_values"] = values
+                model_rows.append(row)
 
         model_rows.sort(
             key=lambda item: (
+                ("fixed_0.5", "train_f1").index(item["threshold_mode"]),
                 -item["real_positive_auc_mean"],
                 -item["real_positive_f1_mean"],
                 item["feature_set"],
             )
         )
-        for rank, row in enumerate(model_rows, start=1):
-            row["rank"] = rank
+        for threshold_mode in ("fixed_0.5", "train_f1"):
+            mode_rows = [
+                row for row in model_rows
+                if row["threshold_mode"] == threshold_mode
+            ]
+            for rank, row in enumerate(mode_rows, start=1):
+                row["rank"] = rank
         rows.extend(model_rows)
         raw[model] = model_rows
 
@@ -164,12 +199,24 @@ def _validate_seed_metadata(model: str, feature_set: str, seed_metrics: dict[int
         )
         if selection != (
             "strict_82_no_validation",
-            "last_epoch",
+            "minimum_train_loss",
             "train_f1",
         ):
             raise ValueError(
                 f"{model}/{feature_set}/seed{expected_seed}: incompatible "
                 f"selection protocol {selection}"
+            )
+        reporting = tuple(metrics.get("threshold_reporting") or ())
+        if reporting != ("fixed_0.5", "train_f1"):
+            raise ValueError(
+                f"{model}/{feature_set}/seed{expected_seed}: invalid "
+                f"threshold reporting {reporting}"
+            )
+        reports = metrics.get("threshold_reports") or {}
+        if tuple(reports) != reporting:
+            raise ValueError(
+                f"{model}/{feature_set}/seed{expected_seed}: missing dual "
+                "threshold reports"
             )
         actual_seed = metrics.get("best_params", {}).get("seed")
         if actual_seed is not None and int(actual_seed) != int(expected_seed):
@@ -193,34 +240,42 @@ def _write_markdown(path: Path, title: str, seeds: list[int], rows: list[dict]) 
         "",
         f"Seeds: `{', '.join(str(seed) for seed in seeds)}`. Values are population mean+/-std.",
         "Real is the headline positive class; hallucination-positive metrics are reported alongside it.",
-        "Strict 8:2 has no validation set: every run uses fixed epochs, the final checkpoint, and a Real-F1 threshold selected on train only.",
+        "Strict 8:2 has no validation set: train-loss early stopping restores the minimum-train-loss checkpoint.",
+        "Every checkpoint is reported twice: fixed threshold 0.5 and a Real-F1 threshold selected on train only.",
         "Real/Hall AUC values are equal under score inversion, while AUPR differs; hallucination metrics use the complementary prediction at the same fixed boundary.",
         "",
         "## Best by model",
         "",
-        "| Model | Best feature set | Acc | Real PR | Real RC | Real F1 | Real AUC | Real AUPR | Hall. PR | Hall. RC | Hall. F1 | Hall. AUC | Hall. AUPR |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Model | Threshold mode | Best feature set | Threshold | Acc | Real PR | Real RC | Real F1 | Real AUC | Real AUPR | Hall. PR | Hall. RC | Hall. F1 | Hall. AUC | Hall. AUPR |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     model_order = []
     for row in rows:
         if row["model"] not in model_order:
             model_order.append(row["model"])
     for model in model_order:
-        best = next(row for row in rows if row["model"] == model)
-        lines.append(
-            f"| {best['model_label']} | `{best['feature_set']}` | "
-            f"{_mean_std(best, 'accuracy')} | "
-            f"{_mean_std(best, 'real_positive_precision')} | "
-            f"{_mean_std(best, 'real_positive_recall')} | "
-            f"{_mean_std(best, 'real_positive_f1')} | "
-            f"{_mean_std(best, 'real_positive_auc')} | "
-            f"{_mean_std(best, 'real_positive_aupr')} | "
-            f"{_mean_std(best, 'hallucination_positive_precision')} | "
-            f"{_mean_std(best, 'hallucination_positive_recall')} | "
-            f"{_mean_std(best, 'hallucination_positive_f1')} | "
-            f"{_mean_std(best, 'hallucination_positive_auc')} | "
-            f"{_mean_std(best, 'hallucination_positive_aupr')} |"
-        )
+        for threshold_mode in ("fixed_0.5", "train_f1"):
+            best = next(
+                row for row in rows
+                if row["model"] == model
+                and row["threshold_mode"] == threshold_mode
+            )
+            lines.append(
+                f"| {best['model_label']} | {threshold_mode} | "
+                f"`{best['feature_set']}` | "
+                f"{_mean_std(best, 'threshold')} | "
+                f"{_mean_std(best, 'accuracy')} | "
+                f"{_mean_std(best, 'real_positive_precision')} | "
+                f"{_mean_std(best, 'real_positive_recall')} | "
+                f"{_mean_std(best, 'real_positive_f1')} | "
+                f"{_mean_std(best, 'real_positive_auc')} | "
+                f"{_mean_std(best, 'real_positive_aupr')} | "
+                f"{_mean_std(best, 'hallucination_positive_precision')} | "
+                f"{_mean_std(best, 'hallucination_positive_recall')} | "
+                f"{_mean_std(best, 'hallucination_positive_f1')} | "
+                f"{_mean_std(best, 'hallucination_positive_auc')} | "
+                f"{_mean_std(best, 'hallucination_positive_aupr')} |"
+            )
 
     for model in model_order:
         model_rows = [row for row in rows if row["model"] == model]
@@ -229,13 +284,14 @@ def _write_markdown(path: Path, title: str, seeds: list[int], rows: list[dict]) 
                 "",
                 f"## {model_rows[0]['model_label']}",
                 "",
-                "| Rank | Feature set | Acc | Real PR | Real RC | Real F1 | Real AUC | Real AUPR | Hall. PR | Hall. RC | Hall. F1 | Hall. AUC | Hall. AUPR |",
-                "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Threshold mode | Rank | Feature set | Threshold | Acc | Real PR | Real RC | Real F1 | Real AUC | Real AUPR | Hall. PR | Hall. RC | Hall. F1 | Hall. AUC | Hall. AUPR |",
+                "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in model_rows:
             lines.append(
-                f"| {row['rank']} | `{row['feature_set']}` | "
+                f"| {row['threshold_mode']} | {row['rank']} | `{row['feature_set']}` | "
+                f"{_mean_std(row, 'threshold')} | "
                 f"{_mean_std(row, 'accuracy')} | "
                 f"{_mean_std(row, 'real_positive_precision')} | "
                 f"{_mean_std(row, 'real_positive_recall')} | "
@@ -257,6 +313,9 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         "model_label",
         "rank",
         "feature_set",
+        "threshold_mode",
+        "threshold_mean",
+        "threshold_std",
         "num_seeds",
         "seeds",
         "headline_positive_class",

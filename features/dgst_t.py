@@ -305,10 +305,13 @@ def compute_dgst_t_batch_from_captures(
     ffn_injection_eps: float = EPS,
     compute_dual_scope: bool = False,
     four_gate_methods: Sequence[str] | None = None,
+    four_gate_cost_modes: Sequence[str] | str | None = None,
+    four_gate_support_modes: Sequence[str] | str | None = None,
     release_layer_captures: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute DGST-T for several target tokens directly from shared captures."""
     from models.dgst_capture import (
+        attention_row_from_capture,
         resolve_output_embedding_layer,
         resolve_decoder_final_norm,
         resolve_prompt_positions,
@@ -328,11 +331,23 @@ def compute_dgst_t_batch_from_captures(
         return []
 
     if _normalize_target_gate_mode(target_gate_mode) == "four_gate":
+        prompt_positions = (
+            [int(position) for position in prompt_positions_override]
+            if prompt_positions_override is not None
+            else resolve_prompt_positions(
+                full_input_ids=full_input_ids,
+                prompt_tokenized_length=prompt_tokenized_length,
+                image_token_id=int(image_token_id),
+                visual_start=int(visual_start),
+                visual_end=int(visual_end),
+            )
+        )
         return compute_four_gate_dgst_batch_from_captures(
             model=model,
             captures=captures,
             visual_start=int(visual_start),
             visual_end=int(visual_end),
+            prompt_positions=prompt_positions,
             target_token_ids=target_ids,
             prediction_positions=pred_positions,
             semantic_chunk_size=int(semantic_chunk_size),
@@ -340,7 +355,13 @@ def compute_dgst_t_batch_from_captures(
             transport_top_k=int(transport_top_k),
             target_region_top_k=int(atarget_visual_top_k),
             mad_epsilon=float(relative_vll_mad_epsilon),
+            cost_mode=cost_mode,
+            cost_modes=four_gate_cost_modes,
             enabled_methods=four_gate_methods,
+            compute_dual_scope=bool(compute_dual_scope),
+            support_modes=four_gate_support_modes,
+            compute_ffn_injection_features=bool(compute_ffn_injection_features),
+            ffn_injection_eps=float(ffn_injection_eps),
             release_layer_captures=bool(release_layer_captures),
         )
 
@@ -465,7 +486,10 @@ def compute_dgst_t_batch_from_captures(
         prompt_mean_state = prompt_states.mean(dim=0)
 
         for target_offset, prediction_position in enumerate(pred_positions):
-            attention_row = capture["attn_weights"][0, :, int(prediction_position), :]
+            attention_row = attention_row_from_capture(
+                capture,
+                int(prediction_position),
+            )
             support_attention = attention_row.index_select(
                 1,
                 support_index.to(attention_row.device),
@@ -3945,19 +3969,184 @@ def compute_four_gate_dgst_batch_from_captures(
     visual_end: int,
     target_token_ids: Sequence[int],
     prediction_positions: Sequence[int],
+    prompt_positions: Sequence[int] | None = None,
     semantic_chunk_size: int = 64,
     tau: float = 0.07,
     transport_top_k: int = 64,
     target_region_top_k: int = 32,
     mad_epsilon: float = RELATIVE_VLL_MAD_EPSILON,
+    cost_mode: str = "sqrt_matched_state",
+    cost_modes: Sequence[str] | str | None = None,
+    enabled_methods: Sequence[str] | None = None,
+    compute_dual_scope: bool = False,
+    support_modes: Sequence[str] | str | None = None,
+    compute_ffn_injection_features: bool = False,
+    ffn_injection_eps: float = EPS,
+    release_layer_captures: bool = False,
+) -> list[dict[str, Any]]:
+    """Compute compact VV features and optional VP/FAD features.
+
+    VV remains the unprefixed, backward-compatible branch. ``support_modes``
+    explicitly selects VV, VP, or both; when both are enabled the same
+    captures are reduced over each support set and VP is stored under
+    ``dgst_t_vp_*``.
+    ``compute_ffn_injection_features`` adds the historical layerwise FAD
+    curve without re-enabling the other legacy FFN diagnostics.
+    """
+    active_modes = _normalize_four_gate_support_modes(
+        support_modes,
+        legacy_compute_dual_scope=bool(compute_dual_scope),
+    )
+    visual_positions = list(range(int(visual_start), int(visual_end)))
+    scopes: list[tuple[str, list[int]]] = []
+    if "vv" in active_modes:
+        scopes.append(("visual", visual_positions))
+    if "vp" in active_modes:
+        if not prompt_positions:
+            raise ValueError(
+                "four-gate VP extraction requires at least one prompt support token."
+            )
+        vp_positions = sorted(
+            dict.fromkeys(
+                visual_positions + [int(position) for position in prompt_positions]
+            )
+        )
+        scopes.append(("visual_prompt", vp_positions))
+
+    scoped_results: dict[str, list[dict[str, Any]]] = {}
+    for scope_name, support_positions in scopes:
+        scoped_results[scope_name] = _compute_four_gate_single_scope_from_captures(
+            model=model,
+            captures=captures,
+            visual_start=int(visual_start),
+            visual_end=int(visual_end),
+            support_positions=support_positions,
+            support_scope=scope_name,
+            target_token_ids=target_token_ids,
+            prediction_positions=prediction_positions,
+            semantic_chunk_size=int(semantic_chunk_size),
+            tau=float(tau),
+            transport_top_k=int(transport_top_k),
+            target_region_top_k=int(target_region_top_k),
+            mad_epsilon=float(mad_epsilon),
+            cost_mode=cost_mode,
+            cost_modes=cost_modes,
+            enabled_methods=enabled_methods,
+            release_layer_captures=False,
+        )
+
+    if "visual" in scoped_results:
+        results = scoped_results["visual"]
+    else:
+        # VP-only mode intentionally has no unprefixed per-layer values: those
+        # names are reserved for the backward-compatible VV branch.
+        results = [
+            {
+                key: value
+                for key, value in vp_result.items()
+                if not key.endswith("_per_layer")
+            }
+            for vp_result in scoped_results["visual_prompt"]
+        ]
+    for result in results:
+        result["dgst_t_four_gate_support_scopes"] = [name for name, _ in scopes]
+        if "vv" in active_modes:
+            result["dgst_t_vv_support_size"] = len(visual_positions)
+
+    if "visual_prompt" in scoped_results:
+        vp_results = scoped_results["visual_prompt"]
+        if len(vp_results) != len(results):
+            raise AssertionError("VV and VP four-gate result counts differ.")
+        for result, vp_result in zip(results, vp_results):
+            result["dgst_t_profile"] = "four_gate_vv_vp_v1"
+            if "vv" not in active_modes:
+                result["dgst_t_profile"] = "four_gate_vp_v1"
+            result["dgst_t_vp_support_size"] = int(
+                vp_result["dgst_t_support_size"]
+            )
+            for key, value in vp_result.items():
+                if key.startswith("dgst_t_") and (
+                    key.endswith("_per_layer")
+                    or key
+                    in {
+                        "dgst_t_attention_support_per_layer",
+                        "dgst_t_source_dist_per_layer",
+                    }
+                ):
+                    result[f"dgst_t_vp_{key[len('dgst_t_'):]}"] = value
+
+    if compute_ffn_injection_features:
+        pred_positions = [int(position) for position in prediction_positions]
+        eps_value = max(float(ffn_injection_eps), EPS)
+        fad_by_target: list[list[float]] = [[] for _ in pred_positions]
+        for layer_index, capture in enumerate(captures):
+            if capture.get("o_attn") is None:
+                raise RuntimeError(
+                    "ffn_fad requires retained MHSA updates; layer "
+                    f"{layer_index} has no o_attn capture."
+                )
+            if capture.get("o_ffn") is None:
+                raise RuntimeError(
+                    f"ffn_fad requires FFN updates; layer {layer_index} has none."
+                )
+            sequence_length = int(capture["o_ffn"].shape[1])
+            for target_offset, position in enumerate(pred_positions):
+                if position < 0 or position >= sequence_length:
+                    raise ValueError(
+                        f"Prediction position {position} is outside sequence length "
+                        f"{sequence_length}."
+                    )
+                ffn_update = capture["o_ffn"][0, position].float()
+                attn_update = capture["o_attn"][0, position].float()
+                fad_by_target[target_offset].append(
+                    float(
+                        torch.log(
+                            (ffn_update.norm(p=2) + eps_value)
+                            / (attn_update.norm(p=2) + eps_value)
+                        ).item()
+                    )
+                )
+        for result, fad_values in zip(results, fad_by_target):
+            result["dgst_t_ffn_attn_dominance_per_layer"] = torch.tensor(
+                fad_values, dtype=torch.float32
+            )
+            result["dgst_t_ffn_attn_dominance_definition"] = (
+                "log((l2_norm(o_ffn)+eps)/(l2_norm(o_attn)+eps))"
+            )
+
+    if release_layer_captures:
+        for capture in captures:
+            for key in ("h_prev", "o_attn", "h_mid", "o_ffn", "attn_weights"):
+                capture[key] = None
+    return results
+
+
+@torch.inference_mode()
+def _compute_four_gate_single_scope_from_captures(
+    *,
+    model: Any,
+    captures: Sequence[dict[str, Any]],
+    visual_start: int,
+    visual_end: int,
+    support_positions: Sequence[int],
+    support_scope: str,
+    target_token_ids: Sequence[int],
+    prediction_positions: Sequence[int],
+    semantic_chunk_size: int = 64,
+    tau: float = 0.07,
+    transport_top_k: int = 64,
+    target_region_top_k: int = 32,
+    mad_epsilon: float = RELATIVE_VLL_MAD_EPSILON,
+    cost_mode: str = "sqrt_matched_state",
+    cost_modes: Sequence[str] | str | None = None,
     enabled_methods: Sequence[str] | None = None,
     release_layer_captures: bool = False,
 ) -> list[dict[str, Any]]:
-    """Compute the active four-gate VV profile directly from decoder captures.
+    """Compute one compact four-gate support scope from decoder captures.
 
     This is intentionally an early, compact path.  It does not build the
-    historical ``dgst_t_raw`` payload and never computes prompt/VP features,
-    legacy gates, alternative costs, or FFN diagnostics.  For h_pre and h_mid,
+    historical ``dgst_t_raw`` payload, legacy gates or FFN diagnostics. For
+    h_pre and h_mid,
     one chunked vocabulary projection produces both the target raw logit and
     the target vocabulary-softmax probability.
     """
@@ -3973,11 +4162,19 @@ def compute_four_gate_dgst_batch_from_captures(
         return []
     if not captures:
         raise ValueError("four-gate DGST requires at least one decoder-layer capture.")
-    if int(visual_end) <= int(visual_start):
-        raise ValueError("four-gate DGST requires at least one visual support token.")
+    normalized_support_positions = [int(position) for position in support_positions]
+    if not normalized_support_positions:
+        raise ValueError("four-gate DGST requires at least one support token.")
+    if str(support_scope) not in {"visual", "visual_prompt"}:
+        raise ValueError("four-gate support_scope must be visual or visual_prompt.")
     if int(target_region_top_k) <= 0:
         raise ValueError("target_region_top_k must be a positive integer.")
     methods = _normalize_four_gate_methods(enabled_methods)
+    normalized_cost_mode = _normalize_four_gate_cost_mode(cost_mode)
+    normalized_cost_modes = _normalize_four_gate_cost_modes(
+        cost_modes,
+        primary_cost_mode=normalized_cost_mode,
+    )
     output_layer = resolve_output_embedding_layer(model)
 
     records: list[dict[str, Any]] = []
@@ -3993,7 +4190,11 @@ def compute_four_gate_dgst_batch_from_captures(
                 },
                 "direct_hpre_target_probs": [],
                 "direct_hpre_target_dist": [],
-                "problems": {method: [] for method in methods},
+                "problems": {
+                    (method, active_cost): []
+                    for method in methods
+                    for active_cost in normalized_cost_modes
+                },
                 "cosines": {method: [] for method in methods},
                 "ev": {method: [] for method in methods},
             }
@@ -4014,6 +4215,7 @@ def compute_four_gate_dgst_batch_from_captures(
             capture=capture,
             visual_start=int(visual_start),
             visual_end=int(visual_end),
+            support_positions=normalized_support_positions,
             target_token_ids=target_ids,
             prediction_positions=pred_positions,
             semantic_chunk_size=int(semantic_chunk_size),
@@ -4023,9 +4225,16 @@ def compute_four_gate_dgst_batch_from_captures(
         if tuple(compact_capture) != FOUR_GATE_CAPTURE_FIELDS:
             raise AssertionError("Unexpected fields in compact four-gate capture.")
         visual_hpre = compact_capture["visual_hpre"]
-        visual_hmid = capture["h_mid"][
-            0, int(visual_start) : int(visual_end)
-        ].float()
+        support_index = torch.tensor(
+            normalized_support_positions,
+            dtype=torch.long,
+            device=capture["h_mid"].device,
+        )
+        visual_hmid = capture["h_mid"][0].index_select(0, support_index).float()
+        visual_hout = visual_hmid + capture["o_ffn"][0].index_select(
+            0, support_index
+        ).float()
+        visual_update = visual_hout - visual_hmid
         sequence_length = int(capture["h_prev"].shape[1])
 
         for target_offset, prediction_position in enumerate(pred_positions):
@@ -4105,14 +4314,18 @@ def compute_four_gate_dgst_batch_from_captures(
                     target_dist,
                     int(transport_top_k),
                 )
-                problem = _prepare_transport_problem_for_state_cost(
-                    source_dist=source_dist,
-                    target_dist=target_dist,
-                    states=cost_states,
-                    support=support,
-                    sqrt_cosine=True,
-                    keep_on_device=False,
-                )
+                for active_cost in normalized_cost_modes:
+                    problem = _prepare_four_gate_cost_problem(
+                        cost_mode=active_cost,
+                        source_dist=source_dist,
+                        target_dist=target_dist,
+                        matched_states=cost_states,
+                        hmid_states=visual_hmid,
+                        hout_states=visual_hout,
+                        update_states=visual_update,
+                        support=support,
+                    )
+                    record["problems"][(method, active_cost)].append(problem)
                 region = _stable_topk_indices(
                     target_dist,
                     int(target_region_top_k),
@@ -4135,11 +4348,10 @@ def compute_four_gate_dgst_batch_from_captures(
                     )
                 if method != DIRECT_HPRE_SOFTMAX_METHOD:
                     record["gates"][method].append(gate)
-                record["problems"][method].append(problem)
                 record["cosines"][method].append(target_cosine)
                 record["ev"][method].append(evidence_value)
 
-        del compact_capture, visual_hpre, visual_hmid
+        del compact_capture, visual_hpre, visual_hmid, visual_hout, visual_update
         if release_layer_captures:
             # Method-only extraction has no downstream consumer for the hook
             # tensors.  Drop every large decoder reference as soon as this
@@ -4170,7 +4382,13 @@ def compute_four_gate_dgst_batch_from_captures(
             "dgst_t_target_token_id": int(target_ids[target_offset]),
             "dgst_t_prediction_position": int(pred_positions[target_offset]),
             "dgst_t_four_gate_methods": list(methods),
-            "dgst_t_mad_axis": "visual_tokens",
+            "dgst_t_mad_axis": (
+                "visual_tokens"
+                if str(support_scope) == "visual"
+                else "visual_prompt_tokens"
+            ),
+            "dgst_t_support_scope": str(support_scope),
+            "dgst_t_support_size": len(normalized_support_positions),
             "dgst_t_mad_scale": float(GAUSSIAN_MAD_SCALE),
             "dgst_t_softmax_axis": "vocabulary",
             "dgst_t_source_distribution_mode": "softmax",
@@ -4183,7 +4401,8 @@ def compute_four_gate_dgst_batch_from_captures(
             "dgst_t_ev_definition": (
                 "target_dist_topk_mass_x_mean_target_cosine"
             ),
-            "dgst_t_cost": "sqrt_cosine_matched_state",
+            "dgst_t_cost": normalized_cost_mode,
+            "dgst_t_cost_modes": list(normalized_cost_modes),
             "dgst_t_ot_solver": "emd",
             "dgst_t_attention_support_per_layer": torch.stack(
                 record["attention"], dim=0
@@ -4192,6 +4411,8 @@ def compute_four_gate_dgst_batch_from_captures(
                 record["source"], dim=0
             ).detach().to(device="cpu", dtype=torch.float32),
         }
+        if "sqrt_stateupd_alpha05" in normalized_cost_modes:
+            result["dgst_t_cost_alpha"] = 0.5
         if RAW_ATTENTION_METHOD in methods:
             result["dgst_t_raw_attention_definition"] = (
                 "post_softmax_head_mean_visual_support_renormalized"
@@ -4217,11 +4438,13 @@ def compute_four_gate_dgst_batch_from_captures(
                 result[f"dgst_t_{method}_gate_per_layer"] = torch.stack(
                     record["gates"][method], dim=0
                 ).detach().to(device="cpu", dtype=torch.float32)
-            result[
-                f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
-            ] = torch.tensor(
-                risk_series[method], dtype=torch.float32
-            )
+            for active_cost in normalized_cost_modes:
+                risk_suffix = _four_gate_risk_suffix(active_cost, state_name)
+                result[
+                    f"dgst_t_{method}_{risk_suffix}_per_layer"
+                ] = torch.tensor(
+                    risk_series[(method, active_cost)], dtype=torch.float32
+                )
             topk_slug = f"topk{int(target_region_top_k)}"
             result[
                 f"dgst_t_{method}_target_cosine_{topk_slug}_{state_name}_per_layer"
@@ -4245,6 +4468,7 @@ def build_compact_four_gate_layer_capture(
     visual_end: int,
     target_token_ids: Sequence[int],
     prediction_positions: Sequence[int],
+    support_positions: Sequence[int] | None = None,
     semantic_chunk_size: int = 64,
     tau: float = 0.07,
     enabled_methods: Sequence[str] | None = None,
@@ -4257,6 +4481,7 @@ def build_compact_four_gate_layer_capture(
     compact ``[T,P]`` columns survive this function.
     """
     from models.dgst_capture import (
+        attention_row_from_capture,
         target_logits_and_probabilities_multi,
         target_logits_multi,
     )
@@ -4266,7 +4491,6 @@ def build_compact_four_gate_layer_capture(
     h_prev = capture["h_prev"][0]
     h_mid = capture["h_mid"][0]
     o_ffn = capture["o_ffn"][0]
-    attention_weights = capture["attn_weights"]
     sequence_length = int(h_prev.shape[0])
     if int(visual_start) < 0 or int(visual_end) > sequence_length:
         raise ValueError(
@@ -4276,8 +4500,20 @@ def build_compact_four_gate_layer_capture(
     positions = [int(value) for value in prediction_positions]
     if any(value < 0 or value >= sequence_length for value in positions):
         raise ValueError("A prediction position is outside the captured sequence.")
-    visual_index = torch.arange(
-        int(visual_start), int(visual_end), dtype=torch.long, device=h_prev.device
+    selected_support_positions = (
+        list(range(int(visual_start), int(visual_end)))
+        if support_positions is None
+        else [int(position) for position in support_positions]
+    )
+    if not selected_support_positions:
+        raise ValueError("Four-gate support positions must not be empty.")
+    if any(
+        position < 0 or position >= sequence_length
+        for position in selected_support_positions
+    ):
+        raise ValueError("A four-gate support position is outside the captured sequence.")
+    visual_index = torch.tensor(
+        selected_support_positions, dtype=torch.long, device=h_prev.device
     )
     position_index = torch.tensor(positions, dtype=torch.long, device=h_prev.device)
     visual_hpre = h_prev.index_select(0, visual_index).float()
@@ -4332,9 +4568,10 @@ def build_compact_four_gate_layer_capture(
     attention_support = torch.stack(
         [
             _renormalize(
-                attention_weights[
-                    0, :, position, int(visual_start) : int(visual_end)
-                ].float().mean(dim=0)
+                attention_row_from_capture(capture, position)
+                .index_select(1, visual_index)
+                .float()
+                .mean(dim=0)
             )
             for position in positions
         ],
@@ -4402,6 +4639,144 @@ def _normalize_four_gate_methods(
     if not selected:
         raise ValueError("At least one four-gate method must be enabled.")
     return selected
+
+
+def _normalize_four_gate_support_modes(
+    values: Sequence[str] | str | None,
+    *,
+    legacy_compute_dual_scope: bool = False,
+) -> tuple[str, ...]:
+    """Normalize the explicit VV/VP extraction switches.
+
+    ``compute_dual_scope`` remains a compatibility fallback for older configs;
+    an explicit ``support_modes`` value always wins.
+    """
+    if values is None:
+        return ("vv", "vp") if legacy_compute_dual_scope else ("vv",)
+    requested = [values] if isinstance(values, str) else list(values)
+    aliases = {
+        "vv": "vv",
+        "visual": "vv",
+        "vp": "vp",
+        "visual_prompt": "vp",
+        "visual+prompt": "vp",
+    }
+    normalized: list[str] = []
+    unknown: list[str] = []
+    for value in requested:
+        raw = str(value).strip().lower()
+        mode = aliases.get(raw)
+        if mode is None:
+            unknown.append(raw)
+        elif mode not in normalized:
+            normalized.append(mode)
+    if unknown:
+        raise ValueError(
+            f"Unknown four-gate support modes {unknown}; expected vv and/or vp."
+        )
+    if not normalized:
+        raise ValueError("At least one four-gate support mode must be enabled.")
+    return tuple(mode for mode in ("vv", "vp") if mode in normalized)
+
+
+def _normalize_four_gate_cost_mode(value: str) -> str:
+    mode = str(value).strip().lower().replace("-", "_")
+    if mode in {
+        "sqrt_matched_state",
+        "sqrt_cosine_matched_state",
+        "matched_state",
+        # Before this option was wired into the compact path, the enclosing
+        # API's legacy defaults were accepted but ignored.
+        "direct",
+        "decomposed",
+    }:
+        return "sqrt_cosine_matched_state"
+    if mode in {
+        "geo_stateupd_lu1",
+        "geo_state_update_lu1",
+        "geo_stateupd_lambda1",
+    }:
+        return "geo_stateupd_lu1"
+    if mode in {
+        "sqrt_stateupd_alpha05",
+        "sqrt_state_update_alpha05",
+        "sqrt_stateupd_a05",
+    }:
+        return "sqrt_stateupd_alpha05"
+    raise ValueError(
+        "four_gate cost_mode must be 'sqrt_matched_state' or "
+        "'geo_stateupd_lu1' or 'sqrt_stateupd_alpha05'."
+    )
+
+
+def _normalize_four_gate_cost_modes(
+    value: Sequence[str] | str | None,
+    *,
+    primary_cost_mode: str,
+) -> tuple[str, ...]:
+    raw_modes = [primary_cost_mode] if value is None else (
+        [value] if isinstance(value, str) else list(value)
+    )
+    modes: list[str] = [str(primary_cost_mode)]
+    for raw_mode in raw_modes:
+        normalized = _normalize_four_gate_cost_mode(raw_mode)
+        if normalized not in modes:
+            modes.append(normalized)
+    return tuple(modes)
+
+
+def _four_gate_risk_suffix(cost_mode: str, state_name: str) -> str:
+    normalized = _normalize_four_gate_cost_mode(cost_mode)
+    if normalized == "geo_stateupd_lu1":
+        return "risk_geo_stateupd_lu1"
+    if normalized == "sqrt_stateupd_alpha05":
+        return "risk_sqrt_stateupd_alpha05"
+    return f"risk_sqrt_{state_name}"
+
+
+def _prepare_four_gate_cost_problem(
+    *,
+    cost_mode: str,
+    source_dist: torch.Tensor,
+    target_dist: torch.Tensor,
+    matched_states: torch.Tensor,
+    hmid_states: torch.Tensor,
+    hout_states: torch.Tensor,
+    update_states: torch.Tensor,
+    support: torch.Tensor,
+):
+    normalized = _normalize_four_gate_cost_mode(cost_mode)
+    if normalized == "geo_stateupd_lu1":
+        return _prepare_transport_problem_for_state_cost(
+            source_dist=source_dist,
+            target_dist=target_dist,
+            states=hmid_states,
+            output_states=hout_states,
+            support=support,
+            sqrt_cosine=False,
+            cost_state_mode="state_update",
+            update_lambda=1.0,
+            keep_on_device=False,
+        )
+    if normalized == "sqrt_stateupd_alpha05":
+        return _prepare_transport_problem_for_state_cost(
+            source_dist=source_dist,
+            target_dist=target_dist,
+            states=matched_states,
+            state_update_states=update_states,
+            support=support,
+            sqrt_cosine=False,
+            state_update_mix_alpha=0.5,
+            keep_on_device=False,
+        )
+    return _prepare_transport_problem_for_state_cost(
+        source_dist=source_dist,
+        target_dist=target_dist,
+        states=matched_states,
+        support=support,
+        sqrt_cosine=True,
+        keep_on_device=False,
+    )
 
 
 def _target_comparison_state(method: str) -> str:
@@ -4955,8 +5330,13 @@ def _prepare_transport_problem_for_state_cost(
     source_dist: torch.Tensor,
     target_dist: torch.Tensor,
     states: torch.Tensor,
+    output_states: torch.Tensor | None = None,
+    state_update_states: torch.Tensor | None = None,
     support: torch.Tensor,
     sqrt_cosine: bool,
+    cost_state_mode: str = "mid",
+    update_lambda: float = 0.0,
+    state_update_mix_alpha: float | None = None,
     keep_on_device: bool = False,
 ):
     """Build one OT problem on the caller thread, then move it to CPU.
@@ -4970,9 +5350,32 @@ def _prepare_transport_problem_for_state_cost(
     local_source = _renormalize(source_dist.index_select(0, support))
     local_target = _renormalize(target_dist.index_select(0, support))
     local_states = states.index_select(0, support)
-    distance = _cosine_distance_matrix(local_states)
-    if sqrt_cosine:
-        distance = torch.sqrt((distance / 2.0).clamp_min(0.0))
+    local_output_states = (
+        local_states
+        if output_states is None
+        else output_states.index_select(0, support)
+    )
+    local_update_states = (
+        None
+        if state_update_states is None
+        else state_update_states.index_select(0, support)
+    )
+    if state_update_mix_alpha is not None:
+        distance = _sqrt_state_update_mixture_distance_matrix(
+            local_states,
+            local_output_states,
+            update_states=local_update_states,
+            alpha=float(state_update_mix_alpha),
+        )
+    else:
+        distance = _cost_state_distance_matrix(
+            local_states,
+            local_output_states,
+            mode=cost_state_mode,
+            update_lambda=update_lambda,
+        )
+        if sqrt_cosine:
+            distance = torch.sqrt((distance / 2.0).clamp_min(0.0))
     if keep_on_device:
         return (
             local_source.detach(),
@@ -5431,6 +5834,30 @@ def _cost_state_distance_matrix(
         return 0.5 * (mid_distance + out_distance)
     update_distance = _cosine_distance_matrix(output_states.float() - mid_states.float())
     return mid_distance + float(update_lambda) * update_distance
+
+
+def _sqrt_state_update_mixture_distance_matrix(
+    mid_states: torch.Tensor,
+    output_states: torch.Tensor,
+    *,
+    update_states: torch.Tensor | None = None,
+    alpha: float,
+) -> torch.Tensor:
+    mix = float(alpha)
+    if not 0.0 <= mix <= 1.0:
+        raise ValueError("state/update mixture alpha must be in [0, 1].")
+    state_distance = torch.sqrt(
+        (_cosine_distance_matrix(mid_states) / 2.0).clamp_min(0.0)
+    )
+    updates = (
+        output_states.float() - mid_states.float()
+        if update_states is None
+        else update_states.float()
+    )
+    update_distance = torch.sqrt(
+        (_cosine_distance_matrix(updates) / 2.0).clamp_min(0.0)
+    )
+    return (1.0 - mix) * state_distance + mix * update_distance
 
 
 def _build_cost_matrix(

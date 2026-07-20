@@ -200,7 +200,7 @@ def main() -> None:
         print(
             "[Pipeline] Strict image split (no validation): "
             f"train={len(splits['train'])}, test={len(splits['test'])}; "
-            "fixed epochs, last checkpoint, train-F1 threshold"
+            "minimum-train-loss checkpoint, fixed-0.5 + train-F1 thresholds"
         )
 
     flags = _effective_feature_flags(config)
@@ -507,14 +507,48 @@ def _enabled_method_feature_sets(
             method for method in active if bool(branches.get(method, True))
         }
     disabled = known - active
+    configured_support_modes = dgst.get("support_modes")
+    if isinstance(configured_support_modes, str):
+        support_modes = {configured_support_modes.strip().lower()}
+    elif isinstance(configured_support_modes, Sequence):
+        support_modes = {
+            str(mode).strip().lower() for mode in configured_support_modes
+        }
+    else:
+        support_modes = {
+            "vv",
+            *(
+                ["vp"]
+                if bool(
+                    dgst.get(
+                        "dgst_t_dual_scope",
+                        dgst.get("compute_dual_scope", False),
+                    )
+                )
+                else []
+            ),
+        }
+
+    def block_is_enabled(value: object) -> bool:
+        for component in str(value).split("+"):
+            for factor in component.split("*"):
+                name = factor.strip()
+                is_vp = name.startswith("vp_")
+                base_name = name.removeprefix("vp_")
+                if is_vp and "vp" not in support_modes:
+                    return False
+                if not is_vp and any(
+                    base_name.startswith(f"{method}_") for method in known
+                ) and "vv" not in support_modes:
+                    return False
+                if any(base_name.startswith(f"{method}_") for method in disabled):
+                    return False
+        return True
+
     return [
         str(value)
         for value in feature_sets
-        if not any(
-            component.strip().startswith(f"{method}_")
-            for component in str(value).split("+")
-            for method in disabled
-        )
+        if block_is_enabled(value)
     ]
 
 

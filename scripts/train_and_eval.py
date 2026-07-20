@@ -24,6 +24,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument(
+        "--feature-sets",
+        nargs="+",
+        default=None,
+        help="Train only these configured-compatible feature sets.",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Isolate seed outputs and the aggregate summary under this run name.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the configured training commands without running them.",
@@ -40,6 +51,8 @@ def main() -> None:
         config_path=args.config,
         output_dir=args.output_dir,
         device=args.device,
+        feature_sets_override=args.feature_sets,
+        run_name=args.run_name,
     )
     if not commands:
         raise ValueError("YAML configuration enables no trainable feature family")
@@ -57,6 +70,8 @@ def build_training_commands(
     config_path: str,
     output_dir: str,
     device: str,
+    feature_sets_override: Sequence[str] | None = None,
+    run_name: str | None = None,
 ) -> list[list[str]]:
     flags = _configured_family_flags(config)
     training = config.get("training") or {}
@@ -65,7 +80,13 @@ def build_training_commands(
 
     commands: list[list[str]] = []
     if flags["method"] or flags["ads_cgc"]:
-        feature_sets = _configured_feature_sets(config, flags)
+        feature_sets = (
+            _enabled_method_feature_sets(config, feature_sets_override)
+            if feature_sets_override is not None
+            else _configured_feature_sets(config, flags)
+        )
+        if not feature_sets:
+            raise ValueError("No feature sets remain after applying DGST branch switches")
         trainer = str(
             training.get(
                 "trainer",
@@ -105,11 +126,21 @@ def build_training_commands(
                     "--seed",
                     str(seed),
                 ]
-                if len(seeds) > 1:
+                if run_name is not None:
+                    command.extend(["--run-name", f"{run_name}_seed{seed}"])
+                elif len(seeds) > 1:
                     command.extend(["--run-name", f"seed{seed}"])
                 commands.append(command)
             if len(seeds) > 1:
                 result_root = Path(output_dir) / "results"
+                seed_run_template = (
+                    f"{run_name}_seed{{seed}}" if run_name is not None else "seed{seed}"
+                )
+                summary_stem = (
+                    f"{model}_{run_name}_{len(seeds)}seed_summary"
+                    if run_name is not None
+                    else f"{model}_selected_feature_sets_{len(seeds)}seed_summary"
+                )
                 commands.append(
                     [
                         sys.executable,
@@ -121,19 +152,21 @@ def build_training_commands(
                         "--run-template",
                         str(
                             result_root
-                            / "seed{seed}"
+                            / seed_run_template
                             / "{model}_selected_feature_sets.json"
                         ),
                         "--output-prefix",
                         str(
                             result_root
-                            / f"{model}_selected_feature_sets_{len(seeds)}seed_summary"
+                            / summary_stem
                         ),
                         "--title",
                         f"{model} method + ADS/CGC {len(seeds)}-seed Torch MLP summary",
                     ]
                 )
         elif trainer in {"sklearn", "xgb_rf"}:
+            if run_name is not None:
+                raise ValueError("--run-name currently requires the torch_mlp trainer")
             commands.append(
                 [sys.executable, "scripts/train_feature_sets.py", *common]
             )
@@ -218,17 +251,53 @@ def _torch_probe_cli_args(config: object) -> list[str]:
     scalar_options = {
         "batch_size": "--batch-size",
         "num_epochs": "--num-epochs",
+        "max_epochs": "--num-epochs",
         "learning_rate": "--learning-rate",
         "weight_decay": "--weight-decay",
         "lr_factor": "--lr-factor",
         "lr_patience": "--lr-patience",
         "early_stopping_patience": "--early-stopping-patience",
+        "fixed_threshold": "--fixed-threshold",
         "dropout": "--dropout",
     }
-    allowed = {*scalar_options, "hidden_sizes", "paper_config", "seed", "seeds"}
+    protocol_options = {
+        "structure": "Linear-BatchNorm-ReLU-Dropout",
+        "activation": "relu",
+        "batch_norm": True,
+        "initialization": "kaiming_uniform_relu",
+        "output_dim": 1,
+        "optimizer": "adam",
+        "loss": "bce_with_logits",
+        "scheduler_monitor": "train_loss",
+        "early_stopping_monitor": "train_loss",
+        "checkpoint_selection": "minimum_train_loss",
+        "feature_normalization": "none",
+    }
+    allowed = {
+        *scalar_options,
+        *protocol_options,
+        "threshold_reporting",
+        "hidden_sizes",
+        "paper_config",
+        "seed",
+        "seeds",
+    }
     unknown = sorted(set(config) - allowed)
     if unknown:
         raise ValueError(f"Unknown training.torch_probe options: {unknown}")
+    mismatches = {
+        key: {"expected": expected, "found": config.get(key)}
+        for key, expected in protocol_options.items()
+        if key in config and config.get(key) != expected
+    }
+    reporting = config.get("threshold_reporting")
+    if reporting is not None and list(reporting) != ["fixed_0.5", "train_f1"]:
+        mismatches["threshold_reporting"] = {
+            "expected": ["fixed_0.5", "train_f1"],
+            "found": reporting,
+        }
+    if mismatches:
+        raise ValueError(f"Unsupported default Torch probe protocol: {mismatches}")
     result: list[str] = []
     for key, option in scalar_options.items():
         if key in config:
@@ -248,7 +317,11 @@ def _torch_probe_seeds(config: object) -> list[int]:
         raise ValueError("training.torch_probe must be a YAML mapping")
     values = config.get("seeds")
     if values is None:
-        values = [config.get("seed", 42)]
+        values = (
+            [config["seed"]]
+            if config.get("seed") is not None
+            else [43, 44, 45]
+        )
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise ValueError("training.torch_probe.seeds must be a non-empty list")
     seeds = list(dict.fromkeys(int(value) for value in values))

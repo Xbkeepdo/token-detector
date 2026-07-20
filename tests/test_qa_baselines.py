@@ -369,7 +369,7 @@ class QABaselineTests(unittest.TestCase):
             self.assertFalse(resumed.add(record))
             with path.open("rb") as handle:
                 self.assertEqual(pickle.load(handle)[0]["key"], "a")
-        self.assertEqual(DEFAULT_SEEDS, (42, 43, 44))
+        self.assertEqual(DEFAULT_SEEDS, (43, 44, 45))
 
     def test_two_label_protocols_are_explicit_and_yes_only_filters_null(self):
         all_row = {
@@ -485,13 +485,13 @@ class QABaselineTests(unittest.TestCase):
             self.assertTrue(aggregate_path.is_file())
             self.assertTrue(markdown_path.is_file())
             aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
-            self.assertEqual(aggregate["seeds"], [42, 43, 44])
+            self.assertEqual(aggregate["seeds"], [43, 44, 45])
             self.assertEqual(aggregate["headline_positive_class"], "real")
             seed_output = json.loads(
                 (
                     baseline_dir
                     / "results"
-                    / "seed42"
+                    / "seed43"
                     / f"{stem}.json"
                 ).read_text(encoding="utf-8")
             )

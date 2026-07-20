@@ -22,7 +22,11 @@ from features.baseline import (
     normalize_svar_protocols,
     prepare_official_svar_spans,
 )
-from utils.config_utils import get_dataset_cfg, get_model_cfg, load_config
+from utils.config_utils import (
+    get_dataset_cfg,
+    get_extraction_model_cfg,
+    load_config,
+)
 from utils.io_utils import append_pkl, load_json, load_pkl, save_pkl
 from scripts.extract_features import _resolve_prompt
 
@@ -53,7 +57,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
-    model_cfg = get_model_cfg(config, args.model)
+    model_cfg = get_extraction_model_cfg(config, args.model)
     if args.max_pixels is not None:
         if args.max_pixels <= 0:
             raise ValueError("--max-pixels must be a positive integer")

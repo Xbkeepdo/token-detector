@@ -263,7 +263,7 @@ class ExtractionModeTests(unittest.TestCase):
             metrics["hallucination_positive"]["auc"],
         )
 
-    def test_strict_82_torch_probe_uses_last_epoch_and_train_f1_threshold(self) -> None:
+    def test_strict_82_torch_probe_uses_min_train_loss_and_dual_thresholds(self) -> None:
         X_train = np.asarray(
             [[float(index), float(index % 3)] for index in range(16)],
             dtype=np.float32,
@@ -293,11 +293,18 @@ class ExtractionModeTests(unittest.TestCase):
                 output_dir=directory,
             )
         self.assertEqual(metrics["epochs_ran"], 2)
-        self.assertEqual(metrics["best_epoch"], 2)
+        self.assertGreaterEqual(metrics["best_epoch"], 1)
+        self.assertLessEqual(metrics["best_epoch"], 2)
         self.assertGreaterEqual(metrics["decision_threshold"], 0.0)
         self.assertLessEqual(metrics["decision_threshold"], 1.0)
-        self.assertEqual(metrics["checkpoint_selection"], "last_epoch")
+        self.assertEqual(metrics["checkpoint_selection"], "minimum_train_loss")
         self.assertEqual(metrics["threshold_selection"], "train_f1")
+        self.assertEqual(
+            metrics["threshold_reporting"], ["fixed_0.5", "train_f1"]
+        )
+        self.assertEqual(
+            metrics["threshold_reports"]["fixed_0.5"]["threshold"], 0.5
+        )
         self.assertIsNotNone(metrics["train_metrics"])
         self.assertIsNone(metrics["val_metrics"])
 

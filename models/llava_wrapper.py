@@ -20,6 +20,7 @@ from models.base_wrapper import (
     compact_response_logit_statistics,
 )
 from models.dgst_capture import (
+    attention_row_index,
     build_dgst_t_raw,
     final_normalized_hidden_slice,
     hidden_states_from_captures,
@@ -67,7 +68,33 @@ class LLaVAWrapper(BaseLVLMWrapper):
 
     @property
     def num_visual_tokens(self) -> int:
-        return NUM_VISUAL_TOKENS
+        return int(self.cfg.get("num_visual_tokens", NUM_VISUAL_TOKENS))
+
+    @property
+    def model_label(self) -> str:
+        return "LLaVA-1.5"
+
+    @property
+    def dgst_capture_device(self) -> Optional[str]:
+        value = self.cfg.get("dgst_capture_device")
+        return str(value) if value is not None else None
+
+    @property
+    def dgst_attention_query_chunk_size(self) -> Optional[int]:
+        value = self.cfg.get("dgst_attention_query_chunk_size")
+        return int(value) if value is not None else None
+
+    def _format_prompt(self, raw_prompt: str) -> str:
+        return _format_llava_prompt(raw_prompt)
+
+    def _visual_grid_for_output(
+        self,
+        inputs: dict[str, Any],
+        visual_start: int,
+        visual_end: int,
+    ) -> Optional[Tuple[int, int]]:
+        del inputs, visual_start, visual_end
+        return (24, 24)
 
 
     def generate(
@@ -75,13 +102,16 @@ class LLaVAWrapper(BaseLVLMWrapper):
         image: Image.Image,
         prompt: Optional[str] = None,
     ) -> GenerationOutput:
-        prompt = _format_llava_prompt(self.resolve_prompt(prompt))
+        prompt = self._format_prompt(self.resolve_prompt(prompt))
 
         inputs = self.processor(
             text=prompt,
             images=image,
             return_tensors="pt",
         ).to(self.device, torch.float16)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
 
         with torch.no_grad():
             output_ids = self.model.generate(
@@ -90,6 +120,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 temperature=self.cfg["temperature"],
                 top_p=self.cfg["top_p"],
                 max_new_tokens=self.generation_max_new_tokens,
+                pad_token_id=pad_token_id,
             )
 
         prompt_len = inputs["input_ids"].shape[1]
@@ -119,7 +150,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
         requirements: Optional[ExtractionRequirements] = None,
     ) -> ModelOutput:
         """Extract one prefix position while retaining only requested tensors."""
-        prompt_text = _format_llava_prompt(self.resolve_prompt(prompt))
+        prompt_text = self._format_prompt(self.resolve_prompt(prompt))
         requirements_were_explicit = requirements is not None
         requirements = self.resolve_extraction_requirements(
             requirements,
@@ -138,24 +169,30 @@ class LLaVAWrapper(BaseLVLMWrapper):
             dtype=torch.float16,
         )
         input_ids = inputs["input_ids"]
-        image_token_id = int(getattr(self.model.config, "image_token_index", IMAGE_TOKEN_INDEX))
-        img_placeholder_mask = input_ids[0] == image_token_id
-        if img_placeholder_mask.any():
-            img_placeholder_pos = img_placeholder_mask.nonzero(as_tuple=True)[0][0].item()
-            img_start = img_placeholder_pos
-            img_end = img_start + NUM_VISUAL_TOKENS
-        else:
-            img_start, img_end = self._find_img_range_from_embeds(inputs)
+        image_token_id = self._image_token_id()
+        img_start, img_end = self._find_visual_token_range(inputs, image_token_id)
 
         use_dgst = bool(requirements.dgst_capture and cfg_dgst_t is not None)
         layer_outputs = None
+        attention_query_positions = None
         if use_dgst:
             out, captures = run_forward_with_dgst_captures(
                 self.model,
                 output_hidden_states=False,
-                retain_attention_updates=not _is_four_gate_mode(cfg_dgst_t),
+                retain_attention_updates=(
+                    not _is_four_gate_mode(cfg_dgst_t)
+                    or bool(cfg_dgst_t.get("compute_ffn_injection_features", False))
+                ),
+                attention_query_positions=[-1],
+                capture_device=self.dgst_capture_device,
+                attention_query_chunk_size=self.dgst_attention_query_chunk_size,
+                # LlamaAttention always returns its native eager weights to
+                # hooks.  Disable Transformers' second, full-matrix recorder
+                # so only the requested rows remain after each native layer.
+                record_model_attentions=False,
                 **inputs,
             )
+            attention_query_positions = captures[0]["attention_query_positions"]
         elif requirements.needs_hidden_states:
             captures = None
             out, layer_outputs = run_forward_with_layer_hidden_captures(
@@ -188,9 +225,13 @@ class LLaVAWrapper(BaseLVLMWrapper):
             requirements.token_hidden_states or requirements.patch_hidden_states
         )
         if keep_attention:
-            _require_attentions(out, model_name="LLaVA-1.5")
+            _require_attentions(out, model_name=self.model_label)
             text_to_patch_attn, text_to_text_attn = self._extract_attention_features(
-                out.attentions, img_start, img_end, expanded_seq_len
+                out.attentions,
+                img_start,
+                img_end,
+                expanded_seq_len,
+                attention_query_positions=attention_query_positions,
             )
             if requirements.attention is AttentionRequirement.HEAD_MEAN:
                 text_to_patch_attn = text_to_patch_attn.mean(dim=1, keepdim=True)
@@ -209,6 +250,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
                     token_position=expanded_seq_len - 1,
                     visual_start=img_start,
                     visual_end=img_end,
+                    prompt_positions=prompt_positions_override,
                 )
             elif layer_outputs is not None:
                 token_hidden_states, patch_hidden_states = hidden_states_from_layer_outputs(
@@ -284,7 +326,22 @@ class LLaVAWrapper(BaseLVLMWrapper):
                     transport_top_k=int(cfg_dgst_t.get("transport_top_k", 64)),
                     target_region_top_k=int(cfg_dgst_t.get("atarget_visual_top_k", 32)),
                     mad_epsilon=float(cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6)),
+                    cost_mode=cfg_dgst_t.get("cost_mode", "sqrt_matched_state"),
+                    cost_modes=cfg_dgst_t.get("cost_modes"),
                     enabled_methods=cfg_dgst_t.get("four_gate_methods"),
+                    compute_dual_scope=bool(
+                        cfg_dgst_t.get(
+                            "dgst_t_dual_scope",
+                            cfg_dgst_t.get("compute_dual_scope", False),
+                        )
+                    ),
+                    support_modes=cfg_dgst_t.get("support_modes"),
+                    compute_ffn_injection_features=bool(
+                        cfg_dgst_t.get("compute_ffn_injection_features", False)
+                    ),
+                    ffn_injection_eps=float(
+                        cfg_dgst_t.get("ffn_injection_eps", 1e-12)
+                    ),
                     release_layer_captures=True,
                 )[0]
             else:
@@ -316,7 +373,11 @@ class LLaVAWrapper(BaseLVLMWrapper):
             token_logits=last_logits,
             dgst_t_raw=dgst_t_raw,
             dgst_t_result=dgst_t_result,
-            visual_grid=(24, 24) if requirements.visual_layout else None,
+            visual_grid=(
+                self._visual_grid_for_output(inputs, img_start, img_end)
+                if requirements.visual_layout
+                else None
+            ),
             response_hidden_states=response_hidden,
             baseline_capture=baseline_capture,
         )
@@ -343,7 +404,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
             requirements,
             dgst_enabled=cfg_dgst_t is not None,
         )
-        prompt_text = _format_llava_prompt(self.resolve_prompt(prompt))
+        prompt_text = self._format_prompt(self.resolve_prompt(prompt))
         prefix_inputs = self.processor(
             text=prompt_text,
             images=image,
@@ -358,24 +419,47 @@ class LLaVAWrapper(BaseLVLMWrapper):
         )
         input_ids = full_inputs["input_ids"]
 
-        image_token_id = int(getattr(self.model.config, "image_token_index", IMAGE_TOKEN_INDEX))
-        img_placeholder_mask = input_ids[0] == image_token_id
-        if img_placeholder_mask.any():
-            img_placeholder_pos = img_placeholder_mask.nonzero(as_tuple=True)[0][0].item()
-            img_start = img_placeholder_pos
-            img_end = img_start + NUM_VISUAL_TOKENS
-        else:
-            img_start, img_end = self._find_img_range_from_embeds(full_inputs)
+        image_token_id = self._image_token_id()
+        img_start, img_end = self._find_visual_token_range(
+            full_inputs,
+            image_token_id,
+        )
+
+        visual_token_count = int(img_end - img_start)
+        full_prompt_positions = resolve_prompt_positions(
+            full_input_ids=input_ids[0].tolist(),
+            prompt_tokenized_length=prompt_tokenized_length,
+            image_token_id=image_token_id,
+            visual_start=img_start,
+            visual_end=img_end,
+        )
+        prediction_positions = pre_token_prediction_positions(
+            full_input_ids=input_ids[0].tolist(),
+            prompt_tokenized_length=prompt_tokenized_length,
+            response_token_indices=requested_indices,
+            image_token_id=image_token_id,
+            visual_token_count=visual_token_count,
+            prompt_positions=full_prompt_positions,
+        )
 
         use_dgst = bool(requirements.dgst_capture and cfg_dgst_t is not None)
         layer_outputs = None
+        attention_query_positions = None
         if use_dgst:
             out, captures = run_forward_with_dgst_captures(
                 self.model,
                 output_hidden_states=False,
-                retain_attention_updates=not _is_four_gate_mode(cfg_dgst_t),
+                retain_attention_updates=(
+                    not _is_four_gate_mode(cfg_dgst_t)
+                    or bool(cfg_dgst_t.get("compute_ffn_injection_features", False))
+                ),
+                attention_query_positions=prediction_positions,
+                capture_device=self.dgst_capture_device,
+                attention_query_chunk_size=self.dgst_attention_query_chunk_size,
+                record_model_attentions=False,
                 **full_inputs,
             )
+            attention_query_positions = captures[0]["attention_query_positions"]
         elif requirements.needs_hidden_states:
             captures = None
             out, layer_outputs = run_forward_with_layer_hidden_captures(
@@ -399,22 +483,6 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 )
 
         expanded_seq_len = int(out.logits.shape[1])
-        visual_token_count = int(img_end - img_start)
-        full_prompt_positions = resolve_prompt_positions(
-            full_input_ids=input_ids[0].tolist(),
-            prompt_tokenized_length=prompt_tokenized_length,
-            image_token_id=image_token_id,
-            visual_start=img_start,
-            visual_end=img_end,
-        )
-        prediction_positions = pre_token_prediction_positions(
-            full_input_ids=input_ids[0].tolist(),
-            prompt_tokenized_length=prompt_tokenized_length,
-            response_token_indices=requested_indices,
-            image_token_id=image_token_id,
-            visual_token_count=visual_token_count,
-            prompt_positions=full_prompt_positions,
-        )
         compact_profile = _is_compact_profile(cfg_dgst_t)
         keep_attention = (
             (not compact_profile or requirements_were_explicit)
@@ -424,7 +492,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
             requirements.token_hidden_states or requirements.patch_hidden_states
         )
         if keep_attention:
-            _require_attentions(out, model_name="LLaVA-1.5")
+            _require_attentions(out, model_name=self.model_label)
         if requirements.logits:
             position_logits: list[Optional[torch.Tensor]] = [
                 out.logits[0, int(position)].float().cpu()
@@ -550,6 +618,8 @@ class LLaVAWrapper(BaseLVLMWrapper):
                     cfg_dgst_t.get("compute_dual_scope", False),
                 ),
                 four_gate_methods=cfg_dgst_t.get("four_gate_methods"),
+                four_gate_cost_modes=cfg_dgst_t.get("cost_modes"),
+                four_gate_support_modes=cfg_dgst_t.get("support_modes"),
                 release_layer_captures=(not keep_attention and not keep_hidden),
             )
 
@@ -565,6 +635,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
                     img_end,
                     expanded_seq_len,
                     int(prediction_position),
+                    attention_query_positions=attention_query_positions,
                 )
                 if requirements.attention is AttentionRequirement.HEAD_MEAN:
                     text_to_patch_attn = text_to_patch_attn.mean(dim=1, keepdim=True)
@@ -620,7 +691,11 @@ class LLaVAWrapper(BaseLVLMWrapper):
                     token_logits=logits,
                     dgst_t_raw=None,
                     dgst_t_result=dgst_results[offset] if dgst_results is not None else None,
-                    visual_grid=(24, 24) if requirements.visual_layout else None,
+                    visual_grid=(
+                        self._visual_grid_for_output(full_inputs, img_start, img_end)
+                        if requirements.visual_layout
+                        else None
+                    ),
                     response_hidden_states=shared_response_hidden,
                     baseline_capture={
                         **shared_baseline_capture,
@@ -642,7 +717,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
         cfg_dgst_t: Optional[dict[str, Any]] = None,
         requirements: Optional[ExtractionRequirements] = None,
     ) -> ModelOutput:
-        prompt_text = _format_llava_prompt(request.prompt)
+        prompt_text = self._format_prompt(request.prompt)
         prompt_inputs = self.processor(
             text=prompt_text,
             images=image,
@@ -655,15 +730,11 @@ class LLaVAWrapper(BaseLVLMWrapper):
             dtype=torch.float16,
         )
         input_ids = inputs["input_ids"][0]
-        image_token_id = int(
-            getattr(self.model.config, "image_token_index", IMAGE_TOKEN_INDEX)
+        image_token_id = self._image_token_id()
+        visual_start, visual_end = self._find_visual_token_range(
+            inputs,
+            image_token_id,
         )
-        image_positions = (input_ids == image_token_id).nonzero(as_tuple=True)[0]
-        if int(image_positions.numel()) > 0:
-            visual_start = int(image_positions[0].item())
-            visual_end = visual_start + NUM_VISUAL_TOKENS
-        else:
-            visual_start, visual_end = self._find_img_range_from_embeds(inputs)
         alignment = resolve_prompt_target_alignment(
             tokenizer=self.tokenizer,
             full_input_ids=input_ids.tolist(),
@@ -679,17 +750,65 @@ class LLaVAWrapper(BaseLVLMWrapper):
             visual_start=visual_start,
             visual_end=visual_end,
             image_token_id=image_token_id,
-            visual_grid=(24, 24),
+            visual_grid=self._visual_grid_for_output(
+                inputs,
+                visual_start,
+                visual_end,
+            ),
             cfg_dgst_t=cfg_dgst_t,
             requirements=requirements,
-            model_name="LLaVA-1.5",
+            model_name=self.model_label,
             support_scope=self.cfg.get("dgst_t_support_scope", "visual_prompt"),
         )
 
 
     def _find_img_range_from_embeds(self, inputs: dict) -> Tuple[int, int]:
         """Fallback: estimate img_start by counting non-image prompt tokens."""
-        return 4, 4 + NUM_VISUAL_TOKENS
+        del inputs
+        return 4, 4 + self.num_visual_tokens
+
+    def _image_token_id(self) -> int:
+        return int(
+            getattr(self.model.config, "image_token_index", IMAGE_TOKEN_INDEX)
+        )
+
+    def _find_visual_token_range(
+        self,
+        inputs: dict[str, Any],
+        image_token_id: int,
+    ) -> Tuple[int, int]:
+        """Locate one contiguous visual span in processor-expanded input IDs.
+
+        Recent Transformers processors expand ``<image>`` to the exact number
+        of decoder-side visual embeddings.  Older LLaVA-1.5 processors leave a
+        single placeholder which the model expands internally, so retain the
+        configured fixed-size fallback for that case.
+        """
+
+        input_ids = inputs.get("input_ids")
+        if not torch.is_tensor(input_ids) or input_ids.ndim != 2:
+            raise ValueError("LLaVA inputs require rank-2 input_ids")
+        image_positions = (input_ids[0] == int(image_token_id)).nonzero(
+            as_tuple=True
+        )[0]
+        count = int(image_positions.numel())
+        if count == 0:
+            return self._find_img_range_from_embeds(inputs)
+        start = int(image_positions[0].item())
+        if count == 1:
+            return start, start + self.num_visual_tokens
+        expected = torch.arange(
+            start,
+            start + count,
+            dtype=image_positions.dtype,
+            device=image_positions.device,
+        )
+        if not torch.equal(image_positions, expected):
+            raise ValueError(
+                "LLaVA wrapper supports one contiguous image-token span; "
+                f"found positions={image_positions.detach().cpu().tolist()[:16]}"
+            )
+        return start, start + count
 
     def _resolve_dgst_prompt_support_positions(
         self,
@@ -776,6 +895,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
         img_start: int,
         img_end: int,
         seq_len: int,
+        attention_query_positions: Optional[Sequence[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract two attention tensors from the last token across all layers:"""
         visual_set = set(range(img_start, img_end))
@@ -788,9 +908,13 @@ class LLaVAWrapper(BaseLVLMWrapper):
 
         patch_layers = []
         text_layers  = []
+        row_index = attention_row_index(
+            prediction_position=last_pos,
+            attention_query_positions=attention_query_positions,
+        )
         for layer_attn in attentions:
             text_idx_tensor = text_idx_tensor.to(layer_attn.device)
-            row = layer_attn[0, :, last_pos, :]
+            row = layer_attn[0, :, row_index, :]
             patch_layers.append(row[:, img_start:img_end])
             text_layers.append(row[:, text_idx_tensor])
 
@@ -806,6 +930,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
         img_end: int,
         seq_len: int,
         token_position: int,
+        attention_query_positions: Optional[Sequence[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract attention features for a specific prediction position."""
         visual_set = set(range(img_start, img_end))
@@ -818,8 +943,12 @@ class LLaVAWrapper(BaseLVLMWrapper):
 
         patch_layers = []
         text_layers = []
+        row_index = attention_row_index(
+            prediction_position=last_pos,
+            attention_query_positions=attention_query_positions,
+        )
         for layer_attn in attentions:
-            row = layer_attn[0, :, last_pos, :]
+            row = layer_attn[0, :, row_index, :]
             patch_layers.append(row[:, img_start:img_end])
             text_layers.append(row[:, text_idx_tensor])
 
@@ -855,9 +984,6 @@ class LLaVAWrapper(BaseLVLMWrapper):
             token_list.append(hs[0, int(token_position), :])
             patch_list.append(hs[0, img_start:img_end, :])
         return torch.stack(token_list, dim=0), torch.stack(patch_list, dim=0)
-
-
-from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
 
 
 def _to_device_dtype(inputs: dict, device: str, dtype: torch.dtype) -> dict:
@@ -938,20 +1064,3 @@ def _require_attentions(out: Any, *, model_name: str) -> None:
 
 def _normalize_prompt_text(text: str) -> str:
     return " ".join(str(text).strip().split())
-
-class LLaVANextWrapper(LLaVAWrapper):
-    """Wrapper for LLaVA-Next (1.6) — dynamic resolution variant of LLaVA."""
-
-    def _load_model(self) -> None:
-        hf_name = self.cfg["hf_name"]
-        print(f"[LLaVANextWrapper] Loading model from {hf_name} …")
-        self.processor = LlavaNextProcessor.from_pretrained(hf_name)
-        self.model = LlavaNextForConditionalGeneration.from_pretrained(
-            hf_name,
-            torch_dtype=torch.float16,
-            device_map=self.device,
-            attn_implementation="eager",
-        )
-        self.model.eval()
-        self.tokenizer = self.processor.tokenizer
-        print("[LLaVANextWrapper] Model loaded.")

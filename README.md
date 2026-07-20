@@ -79,8 +79,9 @@ therefore predicts `response_ids[i]`.
 
 The unified QA path compares the current six-branch DGST method, ADS+CGC, and
 MetaToken/SVAR-controlled/DHCP/ProjectAway/HalLoc on one shared, image-level
-8:2 split with no validation set. Training uses fixed epochs, the final
-checkpoint and a Real-F1 threshold selected on train only. COCO and QA share
+8:2 split with no validation set. Training monitors train loss, restores the
+minimum-train-loss checkpoint, and reports both a fixed 0.5 threshold and a
+Real-F1 threshold selected on train only. COCO and QA share
 `configs/model_configs_unified.yaml`;
 `configs/model_configs_server_fj01.yaml` contains the same settings with fj01
 paths. The `qa_benchmarks` section stores only QA dataset/protocol settings,

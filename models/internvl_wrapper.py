@@ -204,7 +204,10 @@ class InternVLWrapper(BaseLVLMWrapper):
             out, captures = run_forward_with_dgst_captures(
                 self.model,
                 output_hidden_states=False,
-                retain_attention_updates=not _is_four_gate_mode(cfg_dgst_t),
+                retain_attention_updates=(
+                    not _is_four_gate_mode(cfg_dgst_t)
+                    or bool(cfg_dgst_t.get("compute_ffn_injection_features", False))
+                ),
                 **forward_inputs,
             )
         elif requirements.needs_hidden_states:
@@ -260,6 +263,7 @@ class InternVLWrapper(BaseLVLMWrapper):
                     token_position=seq_len - 1,
                     visual_start=img_start,
                     visual_end=img_end,
+                    prompt_positions=prompt_positions_override,
                 )
             elif layer_outputs is not None:
                 token_hidden_states, patch_hidden_states = hidden_states_from_layer_outputs(
@@ -326,7 +330,22 @@ class InternVLWrapper(BaseLVLMWrapper):
                     transport_top_k=int(cfg_dgst_t.get("transport_top_k", 64)),
                     target_region_top_k=int(cfg_dgst_t.get("atarget_visual_top_k", 32)),
                     mad_epsilon=float(cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6)),
+                    cost_mode=cfg_dgst_t.get("cost_mode", "sqrt_matched_state"),
+                    cost_modes=cfg_dgst_t.get("cost_modes"),
                     enabled_methods=cfg_dgst_t.get("four_gate_methods"),
+                    compute_dual_scope=bool(
+                        cfg_dgst_t.get(
+                            "dgst_t_dual_scope",
+                            cfg_dgst_t.get("compute_dual_scope", False),
+                        )
+                    ),
+                    support_modes=cfg_dgst_t.get("support_modes"),
+                    compute_ffn_injection_features=bool(
+                        cfg_dgst_t.get("compute_ffn_injection_features", False)
+                    ),
+                    ffn_injection_eps=float(
+                        cfg_dgst_t.get("ffn_injection_eps", 1e-12)
+                    ),
                     release_layer_captures=True,
                 )[0]
             else:
@@ -428,7 +447,10 @@ class InternVLWrapper(BaseLVLMWrapper):
             out, captures = run_forward_with_dgst_captures(
                 self.model,
                 output_hidden_states=False,
-                retain_attention_updates=not _is_four_gate_mode(cfg_dgst_t),
+                retain_attention_updates=(
+                    not _is_four_gate_mode(cfg_dgst_t)
+                    or bool(cfg_dgst_t.get("compute_ffn_injection_features", False))
+                ),
                 **forward_inputs,
             )
         elif requirements.needs_hidden_states:
@@ -595,6 +617,8 @@ class InternVLWrapper(BaseLVLMWrapper):
                     cfg_dgst_t.get("compute_dual_scope", False),
                 ),
                 four_gate_methods=cfg_dgst_t.get("four_gate_methods"),
+                four_gate_cost_modes=cfg_dgst_t.get("cost_modes"),
+                four_gate_support_modes=cfg_dgst_t.get("support_modes"),
                 release_layer_captures=(not keep_attention and not keep_hidden),
             )
 

@@ -195,6 +195,7 @@ class Qwen3VLWrapper(BaseLVLMWrapper):
                     .strip()
                     .lower()
                     != "four_gate"
+                    or bool(cfg_dgst_t.get("compute_ffn_injection_features", False))
                 ),
                 **inputs,
             )
@@ -378,6 +379,8 @@ class Qwen3VLWrapper(BaseLVLMWrapper):
                     )
                 ),
                 four_gate_methods=cfg_dgst_t.get("four_gate_methods"),
+                four_gate_cost_modes=cfg_dgst_t.get("cost_modes"),
+                four_gate_support_modes=cfg_dgst_t.get("support_modes"),
                 release_layer_captures=True,
             )
             if len(results) != 1:

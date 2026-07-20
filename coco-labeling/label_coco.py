@@ -376,7 +376,7 @@ def _load_or_create_splits(
     print(
         "[COCO-CHAIR] Strict image split (no validation): "
         f"{len(splits['train'])} train, {len(splits['test'])} test "
-        "(fixed epochs, last checkpoint, train-F1 threshold)."
+        "(minimum-train-loss checkpoint, fixed-0.5 + train-F1 thresholds)."
     )
     return splits
 

@@ -667,6 +667,8 @@ def _qa_extraction_config_fingerprint(
     repo_root = Path(__file__).resolve().parents[1]
     wrapper_by_model = {
         "llava_1_5_7b": "models/llava_wrapper.py",
+        "llava_next_8b": "models/llava_next_wrapper.py",
+        "llava_next_llama3_8b": "models/llava_next_wrapper.py",
         "internvl_2_5_8b": "models/internvl_wrapper.py",
         "qwen2_5_vl_7b": "models/qwen_wrapper.py",
         "qwen3_vl_8b": "models/qwen3_vl_wrapper.py",

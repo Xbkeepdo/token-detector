@@ -53,10 +53,26 @@ class QAProbe(nn.Module):
         layers = []
         previous = input_dim
         for hidden in hidden_sizes:
-            layers.extend((nn.Linear(previous, hidden), nn.ReLU(), nn.Dropout(dropout)))
+            layers.extend((
+                nn.Linear(previous, hidden),
+                nn.BatchNorm1d(hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ))
             previous = hidden
         layers.append(nn.Linear(previous, 1))
         self.network = nn.Sequential(*layers)
+        self._initialize()
+
+    def _initialize(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
 
     def forward(self, inputs):
         return self.network(inputs).squeeze(-1)
@@ -394,6 +410,42 @@ def _qa_image_identity(row: Mapping[str, object]) -> str | None:
     return f"{dataset}::{source_split}::{image_text}"
 
 
+def _validate_default_probe_config(cfg: Mapping[str, object]) -> None:
+    """Reject silent drift from the configured default MLP protocol."""
+
+    expected = {
+        "structure": "Linear-BatchNorm-ReLU-Dropout",
+        "activation": "relu",
+        "batch_norm": True,
+        "initialization": "kaiming_uniform_relu",
+        "output_dim": 1,
+        "optimizer": "adam",
+        "loss": "bce_with_logits",
+        "scheduler_monitor": "train_loss",
+        "early_stopping_monitor": "train_loss",
+        "checkpoint_selection": "minimum_train_loss",
+        "feature_normalization": "none",
+    }
+    mismatches = {
+        key: {"expected": value, "found": cfg.get(key)}
+        for key, value in expected.items()
+        if key in cfg and cfg.get(key) != value
+    }
+    reporting = tuple(
+        str(value)
+        for value in cfg.get(
+            "threshold_reporting", ("fixed_0.5", "train_f1")
+        )
+    )
+    if reporting != ("fixed_0.5", "train_f1"):
+        mismatches["threshold_reporting"] = {
+            "expected": ["fixed_0.5", "train_f1"],
+            "found": list(reporting),
+        }
+    if mismatches:
+        raise ValueError(f"Unsupported default Torch probe config: {mismatches}")
+
+
 def train_one_seed(
     rows: Sequence[dict],
     feature_set: str,
@@ -421,11 +473,12 @@ def train_one_seed(
             )
 
     _seed_everything(seed)
-    mean = X_train.mean(axis=0)
-    std = X_train.std(axis=0)
-    std[std < 1e-6] = 1.0
-    X_train = (X_train - mean) / std
-    X_test = (X_test - mean) / std
+    _validate_default_probe_config(cfg)
+    # The requested default uses network-internal BatchNorm and no separate
+    # z-score preprocessing. Keep identity arrays in the checkpoint so older
+    # inference consumers that expect mean/std remain compatible.
+    mean = np.zeros(X_train.shape[1], dtype=np.float32)
+    std = np.ones(X_train.shape[1], dtype=np.float32)
 
     chosen_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = QAProbe(
@@ -433,20 +486,17 @@ def train_one_seed(
         tuple(cfg.get("hidden_sizes", [128, 64, 32])),
         float(cfg.get("dropout", 0.3)),
     ).to(chosen_device)
-    negatives = int((y_train == 0).sum())
-    positives = int((y_train == 1).sum())
-    pos_weight = torch.tensor([negatives / max(positives, 1)], dtype=torch.float32, device=chosen_device)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(
+    loss_fn = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(
         model.parameters(),
         lr=float(cfg.get("learning_rate", 1e-3)),
-        weight_decay=float(cfg.get("weight_decay", 1e-4)),
+        weight_decay=float(cfg.get("weight_decay", 1e-5)),
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=float(cfg.get("lr_factor", 0.5)),
-        patience=int(cfg.get("lr_patience", 4)),
+        patience=int(cfg.get("lr_patience", 5)),
     )
     generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(
@@ -454,38 +504,79 @@ def train_one_seed(
         batch_size=int(cfg.get("batch_size", 256)),
         shuffle=True,
         generator=generator,
+        drop_last=(len(X_train) % int(cfg.get("batch_size", 256)) == 1),
     )
     history = []
-    maximum_epochs = int(cfg.get("num_epochs", cfg.get("epochs", 100)))
+    maximum_epochs = int(
+        cfg.get("max_epochs", cfg.get("num_epochs", cfg.get("epochs", 100)))
+    )
+    early_stopping_patience = int(cfg.get("early_stopping_patience", 10))
+    best_state = None
+    best_train_loss = math.inf
+    best_epoch = 0
+    stale_epochs = 0
     for epoch in range(maximum_epochs):
         model.train()
-        train_losses = []
+        train_loss_sum = 0.0
+        train_row_count = 0
         for batch_x, batch_y in train_loader:
             batch_x, batch_y = batch_x.to(chosen_device), batch_y.to(chosen_device)
             optimizer.zero_grad(set_to_none=True)
             loss = loss_fn(model(batch_x), batch_y)
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"Non-finite train loss for {feature_set} seed={seed}"
+                )
             loss.backward()
             optimizer.step()
-            train_losses.append(float(loss.item()))
-        train_loss = float(np.mean(train_losses))
+            batch_rows = int(batch_y.shape[0])
+            train_loss_sum += float(loss.item()) * batch_rows
+            train_row_count += batch_rows
+        train_loss = train_loss_sum / max(train_row_count, 1)
+        improved = train_loss < best_train_loss
+        if improved:
+            best_train_loss = float(train_loss)
+            best_epoch = epoch + 1
+            stale_epochs = 0
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+        else:
+            stale_epochs += 1
         scheduler.step(train_loss)
         history.append({
             "epoch": epoch + 1,
             "train_loss": train_loss,
             "monitor": "train_loss",
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "is_best": bool(improved),
+            "stale_epochs": int(stale_epochs),
         })
-    best_state = {
-        key: value.detach().cpu().clone()
-        for key, value in model.state_dict().items()
-    }
-    best_epoch = maximum_epochs
+        if stale_epochs >= early_stopping_patience:
+            break
+    if best_state is None:
+        raise RuntimeError("Training did not produce a finite checkpoint")
+    model.load_state_dict(best_state)
     train_probability = _predict(model, X_train, chosen_device)
     threshold, train_f1 = choose_real_f1_threshold(
         y_train,
         train_probability,
     )
     test_probability = _predict(model, X_test, chosen_device)
+    fixed_threshold = float(cfg.get("fixed_threshold", 0.5))
+    train_metrics_by_threshold = {
+        "fixed_0.5": classification_metrics(
+            y_train, train_probability, fixed_threshold
+        ),
+        "train_f1": classification_metrics(y_train, train_probability, threshold),
+    }
+    test_metrics_by_threshold = {
+        "fixed_0.5": classification_metrics(
+            y_test, test_probability, fixed_threshold
+        ),
+        "train_f1": classification_metrics(y_test, test_probability, threshold),
+    }
 
     checkpoint_dir = Path(output_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -499,7 +590,11 @@ def train_one_seed(
         "mean": mean,
         "std": std,
         "threshold": threshold,
+        "thresholds": {"fixed_0.5": fixed_threshold, "train_f1": threshold},
         "input_dim": int(X_train.shape[1]),
+        "best_epoch": int(best_epoch),
+        "best_train_loss": float(best_train_loss),
+        "feature_normalization": "none",
     })
     result = {
         "feature_set": feature_set,
@@ -525,24 +620,40 @@ def train_one_seed(
             "test": np.bincount(y_test, minlength=2).tolist(),
         },
         "input_dim": int(X_train.shape[1]),
-        "pos_weight": float(pos_weight.item()),
+        "pos_weight": None,
         "best_val_loss": None,
         "best_epoch": best_epoch,
         "epochs_completed": len(history),
+        "best_train_loss": float(best_train_loss),
         "threshold": threshold,
+        "thresholds": {"fixed_0.5": fixed_threshold, "train_f1": threshold},
         "val_metrics": None,
         "train_threshold_f1": train_f1,
-        "train_metrics": classification_metrics(
-            y_train,
-            train_probability,
-            threshold,
-        ),
-        "test_metrics": classification_metrics(y_test, test_probability, threshold),
+        "train_metrics": train_metrics_by_threshold["train_f1"],
+        "test_metrics": test_metrics_by_threshold["train_f1"],
         "test_groups": grouped_metrics(test_rows, y_test, test_probability, threshold),
+        "threshold_reports": {
+            mode: {
+                "threshold": (
+                    fixed_threshold if mode == "fixed_0.5" else threshold
+                ),
+                "train_metrics": train_metrics_by_threshold[mode],
+                "test_metrics": test_metrics_by_threshold[mode],
+                "test_groups": grouped_metrics(
+                    test_rows,
+                    y_test,
+                    test_probability,
+                    fixed_threshold if mode == "fixed_0.5" else threshold,
+                ),
+            }
+            for mode in ("fixed_0.5", "train_f1")
+        },
         "history": history,
         "split_protocol": "strict_82_no_validation",
-        "checkpoint_selection": "last_epoch",
+        "checkpoint_selection": "minimum_train_loss",
         "threshold_selection": "train_f1",
+        "threshold_reporting": ["fixed_0.5", "train_f1"],
+        "feature_normalization": "none",
     }
     _atomic_json(checkpoint_dir / "result.json", result)
     return result
@@ -681,11 +792,43 @@ def aggregate_seed_results(results: Sequence[dict]) -> dict:
         "counts": results[0].get("counts"),
         "class_counts": results[0].get("class_counts"),
         "image_counts": results[0].get("image_counts"),
+        "threshold_reporting": results[0].get("threshold_reporting"),
     }
     for path in paths:
         values = [_nested(result["test_metrics"], path) for result in results]
         summary[path] = {"mean": float(np.mean(values)), "std": float(np.std(values, ddof=0))}
+    reporting = tuple(results[0].get("threshold_reporting") or ())
+    if reporting:
+        for result in results:
+            if tuple(result.get("threshold_reporting") or ()) != reporting:
+                raise ValueError("Cannot aggregate mixed threshold reporting modes")
+        summary["threshold_reports"] = {}
+        for mode in reporting:
+            mode_summary = {
+                "threshold": _metric_statistics([
+                    float(result["threshold_reports"][mode]["threshold"])
+                    for result in results
+                ])
+            }
+            for path in paths:
+                mode_summary[path] = _metric_statistics([
+                    _nested(
+                        result["threshold_reports"][mode]["test_metrics"],
+                        path,
+                    )
+                    for result in results
+                ])
+            summary["threshold_reports"][mode] = mode_summary
     return summary
+
+
+def _metric_statistics(values: Sequence[float]) -> dict:
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(array.mean()),
+        "std": float(array.std(ddof=0)),
+        "values": [float(value) for value in array],
+    }
 
 
 def _parse_target_feature(feature_set: str) -> tuple[str, str]:

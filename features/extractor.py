@@ -18,7 +18,11 @@ from models.base_wrapper import (
 from features.attention import compute_alpha_img_alpha_text
 from features.ads import compute_ads
 from features.cgc import compute_cgc
-from features.dgst_t import compute_dgst_t, _target_comparison_state
+from features.dgst_t import (
+    compute_dgst_t,
+    _four_gate_risk_suffix,
+    _target_comparison_state,
+)
 from utils.io_utils import append_pkl, load_json, load_pkl, save_pkl
 
 
@@ -311,6 +315,13 @@ def extract_features_for_dataset(
                     "forward for MetaToken/HalLoc alignment; per-object fallback "
                     f"is unsafe for image {image_id}."
                 ) from e
+            # An OOM traceback retains the failed forward's local capture
+            # tensors. Clear those frames before attempting the smaller
+            # per-position fallback, otherwise the retry starts with the
+            # original allocation still live.
+            traceback.clear_frames(e.__traceback__)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             model_outputs = _extract_token_features_fallback(
                 model_wrapper=model_wrapper,
                 image=image,
@@ -1080,37 +1091,95 @@ def _build_four_gate_feature_record(
         "dgst_t_cost",
         "dgst_t_ot_solver",
     )
-    required_matrices = (
-        "dgst_t_attention_support_per_layer",
-        "dgst_t_source_dist_per_layer",
-    )
     direct_softmax_method = "hpre_softmax_prob_direct"
     target_region_top_k = int(dgst_t["dgst_t_target_region_top_k"])
     topk_slug = f"topk{target_region_top_k}"
+    cost_modes = tuple(
+        dgst_t.get("dgst_t_cost_modes") or [dgst_t["dgst_t_cost"]]
+    )
+    support_scopes = tuple(
+        dgst_t.get("dgst_t_four_gate_support_scopes") or ["visual"]
+    )
+    has_vv_scope = "visual" in support_scopes
+    has_vp_scope = "visual_prompt" in support_scopes
+    required_matrices = (
+        (
+            "dgst_t_attention_support_per_layer",
+            "dgst_t_source_dist_per_layer",
+        )
+        if has_vv_scope
+        else ()
+    )
     method_keys = []
-    for method in methods:
-        state_name = _target_comparison_state(method)
-        if method == direct_softmax_method:
+    if has_vv_scope:
+        for method in methods:
+            state_name = _target_comparison_state(method)
+            if method == direct_softmax_method:
+                method_keys.extend(
+                    [
+                        "dgst_t_hpre_softmax_prob_direct_"
+                        "target_prob_matrix_per_layer",
+                        "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer",
+                    ]
+                )
+            else:
+                method_keys.append(f"dgst_t_{method}_gate_per_layer")
+            for cost_mode in cost_modes:
+                risk_suffix = _four_gate_risk_suffix(cost_mode, state_name)
+                method_keys.append(f"dgst_t_{method}_{risk_suffix}_per_layer")
             method_keys.extend(
                 [
-                    "dgst_t_hpre_softmax_prob_direct_"
-                    "target_prob_matrix_per_layer",
-                    "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer",
+                    f"dgst_t_{method}_target_cosine_"
+                    f"{topk_slug}_{state_name}_per_layer",
+                    f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
+                    f"{topk_slug}_{state_name}_per_layer",
                 ]
             )
-        else:
-            method_keys.append(f"dgst_t_{method}_gate_per_layer")
-        method_keys.extend(
-            [
-                f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer",
-                f"dgst_t_{method}_target_cosine_{topk_slug}_{state_name}_per_layer",
-                f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
-                f"{topk_slug}_{state_name}_per_layer",
-            ]
+    vp_method_keys = []
+    if has_vp_scope:
+        for method in methods:
+            state_name = _target_comparison_state(method)
+            if method == direct_softmax_method:
+                vp_method_keys.extend(
+                    [
+                        "dgst_t_vp_hpre_softmax_prob_direct_"
+                        "target_prob_matrix_per_layer",
+                        "dgst_t_vp_hpre_softmax_prob_direct_"
+                        "target_dist_per_layer",
+                    ]
+                )
+            else:
+                vp_method_keys.append(f"dgst_t_vp_{method}_gate_per_layer")
+            for cost_mode in cost_modes:
+                risk_suffix = _four_gate_risk_suffix(cost_mode, state_name)
+                vp_method_keys.append(
+                    f"dgst_t_vp_{method}_{risk_suffix}_per_layer"
+                )
+            vp_method_keys.extend(
+                [
+                    f"dgst_t_vp_{method}_target_cosine_"
+                    f"{topk_slug}_{state_name}_per_layer",
+                    f"dgst_t_vp_{method}_ev_target_dist_mass_x_cosine_"
+                    f"{topk_slug}_{state_name}_per_layer",
+                ]
+            )
+    vp_matrix_keys = (
+        (
+            "dgst_t_vp_attention_support_per_layer",
+            "dgst_t_vp_source_dist_per_layer",
         )
+        if has_vp_scope
+        else ()
+    )
     missing = [
         key
-        for key in (*required_metadata, *required_matrices, *method_keys)
+        for key in (
+            *required_metadata,
+            *required_matrices,
+            *method_keys,
+            *vp_matrix_keys,
+            *vp_method_keys,
+        )
         if key not in dgst_t
     ]
     if missing:
@@ -1135,21 +1204,27 @@ def _build_four_gate_feature_record(
         "response_token_idx": int(response_index),
         "label": int(span["label"]),
         "dgst_t_four_gate_methods": list(methods),
+        "dgst_t_four_gate_support_scopes": list(support_scopes),
     }
     for key in required_metadata:
         feat[key] = dgst_t[key]
+    feat["dgst_t_cost_modes"] = list(cost_modes)
+    if "dgst_t_cost_alpha" in dgst_t:
+        feat["dgst_t_cost_alpha"] = float(dgst_t["dgst_t_cost_alpha"])
     if has_raw_attention:
         feat["dgst_t_raw_attention_definition"] = dgst_t.get(
             "dgst_t_raw_attention_definition",
             "post_softmax_head_mean_visual_support_renormalized",
         )
-    if has_direct_softmax:
+    if has_direct_softmax and has_vv_scope:
         feat["dgst_t_hpre_softmax_prob_direct_definition"] = dgst_t.get(
             "dgst_t_hpre_softmax_prob_direct_definition",
             "visual_hpre_vocabulary_softmax_target_probability_"
             "renormalized_over_visual_tokens",
         )
     for key in required_matrices:
+        feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
+    for key in vp_matrix_keys:
         feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
     if has_direct_softmax:
         feat[
@@ -1168,18 +1243,39 @@ def _build_four_gate_feature_record(
             ],
             dtype=np.float32,
         )
-    for method in methods:
-        state_name = _target_comparison_state(method)
-        if method != direct_softmax_method:
-            gate_key = f"dgst_t_{method}_gate_per_layer"
-            feat[gate_key] = _compact_numpy(dgst_t[gate_key], dtype=np.float32)
-        for suffix in (
-            f"risk_sqrt_{state_name}_per_layer",
-            f"target_cosine_{topk_slug}_{state_name}_per_layer",
-            f"ev_target_dist_mass_x_cosine_{topk_slug}_{state_name}_per_layer",
-        ):
-            key = f"dgst_t_{method}_{suffix}"
+    if has_vv_scope:
+        for method in methods:
+            state_name = _target_comparison_state(method)
+            if method != direct_softmax_method:
+                gate_key = f"dgst_t_{method}_gate_per_layer"
+                feat[gate_key] = _compact_numpy(dgst_t[gate_key], dtype=np.float32)
+            for cost_mode in cost_modes:
+                risk_suffix = _four_gate_risk_suffix(cost_mode, state_name)
+                key = f"dgst_t_{method}_{risk_suffix}_per_layer"
+                feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
+            for suffix in (
+                f"target_cosine_{topk_slug}_{state_name}_per_layer",
+                f"ev_target_dist_mass_x_cosine_{topk_slug}_{state_name}_per_layer",
+            ):
+                key = f"dgst_t_{method}_{suffix}"
+                feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
+    if has_vp_scope:
+        for key in vp_method_keys:
             feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
+        if has_vv_scope:
+            feat["dgst_t_vv_support_size"] = int(
+                dgst_t["dgst_t_vv_support_size"]
+            )
+        feat["dgst_t_vp_support_size"] = int(dgst_t["dgst_t_vp_support_size"])
+    fad_key = "dgst_t_ffn_attn_dominance_per_layer"
+    if fad_key in dgst_t:
+        feat[fad_key] = _compact_numpy(dgst_t[fad_key], dtype=np.float32)
+        feat["dgst_t_ffn_attn_dominance_definition"] = str(
+            dgst_t.get(
+                "dgst_t_ffn_attn_dominance_definition",
+                "log((l2_norm(o_ffn)+eps)/(l2_norm(o_attn)+eps))",
+            )
+        )
     return feat
 
 

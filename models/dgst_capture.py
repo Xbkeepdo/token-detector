@@ -8,6 +8,109 @@ import torch
 import torch.nn.functional as F
 
 
+_DGST_CHUNKED_ATTENTION_NAME = "dgst_chunked_eager"
+
+
+def chunked_eager_attention_forward(
+    module: Any,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **_kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact eager-attention formula with a bounded query-row workspace.
+
+    The stock Llama eager implementation materializes ``[B,H,Q,K]`` in FP16,
+    then another full matrix in FP32 for softmax.  LLaVA-NeXT AnyRes can make
+    that transient exceed 1 GiB.  This implementation performs the same
+    matmul, mask, FP32 softmax, cast, dropout, and value matmul in query chunks,
+    then separately returns only the DGST rows requested by the caller.
+    """
+    groups = int(getattr(module, "num_key_value_groups", 1))
+    if groups > 1:
+        batch, kv_heads, key_length, head_dim = key.shape
+        key = (
+            key[:, :, None, :, :]
+            .expand(batch, kv_heads, groups, key_length, head_dim)
+            .reshape(batch, kv_heads * groups, key_length, head_dim)
+        )
+        value = (
+            value[:, :, None, :, :]
+            .expand(batch, kv_heads, groups, key_length, head_dim)
+            .reshape(batch, kv_heads * groups, key_length, head_dim)
+        )
+
+    query_length = int(query.shape[-2])
+    key_length = int(key.shape[-2])
+    chunk_size = max(
+        1,
+        int(getattr(module, "_dgst_attention_query_chunk_size", 512)),
+    )
+    requested = tuple(
+        dict.fromkeys(
+            int(value)
+            for value in getattr(module, "_dgst_attention_query_positions", (-1,))
+        )
+    )
+    positions = tuple(
+        position if position >= 0 else query_length + position
+        for position in requested
+    )
+    invalid = [
+        position
+        for position in positions
+        if position < 0 or position >= query_length
+    ]
+    if invalid:
+        raise IndexError(
+            f"Chunked attention query positions outside length {query_length}: {invalid}"
+        )
+    module._dgst_attention_absolute_positions = positions
+
+    key_transposed = key.transpose(2, 3)
+
+    def weights_for(query_slice: torch.Tensor, start: int, end: int) -> torch.Tensor:
+        weights = torch.matmul(query_slice, key_transposed) * scaling
+        if attention_mask is not None:
+            weights = weights + attention_mask[:, :, start:end, :key_length]
+        weights = F.softmax(weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        return F.dropout(weights, p=float(dropout), training=module.training)
+
+    output_chunks = []
+    for start in range(0, query_length, chunk_size):
+        end = min(query_length, start + chunk_size)
+        weights = weights_for(query[:, :, start:end, :], start, end)
+        output_chunks.append(torch.matmul(weights, value))
+        del weights
+
+    position_index = torch.tensor(
+        positions,
+        dtype=torch.long,
+        device=query.device,
+    )
+    selected_query = query.index_select(2, position_index)
+    selected_weights = torch.matmul(selected_query, key_transposed) * scaling
+    if attention_mask is not None:
+        selected_mask = attention_mask.index_select(2, position_index)
+        selected_weights = selected_weights + selected_mask[:, :, :, :key_length]
+    selected_weights = F.softmax(
+        selected_weights,
+        dim=-1,
+        dtype=torch.float32,
+    ).to(query.dtype)
+    selected_weights = F.dropout(
+        selected_weights,
+        p=float(dropout),
+        training=module.training,
+    )
+
+    attention_output = torch.cat(output_chunks, dim=2)
+    return attention_output.transpose(1, 2).contiguous(), selected_weights
+
+
 def resolve_decoder_layers(model: Any):
     """Return the LM decoder layers for LLaVA, Qwen2.5-VL, or InternVL."""
     language_model = getattr(model, "language_model", None)
@@ -123,36 +226,138 @@ def run_forward_with_dgst_captures(
     *,
     output_hidden_states: bool = True,
     retain_attention_updates: bool = True,
+    attention_query_positions: Sequence[int] | None = None,
+    capture_device: str | torch.device | None = None,
+    attention_query_chunk_size: int | None = None,
+    record_model_attentions: bool = True,
     **forward_kwargs,
 ):
-    """Run a forward pass while capturing decoder attention and FFN updates."""
+    """Run a forward pass while capturing decoder attention and FFN updates.
+
+    When ``attention_query_positions`` is supplied, decoder attention hooks
+    replace every full ``[B,H,Q,K]`` attention output with only the requested
+    query rows before the parent decoder can retain it.  DGST and the baseline
+    consumers only read those rows, so this avoids keeping one quadratic
+    attention matrix per layer for long multimodal sequences.
+
+    Negative positions follow normal Python indexing (``-1`` is the final
+    query row).  The normalized absolute positions are recorded in each
+    capture so downstream code can address rows by their original sequence
+    position without changing feature semantics.
+    """
     layers = resolve_decoder_layers(model)
+    resolved_capture_device = (
+        torch.device(capture_device) if capture_device is not None else None
+    )
+
+    def captured(value: torch.Tensor) -> torch.Tensor:
+        result = value.detach()
+        if (
+            resolved_capture_device is not None
+            and result.device != resolved_capture_device
+        ):
+            result = result.to(device=resolved_capture_device)
+        return result
+
+    requested_attention_positions = (
+        tuple(dict.fromkeys(int(value) for value in attention_query_positions))
+        if attention_query_positions is not None
+        else None
+    )
+    if requested_attention_positions is not None and not requested_attention_positions:
+        raise ValueError("attention_query_positions must not be empty when supplied.")
+    if attention_query_chunk_size is not None and attention_query_chunk_size <= 0:
+        raise ValueError("attention_query_chunk_size must be positive when supplied.")
     captures: list[dict[str, Any]] = [
-        {"h_prev": None, "o_attn": None, "attn_weights": None, "o_ffn": None}
+        {
+            "h_prev": None,
+            "o_attn": None,
+            "attn_weights": None,
+            "attention_query_positions": None,
+            "o_ffn": None,
+        }
         for _ in range(len(layers))
     ]
     handles = []
 
     def layer_pre_hook(index: int):
         def hook(_module, args):
-            captures[index]["h_prev"] = args[0].detach()
+            captures[index]["h_prev"] = captured(args[0])
 
         return hook
 
     def attention_hook(index: int):
         def hook(_module, _args, output):
             if isinstance(output, tuple):
-                captures[index]["o_attn"] = output[0].detach()
+                attention_update = captured(output[0])
+                captures[index]["o_attn"] = attention_update
+                if not retain_attention_updates:
+                    captures[index]["h_mid"] = (
+                        captures[index]["h_prev"] + attention_update
+                    )
+                    captures[index]["o_attn"] = None
                 if len(output) > 1 and output[1] is not None:
-                    captures[index]["attn_weights"] = output[1].detach()
+                    attention_weights = output[1]
+                    compact_positions = getattr(
+                        _module,
+                        "_dgst_attention_absolute_positions",
+                        None,
+                    )
+                    if compact_positions is not None:
+                        captures[index]["attention_query_positions"] = tuple(
+                            int(value) for value in compact_positions
+                        )
+                    elif requested_attention_positions is not None:
+                        query_length = int(attention_weights.shape[-2])
+                        normalized_positions = tuple(
+                            position if position >= 0 else query_length + position
+                            for position in requested_attention_positions
+                        )
+                        invalid = [
+                            position
+                            for position in normalized_positions
+                            if position < 0 or position >= query_length
+                        ]
+                        if invalid:
+                            raise IndexError(
+                                "DGST attention query position(s) outside decoder "
+                                f"length {query_length}: {invalid}"
+                            )
+                        query_index = torch.tensor(
+                            normalized_positions,
+                            dtype=torch.long,
+                            device=attention_weights.device,
+                        )
+                        attention_weights = attention_weights.index_select(
+                            -2,
+                            query_index,
+                        )
+                        captures[index]["attention_query_positions"] = (
+                            normalized_positions
+                        )
+                        # A forward hook may replace the module output.  The
+                        # attention output used by the residual path is left
+                        # untouched; only the diagnostic weights collected by
+                        # the parent decoder are reduced to the needed rows.
+                        output_values = list(output)
+                        output_values[1] = attention_weights
+                        output = tuple(output_values)
+                    captures[index]["attn_weights"] = captured(attention_weights)
             else:
-                captures[index]["o_attn"] = output.detach()
+                attention_update = captured(output)
+                captures[index]["o_attn"] = attention_update
+                if not retain_attention_updates:
+                    captures[index]["h_mid"] = (
+                        captures[index]["h_prev"] + attention_update
+                    )
+                    captures[index]["o_attn"] = None
+            return output
 
         return hook
 
     def mlp_hook(index: int):
         def hook(_module, _args, output):
-            captures[index]["o_ffn"] = output.detach()
+            captures[index]["o_ffn"] = captured(output)
 
         return hook
 
@@ -161,11 +366,49 @@ def run_forward_with_dgst_captures(
         handles.append(_layer_attention_module(layer).register_forward_hook(attention_hook(index)))
         handles.append(_layer_mlp_module(layer).register_forward_hook(mlp_hook(index)))
 
+    attention_modules = [_layer_attention_module(layer) for layer in layers]
+    original_attention_implementations: dict[int, tuple[Any, Any]] = {}
+    chunked_attention_enabled = attention_query_chunk_size is not None
+    if chunked_attention_enabled:
+        if requested_attention_positions is None:
+            raise ValueError(
+                "Chunked DGST attention requires attention_query_positions."
+            )
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        if _DGST_CHUNKED_ATTENTION_NAME not in ALL_ATTENTION_FUNCTIONS.valid_keys():
+            ALL_ATTENTION_FUNCTIONS.register(
+                _DGST_CHUNKED_ATTENTION_NAME,
+                chunked_eager_attention_forward,
+            )
+        for module in attention_modules:
+            config = getattr(module, "config", None)
+            if config is None:
+                raise TypeError(
+                    "Chunked DGST attention requires attention modules with a config."
+                )
+            config_id = id(config)
+            if config_id not in original_attention_implementations:
+                original_attention_implementations[config_id] = (
+                    config,
+                    config._attn_implementation,
+                )
+                config._attn_implementation = _DGST_CHUNKED_ATTENTION_NAME
+            module._dgst_attention_query_positions = requested_attention_positions
+            module._dgst_attention_query_chunk_size = int(attention_query_chunk_size)
+
     try:
         with torch.no_grad():
             outputs = model(
                 **forward_kwargs,
-                output_attentions=True,
+                # The chunked attention function returns the selected rows to
+                # our module hooks directly.  Asking Transformers' generic
+                # recorder to collect them as well is redundant and emits a
+                # misleading warning because the registered implementation
+                # has a custom name rather than the literal string "eager".
+                output_attentions=bool(
+                    record_model_attentions and not chunked_attention_enabled
+                ),
                 output_hidden_states=bool(output_hidden_states),
                 return_dict=True,
                 use_cache=False,
@@ -173,29 +416,91 @@ def run_forward_with_dgst_captures(
     finally:
         for handle in handles:
             handle.remove()
+        if chunked_attention_enabled:
+            for config, implementation in original_attention_implementations.values():
+                config._attn_implementation = implementation
+            for module in attention_modules:
+                for name in (
+                    "_dgst_attention_query_positions",
+                    "_dgst_attention_query_chunk_size",
+                    "_dgst_attention_absolute_positions",
+                ):
+                    if hasattr(module, name):
+                        delattr(module, name)
 
     attentions = getattr(outputs, "attentions", None)
     for index, capture in enumerate(captures):
-        if capture["h_prev"] is None or capture["o_attn"] is None or capture["o_ffn"] is None:
-            raise RuntimeError("DGST-T hooks did not capture h_prev, o_attn, and o_ffn for every layer.")
+        if (
+            capture["h_prev"] is None
+            or (capture["o_attn"] is None and capture.get("h_mid") is None)
+            or capture["o_ffn"] is None
+        ):
+            raise RuntimeError(
+                "DGST-T hooks did not capture h_prev, h_mid/o_attn, and o_ffn "
+                "for every layer."
+            )
         if capture["attn_weights"] is None and attentions is not None and index < len(attentions):
             capture["attn_weights"] = attentions[index]
         if capture["attn_weights"] is None:
             raise RuntimeError("DGST-T requires attention weights; load the model with eager attention.")
 
-        target_device = capture["o_attn"].device
+        target_state = capture.get("o_attn")
+        if target_state is None:
+            target_state = capture.get("h_mid")
+        target_device = target_state.device
         for key in ("h_prev", "o_ffn", "attn_weights"):
             if capture[key].device != target_device:
                 capture[key] = capture[key].to(target_device)
-        capture["h_mid"] = capture["h_prev"] + capture["o_attn"]
-        if not retain_attention_updates:
+        if capture.get("h_mid") is None:
+            capture["h_mid"] = capture["h_prev"] + capture["o_attn"]
+        if not retain_attention_updates and capture.get("o_attn") is not None:
             # The active four-gate profile consumes h_mid but never o_attn
             # separately. Releasing this full [B,S,D] tensor for every layer
             # before vocabulary projection provides crucial headroom on 32-GiB
             # GPUs while legacy diagnostic paths keep the old field by default.
             capture["o_attn"] = None
 
+    if getattr(outputs, "attentions", None) is None:
+        # Recent Transformers Llama decoder layers discard the diagnostic
+        # attention return even when output_attentions=True.  The hooks are
+        # authoritative and also carry the compacted rows needed by ADS/CGC.
+        outputs.attentions = tuple(capture["attn_weights"] for capture in captures)
+
     return outputs, captures
+
+
+def attention_row_from_capture(
+    capture: dict[str, Any],
+    prediction_position: int,
+) -> torch.Tensor:
+    """Return one ``[H,K]`` row from a full or query-compacted capture."""
+    weights = capture.get("attn_weights")
+    if weights is None:
+        raise RuntimeError("DGST capture has no attention weights.")
+    query_positions = capture.get("attention_query_positions")
+    row_index = attention_row_index(
+        prediction_position=int(prediction_position),
+        attention_query_positions=query_positions,
+    )
+    return weights[0, :, row_index, :]
+
+
+def attention_row_index(
+    *,
+    prediction_position: int,
+    attention_query_positions: Sequence[int] | None,
+) -> int:
+    """Map an absolute decoder position to its compact attention-row index."""
+    position = int(prediction_position)
+    if attention_query_positions is None:
+        return position
+    positions = tuple(int(value) for value in attention_query_positions)
+    try:
+        return positions.index(position)
+    except ValueError as exc:
+        raise KeyError(
+            f"Attention row {position} was not captured; available rows={positions}."
+        ) from exc
 
 
 def run_forward_with_layer_hidden_captures(
@@ -485,7 +790,10 @@ def build_dgst_t_raw_batch(
         )
 
         for target_offset, prediction_position in enumerate(pred_positions):
-            attention_row = capture["attn_weights"][0, :, int(prediction_position), :]
+            attention_row = attention_row_from_capture(
+                capture,
+                int(prediction_position),
+            )
             support_attention = attention_row.index_select(
                 1, support_index.to(attention_row.device)
             ).mean(dim=0)

@@ -316,7 +316,7 @@ def _decoder_prefix_offsets(
     result: list[Optional[tuple[int, int]]] = [None] * len(response_token_ids)
     previous_progress = 0
     pending: list[int] = []
-    special_ids = set(int(value) for value in getattr(tokenizer, "all_special_ids", []))
+    special_ids = _tokenizer_special_ids(tokenizer)
     for response_index, prefix_text in enumerate(decoded_prefixes):
         progress = _common_prefix_length(str(prefix_text), decoded)
         if progress < previous_progress:
@@ -381,7 +381,7 @@ def _find_visible_subsequence(
 
 
 def _visible_response_indices(tokenizer, response_ids: Sequence[int]) -> list[int]:
-    special_ids = set(int(value) for value in getattr(tokenizer, "all_special_ids", []))
+    special_ids = _tokenizer_special_ids(tokenizer)
     result = []
     for index, token_id in enumerate(response_ids):
         value = int(token_id)
@@ -393,6 +393,29 @@ def _visible_response_indices(tokenizer, response_ids: Sequence[int]) -> list[in
             continue
         result.append(index)
     return result
+
+
+def _tokenizer_special_ids(tokenizer) -> set[int]:
+    """Return every token the tokenizer backend marks as special.
+
+    Some Llama-3 checkpoints keep ``<|eot_id|>`` as a special AddedToken but
+    omit it from ``all_special_ids`` because it is not assigned to a named
+    tokenizer role.  The decoder still removes it for
+    ``skip_special_tokens=True``, so alignment must include both sources.
+    """
+
+    special_ids = {
+        int(value) for value in getattr(tokenizer, "all_special_ids", [])
+    }
+    added_tokens = getattr(tokenizer, "added_tokens_decoder", {})
+    try:
+        items = added_tokens.items()
+    except AttributeError:
+        return special_ids
+    for token_id, token in items:
+        if bool(getattr(token, "special", False)):
+            special_ids.add(int(token_id))
+    return special_ids
 
 
 def _map_decoded_interval_to_caption(

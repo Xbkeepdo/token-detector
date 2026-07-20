@@ -47,12 +47,12 @@ from utils.config_utils import (  # noqa: E402
 )
 
 
-DEFAULT_SEEDS = (42, 43, 44)
+DEFAULT_SEEDS = (43, 44, 45)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train QA-adapted paper baselines for seeds 42/43/44."
+        description="Train QA-adapted baselines for seeds 43/44/45 by default."
     )
     parser.add_argument("--model", required=True)
     parser.add_argument(
@@ -358,8 +358,9 @@ def run_qa_shared_mlp_training(
                     },
                 },
                 "split_protocol": "strict_82_no_validation",
-                "checkpoint_selection": "last_epoch",
+                "checkpoint_selection": "minimum_train_loss",
                 "threshold_selection": "train_f1",
+                "threshold_reporting": ["fixed_0.5", "train_f1"],
                 "training_input_fingerprint": fingerprint,
                 "training_provenance": provenance,
             }
@@ -404,7 +405,7 @@ def _qa_result_as_baseline_result(
     checkpoint: Path,
     probe_cfg: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return {
+    converted = {
         "paper_config": None,
         "adaptation": "shared_torch_mlp_for_controlled_trainer_comparison",
         "trainer_config": dict(probe_cfg),
@@ -419,8 +420,27 @@ def _qa_result_as_baseline_result(
         ),
         "checkpoint": str(checkpoint),
         "epochs_completed": int(result["epochs_completed"]),
-        "selection_protocol": "fixed_last_epoch_train_real_f1_threshold",
+        "best_epoch": int(result["best_epoch"]),
+        "best_train_loss": float(result["best_train_loss"]),
+        "selection_protocol": (
+            "minimum_train_loss_dual_fixed_0.5_and_train_real_f1_threshold"
+        ),
     }
+    reports = result.get("threshold_reports") or {}
+    if reports:
+        converted["threshold_reports"] = {
+            str(mode): {
+                "threshold": float(report["threshold"]),
+                "train_metrics": _qa_metrics_as_baseline_metrics(
+                    report["train_metrics"]
+                ),
+                "test_metrics": _qa_metrics_as_baseline_metrics(
+                    report["test_metrics"]
+                ),
+            }
+            for mode, report in reports.items()
+        }
+    return converted
 
 
 def _qa_metrics_as_baseline_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:

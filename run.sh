@@ -5,16 +5,16 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-MODEL="${MODEL:-qwen3_vl_8b}"
-OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-ACEV-TOP16}"
-CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"
+MODEL="${MODEL:-qwen2_5_vl_7b}"  # llava_1_5_7b   internvl_2_5_8b  llava_next_8b qwen2_5_vl_7b
+OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-VVandVP+FAD}"
+CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"   #model_configs_server_fj01.yaml
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 DEVICE="${DEVICE:-cuda:0}"
 GENERATION_DEVICES="${GENERATION_DEVICES:-cuda:0 cuda:1}"
 FEATURE_DEVICES="${FEATURE_DEVICES:-cuda:0 cuda:1}"
 CHAIR_CACHE="${CHAIR_CACHE:-outputs/chair_cache/coco_val2014_chair.pkl}"
-NLTK_DATA="${NLTK_DATA:-$HOME/nltk_data}"
+NLTK_DATA="${NLTK_DATA:-$HOME/userdata/nltk_data}"
 REUSE_GENERATIONS_FROM="${REUSE_GENERATIONS_FROM:-}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -24,6 +24,8 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     exit 2
 fi
 export CUDA_VISIBLE_DEVICES NLTK_DATA
+# Required by deterministic CUDA matrix multiplication for reproducible seeds.
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 
 LABEL_ARGS=()
 [[ -n "$REUSE_GENERATIONS_FROM" ]] && \

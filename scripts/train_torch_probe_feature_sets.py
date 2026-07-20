@@ -61,10 +61,13 @@ class TorchProbeConfig:
     lr_factor: float = 0.5
     lr_patience: int = 5
     early_stopping_patience: int = 10
-    seed: int = 42
+    seed: int = 43
     positive_class: str = "real"
     split_protocol: str = "strict_82_no_validation"
     threshold_selection: str = "train_f1"
+    fixed_threshold: float = 0.5
+    threshold_reporting: tuple[str, ...] = ("fixed_0.5", "train_f1")
+    checkpoint_selection: str = "minimum_train_loss"
 
 
 class MatrixDataset(Dataset):
@@ -89,7 +92,7 @@ class DGSTStyleProbe(nn.Module):
         for hidden_dim in hidden_sizes:
             layers.append(nn.Linear(prev_dim, int(hidden_dim)))
             layers.append(nn.BatchNorm1d(int(hidden_dim)))
-            layers.append(nn.LeakyReLU(negative_slope=0.01))
+            layers.append(nn.ReLU())
             layers.append(nn.Dropout(float(dropout)))
             prev_dim = int(hidden_dim)
         layers.append(nn.Linear(prev_dim, 1))
@@ -99,7 +102,7 @@ class DGSTStyleProbe(nn.Module):
     def _init_weights(self) -> None:
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.kaiming_uniform_(module.weight, a=0.01, nonlinearity="leaky_relu")
+                nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0.0)
             elif isinstance(module, nn.BatchNorm1d):
@@ -125,9 +128,10 @@ def parse_args():
     parser.add_argument("--lr-factor", type=float, default=0.5)
     parser.add_argument("--lr-patience", type=int, default=5)
     parser.add_argument("--early-stopping-patience", type=int, default=10)
+    parser.add_argument("--fixed-threshold", type=float, default=0.5)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--hidden-sizes", nargs="+", type=int, default=[128, 64, 32])
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--run-name",
@@ -171,6 +175,7 @@ def main() -> None:
         lr_factor=float(args.lr_factor),
         lr_patience=int(args.lr_patience),
         early_stopping_patience=int(args.early_stopping_patience),
+        fixed_threshold=float(args.fixed_threshold),
         seed=int(args.seed),
         positive_class=str(args.positive_class),
         split_protocol=str(
@@ -218,6 +223,19 @@ def main() -> None:
             "Strict split size differs from dataset.num_images: "
             f"{sum(split_counts.values())} != {configured_count}"
         )
+    dataset_cfg = yaml_config.get("dataset") or {}
+    expected_split_counts = {
+        "train": int(dataset_cfg.get("train_images", split_counts["train"])),
+        "test": int(dataset_cfg.get("test_images", split_counts["test"])),
+    }
+    for split, expected_count in expected_split_counts.items():
+        if int(split_counts[split]) != expected_count:
+            raise ValueError(
+                f"Strict split {split} count differs from config: "
+                f"{split_counts[split]} != {expected_count}"
+            )
+    if dataset_cfg.get("validation") is not None or split_counts.get("val", 0) != 0:
+        raise ValueError("Strict split requires dataset.validation=null and val=0")
     all_features = load_validated_training_features(
         feature_path=feature_path,
         artifact_family="root",
@@ -291,6 +309,13 @@ def main() -> None:
             "positive_class": config.positive_class,
             "split_protocol": config.split_protocol,
             "threshold_selection": config.threshold_selection,
+            "threshold_reporting": list(config.threshold_reporting),
+            "fixed_threshold": config.fixed_threshold,
+            "checkpoint_selection": config.checkpoint_selection,
+            "structure": "Linear-BatchNorm-ReLU-Dropout",
+            "initialization": "kaiming_uniform_relu",
+            "optimizer": "Adam",
+            "loss": "BCEWithLogitsLoss",
         }
         metrics["artifacts"] = {
             "model": os.path.join(artifacts_dir, "model.pt"),
@@ -342,7 +367,7 @@ def train_and_evaluate_probe(
         MatrixDataset(X_train, train_targets),
         batch_size=config.batch_size,
         shuffle=True,
-        drop_last=X_train.shape[0] > config.batch_size,
+        drop_last=(X_train.shape[0] % config.batch_size == 1),
     )
     model = DGSTStyleProbe(
         input_dim=int(X_train.shape[1]),
@@ -363,11 +388,26 @@ def train_and_evaluate_probe(
     )
 
     history = []
+    best_state = None
+    best_train_loss = math.inf
+    best_epoch = 0
+    stale_epochs = 0
     model_path = os.path.join(output_dir, "model.pt")
 
     progress = tqdm(range(config.num_epochs), desc="Training torch probe", unit="epoch", leave=False)
     for epoch in progress:
         train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
+        improved = train_loss < best_train_loss
+        if improved:
+            best_train_loss = float(train_loss)
+            best_epoch = int(epoch + 1)
+            stale_epochs = 0
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+        else:
+            stale_epochs += 1
         scheduler.step(train_loss)
         history.append(
             {
@@ -375,14 +415,21 @@ def train_and_evaluate_probe(
                 "train_loss": float(train_loss),
                 "monitor": "train_loss",
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "is_best": bool(improved),
+                "stale_epochs": int(stale_epochs),
             }
         )
         progress.set_postfix(
             train_loss=f"{train_loss:.4f}",
         )
+        if stale_epochs >= config.early_stopping_patience:
+            break
 
     progress.close()
-    torch.save(model.state_dict(), model_path)
+    if best_state is None:
+        raise RuntimeError("Training did not produce a finite checkpoint")
+    model.load_state_dict(best_state)
+    torch.save(best_state, model_path)
     train_eval_loader = DataLoader(
         MatrixDataset(X_train, train_targets),
         batch_size=config.batch_size,
@@ -404,20 +451,59 @@ def train_and_evaluate_probe(
         positive_class=config.positive_class,
         threshold=decision_threshold,
     )
-    metrics["best_epoch"] = int(config.num_epochs)
-    metrics["best_val_loss"] = None
-    metrics["val_score"] = None
-    metrics["val_metrics"] = None
-    metrics["train_metrics"] = _metrics_from_probs(
+    fixed_metrics = _metrics_from_probs(
+        test_targets,
+        test_probs,
+        positive_class=config.positive_class,
+        threshold=config.fixed_threshold,
+    )
+    train_searched_metrics = _metrics_from_probs(
         train_targets,
         train_probs,
         positive_class=config.positive_class,
         threshold=decision_threshold,
     )
+    train_fixed_metrics = _metrics_from_probs(
+        train_targets,
+        train_probs,
+        positive_class=config.positive_class,
+        threshold=config.fixed_threshold,
+    )
+    metrics["best_epoch"] = int(best_epoch)
+    metrics["best_train_loss"] = float(best_train_loss)
+    metrics["best_val_loss"] = None
+    metrics["val_score"] = None
+    metrics["val_metrics"] = None
+    metrics["train_metrics"] = train_searched_metrics
     metrics["decision_threshold"] = float(decision_threshold)
+    metrics["thresholds"] = {
+        "fixed_0.5": float(config.fixed_threshold),
+        "train_f1": float(decision_threshold),
+    }
+    metrics["threshold_reports"] = {
+        "fixed_0.5": {
+            "threshold": float(config.fixed_threshold),
+            "train_metrics": train_fixed_metrics,
+            "test_metrics": fixed_metrics,
+        },
+        "train_f1": {
+            "threshold": float(decision_threshold),
+            "train_metrics": train_searched_metrics,
+            "test_metrics": {
+                key: value
+                for key, value in metrics.items()
+                if key in {
+                    "precision", "recall", "f1", "accuracy", "auc", "aupr",
+                    "reported_positive_class", "real_positive",
+                    "hallucination_positive",
+                }
+            },
+        },
+    }
     metrics["epochs_ran"] = int(len(history))
-    metrics["checkpoint_selection"] = "last_epoch"
+    metrics["checkpoint_selection"] = config.checkpoint_selection
     metrics["threshold_selection"] = config.threshold_selection
+    metrics["threshold_reporting"] = list(config.threshold_reporting)
     metrics["split_protocol"] = config.split_protocol
 
     save_json(history, os.path.join(output_dir, "history.json"))
@@ -433,17 +519,22 @@ def _train_epoch(
     device: torch.device,
 ) -> float:
     model.train()
-    losses = []
+    loss_sum = 0.0
+    row_count = 0
     for features, labels in loader:
         features = features.to(device)
         labels = labels.to(device).unsqueeze(1)
         optimizer.zero_grad()
         logits = model(features)
         loss = criterion(logits, labels)
+        if not torch.isfinite(loss):
+            raise RuntimeError("Torch probe produced a non-finite train loss")
         loss.backward()
         optimizer.step()
-        losses.append(float(loss.item()))
-    return float(sum(losses) / len(losses)) if losses else 0.0
+        batch_rows = int(labels.shape[0])
+        loss_sum += float(loss.item()) * batch_rows
+        row_count += batch_rows
+    return loss_sum / max(row_count, 1)
 
 
 def _predict_loss_and_probs(
@@ -453,7 +544,8 @@ def _predict_loss_and_probs(
     device: torch.device,
 ) -> tuple[float, np.ndarray]:
     model.eval()
-    losses = []
+    loss_sum = 0.0
+    row_count = 0
     probs = []
     with torch.no_grad():
         for features, labels in loader:
@@ -461,9 +553,11 @@ def _predict_loss_and_probs(
             labels = labels.to(device).unsqueeze(1)
             logits = model(features)
             loss = criterion(logits, labels)
-            losses.append(float(loss.item()))
+            batch_rows = int(labels.shape[0])
+            loss_sum += float(loss.item()) * batch_rows
+            row_count += batch_rows
             probs.extend(torch.sigmoid(logits).squeeze(1).cpu().tolist())
-    return float(sum(losses) / len(losses)) if losses else 0.0, np.asarray(probs, dtype=np.float32)
+    return loss_sum / max(row_count, 1), np.asarray(probs, dtype=np.float32)
 
 
 def _metrics_from_probs(
@@ -557,13 +651,35 @@ def _select_f1_threshold(
     if targets.size == 0 or targets.size != scores.size:
         raise ValueError("Threshold selection requires equal non-empty arrays.")
     candidates = np.unique(np.concatenate(([0.0], scores, [1.0])))
+    order = np.argsort(scores, kind="stable")
+    sorted_scores = scores[order]
+    sorted_targets = targets[order]
+    positive_prefix = np.concatenate(
+        ([0], np.cumsum(sorted_targets, dtype=np.int64))
+    )
+    split_indices = np.searchsorted(sorted_scores, candidates, side="left")
+    total_positives = int(positive_prefix[-1])
+    true_positives = total_positives - positive_prefix[split_indices]
+    predicted_positives = targets.size - split_indices
+    false_positives = predicted_positives - true_positives
+    false_negatives = total_positives - true_positives
+    true_negatives = split_indices - positive_prefix[split_indices]
+    denominators = 2 * true_positives + false_positives + false_negatives
+    f1_values = np.divide(
+        2.0 * true_positives,
+        denominators,
+        out=np.zeros_like(candidates, dtype=np.float64),
+        where=denominators > 0,
+    )
+    accuracy_values = (true_positives + true_negatives) / float(targets.size)
     best_key = (-np.inf, -np.inf, -np.inf)
     best_threshold = 0.5
-    for threshold in candidates:
-        prediction = (scores >= threshold).astype(np.int32)
+    for threshold, f1_value, accuracy_value in zip(
+        candidates, f1_values, accuracy_values
+    ):
         key = (
-            float(f1_score(targets, prediction, zero_division=0)),
-            float(accuracy_score(targets, prediction)),
+            float(f1_value),
+            float(accuracy_value),
             -abs(float(threshold) - 0.5),
         )
         if key > best_key:
