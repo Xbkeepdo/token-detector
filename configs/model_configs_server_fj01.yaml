@@ -1,18 +1,18 @@
-# Unified COCO caption and POPE/CLEVR QA hallucination-detection settings.
+# fj01 server-path mirror of model_configs_unified.yaml.
+# Unified COCO caption and POPE/CLEVR/AMBER QA hallucination-detection settings.
 #
 # `run.sh` only selects model/output/devices and invokes the three stages.
 # Prompt, extraction families, DGST branches and training behavior live here.
-# The active DGST profile is visual-only and contains four Gaussian-MAD
-# branches plus direct probability and raw-attention controls. Historical VP/legacy/topmass/FFN/
-# Sinkhorn experiments remain in their older config files and are intentionally
-# absent from this active YAML.
+# The active compact profile keeps VV as the backward-compatible branch and
+# additionally extracts VP hpre_raw plus the layerwise FFN/MHSA dominance
+# curve. Historical legacy/topmass/Sinkhorn experiments remain in older files.
 
 run:
   prompt: "Describe this image."
   extraction_mode: "all"                   # all | method_only | ads_cgc_only | baseline_only
 
 experiment:
-  mode: "vv"                               # Fixed visual-only support for this profile.
+  mode: "vv_vp"                            # Parallel visual-only and visual+prompt support.
 
 labeling:
   schema_version: 2
@@ -22,7 +22,8 @@ labeling:
   save_svar_official_samples: true         # Also build the paper-code canonical/surface lookup samples.
   alignment_failure_policy: "error"        # error | skip; never substitute a neighbouring token.
 
-# Same QA protocols as model_configs_unified.yaml; only server paths differ.
+# QA-only dataset/protocol settings. Models, DGST, ADS/CGC, baseline heads and
+# probe hyperparameters are shared with the COCO sections below.
 qa_benchmarks:
   # QA uses the same four extraction modes as COCO. "all" shares one answer-
   # token forward across DGST, ADS+CGC and every enabled baseline.
@@ -36,18 +37,22 @@ qa_benchmarks:
   clevr_root: "/root/rivermind-data/dataset/CLEVR_v1.0"
   amber_root: "/root/rivermind-data/dataset/AMBER"
   prepared_root: "/root/rivermind-data/dataset/qa_benchmarks"
-  output_root: "/root/rivermind-data/project/token-detector/outputs/qa_benchmarks"
+  output_root: "/root/rivermind-data/accept/token-detector/outputs/qa_benchmarks"
   split: "strict_image_level_82"
   split_seed: 42
   generation:
-    max_new_tokens: 8
+    max_new_tokens: 8                     # Overrides caption generation's 512 only for QA.
     temperature: 0.1
     top_p: 0.5
-  # AMBER includes very high-resolution source images. Apply the same bounded
-  # Qwen visual grid during generation and extraction only for this dataset.
+  # AMBER contains native images up to 54 MP. Qwen-family dynamic vision must
+  # bound those images or eager attention can request over 100 GiB. This
+  # override is applied to both generation and feature extraction, and does
+  # not change COCO, POPE, or CLEVR preprocessing.
   dataset_model_overrides:
     amber_discriminative:
       max_pixels: 200704
+  # Use the prompt's final causal row (it predicts response_token_ids[0]).
+  # Add "question_object_pre_token" later for the optional object-position ablation.
   position_protocols:
     - "prompt_last_token"
   label_protocols:
@@ -153,6 +158,14 @@ models:
     prompt_template: null
 
 feature_extraction:
+  # Extraction-only model settings. Existing captions keep their original
+  # generation provenance; feature manifests record these effective values.
+  model_overrides:
+    llava_next_8b:
+      image_grid_pinpoints: [[336, 336]]
+      dgst_attention_query_chunk_size: null
+      dgst_capture_device: null
+
   # Family switches define what is available; run.extraction_mode selects the
   # active subset without adding method switches to run.sh.
   method:
@@ -162,7 +175,7 @@ feature_extraction:
   baseline:
     enabled: true
     output_subdir: "baseline"
-    methods: ["metatoken", "svar", "projectaway", "halloc"] # Optional: "dhcp"
+    methods: ["metatoken", "svar", "projectaway","dhcp"]           # Optional: "dhcp", "halloc"
     seed: 42
     metatoken:
       classifiers: ["lr", "gb"]             # LR(lbfgs), GB(100 estimators).
@@ -217,30 +230,43 @@ feature_extraction:
     # vocabulary softmax first.  Methods can also be removed from this list.
     four_gate_methods:
       - "hpre_raw_logit_gauss"
-      - "hpre_softmax_prob_gauss"
-      - "hmid_raw_logit_gauss"
-      - "hmid_softmax_prob_gauss"
+     # - "hpre_softmax_prob_gauss"
+     # - "hmid_raw_logit_gauss"
+     # - "hmid_softmax_prob_gauss"
       # Direct control: visual_hpre -> vocabulary softmax -> target-token
       # probability, normalized over visual tokens. No MAD and no attention gate.
-      - "hpre_softmax_prob_direct"
+    #  - "hpre_softmax_prob_direct"
       # Control: use post-softmax visual support-attention directly as the
       # target distribution; do not multiply it by a Gaussian gate.
-      - "raw_attention"
+     # - "raw_attention"
     # Boolean form retained for convenient one-line switches.
     branches:
       hpre_raw_logit_gauss: true
-      hpre_softmax_prob_gauss: true
-      hmid_raw_logit_gauss: true
-      hmid_softmax_prob_gauss: true
-      hpre_softmax_prob_direct: true
-      raw_attention: true
+      hpre_softmax_prob_gauss: false
+      hmid_raw_logit_gauss: false
+      hmid_softmax_prob_gauss: false
+      hpre_softmax_prob_direct: false
+      raw_attention: false
 
     # Shared transport math for all four gates and both direct controls.
     tau: 0.07
     source_distribution_mode: "softmax"
     support_scope: "visual"
+    # Explicit support-mode switch. Choose ["vv"], ["vp"], or both; when both
+    # are enabled they share one model forward and are serialized separately.
+    support_modes: ["vv", "vp"]
+    # Compact four-gate mode only restores the historical FAD curve:
+    # log((||o_ffn||_2+eps)/(||o_attn||_2+eps)).
+    compute_ffn_injection_features: true
+    ffn_injection_eps: 1.0e-12
     transport_top_k: 64
-    cost_mode: "sqrt_matched_state"          # hpre branches use hpre; hmid branches use hmid.
+    # Primary: C_ij = sqrt((1-cos(h_state_i,h_state_j))/2), where h_state is
+    # h_prev for hpre methods and h_mid for hmid methods. The alpha05 entry is
+    # extracted only as a comparison and additionally mixes 0.5*FFN distance.
+    cost_mode: "sqrt_matched_state"
+    cost_modes:
+      - "sqrt_matched_state"
+      - "sqrt_stateupd_alpha05"
     ot_solver: "emd"
     # Each branch selects its own target-dist top-K. EV = target-dist top-K
     # mass * the matched-state mean target cosine in the same region (no shift).
@@ -250,7 +276,7 @@ feature_extraction:
     matrix_dtype: "float32"                  # All saved [L,P] DGST matrices.
     curve_dtype: "float32"                   # All saved [L] DGST curves.
 
-    # Deprecated VP, legacy-probability, cost-sweep, topmass, FFN-diagnostic,
+    # Legacy-probability, barrier-cost, topmass, the other FFN diagnostics,
     # and Sinkhorn switches intentionally do not appear in the active config.
 
 dataset:
@@ -279,6 +305,7 @@ training:
   baseline:
     # Training-only selection: this does not change/re-extract baseline/features.pkl.
     # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
+    trainer: "shared_torch_mlp"             # Same 128→64→32 Torch MLP as method probes.
     methods: ["metatoken", "svar", "projectaway"]
     positive_class: "real"                  # real | hallucination; train F1 selects its threshold.
     seeds: [43, 44, 45]                     # Use [43] for a quick single-seed run.
@@ -309,42 +336,75 @@ training:
     seeds: [43, 44, 45]                     # Shared by method, ADS+CGC, and QA dense baselines.
   feature_sets:
     method:
-
+      # FAD is extracted in the shared forward. Here '*' is layerwise product;
+      # '+' concatenates feature vectors for the MLP input.
+      - "ffn_fad"
+      - "ffn_fad*hpre_raw_logit_gauss_risk_sqrt_matched_state"
+      - "ffn_fad*hpre_raw_logit_gauss_risk_sqrt_matched_state+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "ffn_fad*vp_hpre_raw_logit_gauss_risk_sqrt_matched_state"
       - "hpre_raw_logit_gauss_risk"
-      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
-      - "hpre_softmax_prob_gauss_risk"
-      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha05"
+      - "hpre_raw_logit_gauss_risk_sqrt_matched_state"
+      - "hpre_raw_logit_gauss_risk_sqrt_matched_state+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha05+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_raw_logit_gauss_risk_sqrt_matched_state"
+      - "vp_hpre_raw_logit_gauss_risk_sqrt_matched_state+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha05"
+      - "vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha05+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # Generic risk resolves to the primary sqrt_matched_state field.
+     # - "hpre_softmax_prob_gauss_risk"
+     # - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       - "hmid_raw_logit_gauss_risk"
       - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
-      - "hmid_softmax_prob_gauss_risk"
-      - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
-      - "raw_attention_risk"
-      - "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine"
+    #  - "hmid_softmax_prob_gauss_risk"
+     # - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+     # - "raw_attention_risk"
+     # - "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine"
       - "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
-      - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+     # - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       - "hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
-      - "hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
-      - "hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
-      - "raw_attention_ev_target_dist_mass_x_cosine"
+     # - "hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+     # - "hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
+      #- "raw_attention_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_source_target_js+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_source_target_js+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_raw_logit_gauss_source_target_js+hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_softmax_prob_gauss_source_target_js+hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_direct_source_target_js+hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
+      # - "raw_attention_source_target_js+raw_attention_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_one_minus_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_one_minus_target_dist_mass_x_cosine"
+      # - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_one_minus_target_dist_mass_x_cosine"
+      # - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_one_minus_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_one_minus_target_dist_mass_x_cosine"
+      # - "raw_attention_risk+raw_attention_one_minus_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_source_target_union_topk_js"
+      # - "hpre_softmax_prob_gauss_source_target_union_topk_js"
+      # - "hmid_raw_logit_gauss_source_target_union_topk_js"
+      # - "hmid_softmax_prob_gauss_source_target_union_topk_js"
+      # - "hpre_softmax_prob_direct_source_target_union_topk_js"
+      # - "raw_attention_source_target_union_topk_js"
+
       # - "hpre_raw_logit_gauss_risk"
-      # - "hpre_raw_logit_gauss_target_cosine"
+      - "hpre_raw_logit_gauss_target_cosine"
       # - "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
-      # - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_target_cosine"
+      - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_target_cosine"
       # - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       # - "hpre_softmax_prob_gauss_risk"
-      # - "hpre_softmax_prob_gauss_target_cosine"
+     # - "hpre_softmax_prob_gauss_target_cosine"
       # - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
-      # - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_target_cosine"
+    #  - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_target_cosine"
       # - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       # - "hmid_raw_logit_gauss_risk"
-      # - "hmid_raw_logit_gauss_target_cosine"
+      - "hmid_raw_logit_gauss_target_cosine"
       # - "hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
-      # - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_target_cosine"
+      - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_target_cosine"
       # - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       # - "hmid_softmax_prob_gauss_risk"
-      # - "hmid_softmax_prob_gauss_target_cosine"
+    #  - "hmid_softmax_prob_gauss_target_cosine"
       # - "hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
-      # - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_target_cosine"
+    #  - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_target_cosine"
       # - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       # - "hpre_softmax_prob_direct_risk"
       # - "hpre_softmax_prob_direct_target_cosine"
@@ -352,9 +412,9 @@ training:
       # - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_target_cosine"
       # - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
       # - "raw_attention_risk"
-      # - "raw_attention_target_cosine"
+    #  - "raw_attention_target_cosine"
       # - "raw_attention_ev_target_dist_mass_x_cosine"
-      # - "raw_attention_risk+raw_attention_target_cosine"
+     # - "raw_attention_risk+raw_attention_target_cosine"
       # - "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine"
       # - "raw_attention_risk+raw_attention_target_cosine+raw_attention_ev_target_dist_mass_x_cosine"
     ads_cgc:

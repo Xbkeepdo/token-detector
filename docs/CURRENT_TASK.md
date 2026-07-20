@@ -1,5 +1,11 @@
 # Current Task
 
+## 2026-07-21 fj01 `run.sh` 合并冲突收尾
+
+- 已读取 `run.sh` 的 base/ours/theirs 三个 stage，并保留当前工作区中已经合并好的服务器入口：默认 `qwen2_5_vl_7b`、输出 `COCO4000-512-VVVP`、服务器统一配置、可覆盖的活动环境 Python、服务器 NLTK 路径和 `CUBLAS_WORKSPACE_CONFIG`；三阶段仍严格为生成标注、特征抽取、训练评估。
+- `bash -n run.sh` 与 `git diff --cached --check -- run.sh` 通过，`run.sh` 已暂存并解除 `UU`；`git ls-files -u` 为空。`configs/model_configs_server_fj01.yaml` 当时为 `MM`，本次没有修改或覆盖其工作区内容。
+- 附加验证命令 `CUDA_VISIBLE_DEVICES= /opt/conda/envs/td/bin/python -m unittest -v tests.test_pipeline_config` 共运行 32 项，结果为 6 failures、4 errors。失败集中在 pipeline manifest 旧断言：部分用例预期抛出 resume/provenance `ValueError` 但当前实现未抛出，另有 4 项因未生成临时 `pipeline_manifest.json` 报 `FileNotFoundError`；shell 入口、Python 环境、mode/feature-set 路由等相关用例通过。该失败不影响本次 `run.sh` 的语法与冲突解除，但后续需要单独统一 manifest 实现和测试预期。
+
 ## 2026-07-20 compact four-gate 新增 VP hpre_raw 与 ffn_fad
 
 - unified 配置新增显式 `support_modes` 开关：`["vv"]` 只抽视觉支持，`["vp"]` 只抽“视觉 token ∪ prompt token”，`["vv", "vp"]` 则在同一次 decoder forward/capture 后计算两套特征。当前启用第三种；VP 独立保存为 `dgst_t_vp_*`，不会覆盖或误读 VV。

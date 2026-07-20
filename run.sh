@@ -5,9 +5,9 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-MODEL="${MODEL:-qwen2_5_vl_7b}"  # llava_1_5_7b   internvl_2_5_8b  llava_next_8b qwen2_5_vl_7b
-OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-VVandVP+FAD}"
-CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"   #model_configs_server_fj01.yaml
+MODEL="${MODEL:-qwen2_5_vl_7b}"
+OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-512-VVVP}"
+CONFIG="${CONFIG:-configs/model_configs_server_fj01.yaml}"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 DEVICE="${DEVICE:-cuda:0}"
