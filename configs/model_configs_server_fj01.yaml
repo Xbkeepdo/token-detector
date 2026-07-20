@@ -182,8 +182,9 @@ feature_extraction:
       gb_n_estimators: 100
     svar:
       protocols: ["controlled"]             # Exact response offsets; shared fair samples.
-      layer_start: 5                         # Inclusive; official LLaVA range is 5..18.
-      layer_end: 19                          # Exclusive.
+      # Extraction stores all layers; training slices absolute layers [5,19).
+      layer_start: 5                         # Training start, inclusive.
+      layer_end: 19                          # Training end, exclusive (layers 5..18).
       hidden_dim: 248
       learning_rate: 0.001
       batch_size: 32

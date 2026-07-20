@@ -41,6 +41,7 @@ from features.baseline import (
     halloc_optimizer_config,
     normalize_baseline_methods,
     normalize_svar_protocols,
+    svar_training_vector,
     validate_baseline_record,
 )
 from scripts.training_provenance import load_validated_training_features
@@ -210,6 +211,7 @@ def main() -> None:
             _run_shared_mlp_protocol(
                 **training_kwargs,
                 probe_cfg=dict(probe_cfg),
+                baseline_cfg=baseline_cfg,
             )
         else:
             _run_training_protocol(
@@ -266,6 +268,7 @@ def main() -> None:
             _run_shared_mlp_protocol(
                 **training_kwargs,
                 probe_cfg=dict(probe_cfg),
+                baseline_cfg=baseline_cfg,
             )
         else:
             _run_training_protocol(
@@ -414,6 +417,7 @@ def _run_shared_mlp_protocol(
     split_path: Path,
     result_root: Path,
     probe_cfg: Mapping[str, Any],
+    baseline_cfg: Mapping[str, Any],
     device: str,
     run_name: Optional[str],
     result_stem: str,
@@ -435,6 +439,7 @@ def _run_shared_mlp_protocol(
     checkpoint_dir = result_root / "checkpoints" / "shared_torch_mlp"
     run_outputs: list[dict[str, Any]] = []
     run_paths: list[Path] = []
+    svar_layer_start, svar_layer_end = _svar_training_layer_range(baseline_cfg)
     for seed in seeds:
         seed_name = run_name or f"seed{int(seed)}"
         seed_name = _safe_run_name(seed_name)
@@ -456,12 +461,21 @@ def _run_shared_mlp_protocol(
             "checkpoint_selection": "minimum_train_loss",
             "threshold_selection": "train_f1",
             "threshold_reporting": ["fixed_0.5", "train_f1"],
+            "svar_training_layers": {
+                "start": svar_layer_start,
+                "end_exclusive": svar_layer_end,
+            },
         }
         if sample_audit is not None:
             output["sample_audit"] = dict(sample_audit)
         for method in methods:
             matrices = {
-                split: _shared_mlp_baseline_matrix(split_records[split], method)
+                split: _shared_mlp_baseline_matrix(
+                    split_records[split],
+                    method,
+                    svar_layer_start=svar_layer_start,
+                    svar_layer_end=svar_layer_end,
+                )
                 for split in ("train", "test")
             }
             X_train, y_train = matrices["train"]
@@ -546,6 +560,9 @@ def _run_shared_mlp_protocol(
 def _shared_mlp_baseline_matrix(
     records: Sequence[Mapping[str, Any]],
     method: str,
+    *,
+    svar_layer_start: int = 5,
+    svar_layer_end: int = 19,
 ) -> tuple[np.ndarray, np.ndarray]:
     vectors: list[np.ndarray] = []
     labels: list[int] = []
@@ -555,7 +572,14 @@ def _shared_mlp_baseline_matrix(
         if label not in (0, 1):
             raise ValueError(f"Invalid shared-MLP baseline label: {label!r}")
         if normalized in {"metatoken", "svar"}:
-            vector = baseline_vector(record, normalized)
+            if normalized == "svar":
+                vector = svar_training_vector(
+                    get_baseline_payload(record, normalized),
+                    layer_start=svar_layer_start,
+                    layer_end=svar_layer_end,
+                )
+            else:
+                vector = baseline_vector(record, normalized)
         elif normalized == "projectaway":
             payload = get_baseline_payload(record, normalized)
             confidence = payload.get("internal_confidence")
@@ -1442,11 +1466,17 @@ def _train_svar(
     device,
     positive_class,
 ) -> dict[str, Any]:
+    svar_cfg = dict(cfg.get("svar") or {})
+    layer_start, layer_end = _svar_training_layer_range(cfg)
     matrices = {
-        split: build_dense_baseline_matrix(split_records[split], "svar")[:2]
+        split: build_dense_baseline_matrix(
+            split_records[split],
+            "svar",
+            svar_layer_start=layer_start,
+            svar_layer_end=layer_end,
+        )[:2]
         for split in ("train", "val", "test")
     }
-    svar_cfg = dict(cfg.get("svar") or {})
     seed = int(cfg.get("seed", 42))
     strict_82 = bool(cfg.get("_strict_82_no_validation", False))
     # Seed before module construction so the requested run seed controls both
@@ -1488,6 +1518,8 @@ def _train_svar(
             "hidden_dim": int(_setting(svar_cfg, "hidden_dim", "hidden_size", default=248)),
             "threshold": trained.threshold,
             "threshold_score_class": str(positive_class),
+            "layer_start": layer_start,
+            "layer_end_exclusive": layer_end,
         },
     )
     return {
@@ -1506,6 +1538,8 @@ def _train_svar(
                 if strict_82
                 else "validation_selected"
             ),
+            "layer_start": layer_start,
+            "layer_end_exclusive": layer_end,
         },
         "input_dim": int(matrices["train"][0].shape[1]),
         "threshold": trained.threshold,
@@ -1515,6 +1549,20 @@ def _train_svar(
         "history": trained.history,
         "checkpoint": str(path),
     }
+
+
+def _svar_training_layer_range(
+    baseline_cfg: Mapping[str, Any],
+) -> tuple[int, int]:
+    svar_cfg = dict(baseline_cfg.get("svar") or {})
+    start = int(svar_cfg.get("layer_start", 5))
+    end = int(svar_cfg.get("layer_end", 19))
+    if start < 0 or end <= start:
+        raise ValueError(
+            f"Invalid SVAR training layer range [{start},{end}); expected "
+            "0 <= layer_start < layer_end"
+        )
+    return start, end
 
 
 def _train_dhcp(

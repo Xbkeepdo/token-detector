@@ -202,6 +202,17 @@ class QABaselineTests(unittest.TestCase):
                 ),
             },
         )
+        svar_matrix = np.arange(8, dtype=np.float32).reshape(4, 2)
+        attach_baseline(
+            record,
+            "svar",
+            {
+                "vector": svar_matrix.reshape(-1),
+                "visual_attention_ratio": svar_matrix,
+                "layer_start": 0,
+                "layer_end_exclusive": 4,
+            },
+        )
         np.testing.assert_array_equal(
             baseline_probe_vector(record, "metatoken"),
             np.asarray([1.0, 2.0], np.float32),
@@ -209,6 +220,15 @@ class QABaselineTests(unittest.TestCase):
         np.testing.assert_allclose(
             baseline_probe_vector(record, "projectaway"),
             np.asarray([0.4, 0.1, 0.4], np.float32),
+        )
+        np.testing.assert_array_equal(
+            baseline_probe_vector(
+                record,
+                "svar",
+                svar_layer_start=1,
+                svar_layer_end=3,
+            ),
+            svar_matrix[1:3].reshape(-1),
         )
         self.assertEqual(
             label_for_protocol(record, "object_hallucination_yes_only"),
@@ -526,7 +546,8 @@ class QABaselineTests(unittest.TestCase):
         }
         payload = qa_baseline_feature_config(config, ["svar", "halloc"])
         self.assertEqual(
-            payload["svar"], {"layer_start": 5, "protocols": ["controlled"]}
+            payload["svar"],
+            {"protocols": ["controlled"], "extraction_layers": "all"},
         )
         self.assertEqual(payload["halloc"], {"clip_model": "clip"})
 

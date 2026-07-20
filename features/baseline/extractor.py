@@ -173,13 +173,9 @@ def compute_baseline_record(
         attach_baseline(record, "metatoken", features.as_payload())
 
     if "svar" in selected:
-        svar_cfg = dict(cfg.get("svar") or {})
         features = compute_svar_features(
             model_out.text_to_patch_attn,
-            layer_start=svar_cfg.get("layer_start", 5),
-            layer_end=svar_cfg.get("layer_end", 19),
-            start_fraction=float(svar_cfg.get("start_fraction", 0.15)),
-            end_fraction=float(svar_cfg.get("end_fraction", 0.55)),
+            all_layers=True,
         )
         attach_baseline(record, "svar", features.as_payload())
 

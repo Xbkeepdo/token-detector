@@ -507,7 +507,7 @@ def qa_baseline_feature_config(
     selected = normalize_baseline_methods(methods)
     allowed = {
         "metatoken": ("length_penalty", "attention_layer"),
-        "svar": ("layer_start", "layer_end", "start_fraction", "end_fraction"),
+        "svar": (),
         "dhcp": ("target_grid", "spatial_size", "shard_size"),
         "projectaway": ("vocab_chunk_size", "row_chunk_size"),
         "halloc": ("clip_model",),
@@ -524,6 +524,7 @@ def qa_baseline_feature_config(
         }
     if "svar" in selected:
         payload["svar"]["protocols"] = ["controlled"]
+        payload["svar"]["extraction_layers"] = "all"
     return payload
 
 

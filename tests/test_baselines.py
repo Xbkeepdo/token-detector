@@ -39,6 +39,7 @@ from features.baseline import (
     make_baseline_record,
     normalize_baseline_methods,
     resize_attention_preserve_mass,
+    svar_training_vector,
     validate_baseline_record,
 )
 from models.base_wrapper import ModelOutput
@@ -141,6 +142,10 @@ class BaselineFeatureTests(unittest.TestCase):
                 self.assertEqual(
                     float(record["baselines"]["metatoken"]["vector"][1]), 2.0
                 )
+                svar = record["baselines"]["svar"]
+                self.assertEqual(svar["visual_attention_ratio"].shape, (2, 2))
+                self.assertEqual(svar["layer_start"], 0)
+                self.assertEqual(svar["layer_end_exclusive"], 2)
                 self.assertTrue(
                     os.path.exists(
                         os.path.join(
@@ -230,6 +235,31 @@ class BaselineFeatureTests(unittest.TestCase):
         np.testing.assert_allclose(result.visual_attention_ratio, expected.numpy())
         np.testing.assert_allclose(result.vector, expected.reshape(-1).numpy())
         self.assertAlmostEqual(result.score, float(expected.mean(-1).sum()))
+
+        full = compute_svar_features(attention, all_layers=True)
+        np.testing.assert_allclose(
+            full.visual_attention_ratio, attention.sum(-1).numpy()
+        )
+        self.assertEqual(full.layer_start, 0)
+        self.assertEqual(full.layer_end, 4)
+        np.testing.assert_allclose(
+            svar_training_vector(
+                full.as_payload(), layer_start=1, layer_end=3
+            ),
+            expected.reshape(-1).numpy(),
+        )
+        # Existing middle-layer artifacts retain absolute layer metadata and
+        # remain directly trainable without re-extraction.
+        np.testing.assert_allclose(
+            svar_training_vector(
+                result.as_payload(), layer_start=1, layer_end=3
+            ),
+            expected.reshape(-1).numpy(),
+        )
+        with self.assertRaisesRegex(ValueError, "outside saved layers"):
+            svar_training_vector(
+                result.as_payload(), layer_start=0, layer_end=3
+            )
 
     def test_dhcp_resize_preserves_each_head_mass(self):
         attention = torch.rand(3, 2, 6)

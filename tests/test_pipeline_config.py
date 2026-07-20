@@ -878,13 +878,13 @@ class PipelineConfigTests(unittest.TestCase):
             _baseline_features_config_sha256(training_change, run),
         )
 
-        extraction_change = json.loads(json.dumps(config))
-        extraction_change["feature_extraction"]["baseline"]["svar"][
+        training_layer_change = json.loads(json.dumps(config))
+        training_layer_change["feature_extraction"]["baseline"]["svar"][
             "layer_start"
         ] = 6
-        self.assertNotEqual(
+        self.assertEqual(
             original,
-            _baseline_features_config_sha256(extraction_change, run),
+            _baseline_features_config_sha256(training_layer_change, run),
         )
 
     def test_manifest_keeps_root_and_baseline_provenance_independent(self) -> None:

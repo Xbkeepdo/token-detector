@@ -26,7 +26,8 @@ from sklearn.preprocessing import StandardScaler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from features.baseline.schema import baseline_vector
+from features.baseline.schema import baseline_vector, get_baseline_payload
+from features.baseline.svar import svar_training_vector
 
 
 LABEL_HALLUCINATION = 0
@@ -47,15 +48,26 @@ def raw_labels_to_hallucination_targets(labels: Sequence[int]) -> np.ndarray:
 def build_dense_baseline_matrix(
     records: Sequence[Mapping[str, Any]],
     method: str,
+    *,
+    svar_layer_start: int = 5,
+    svar_layer_end: int = 19,
 ) -> tuple[np.ndarray, np.ndarray, list[Mapping[str, Any]]]:
     vectors: list[np.ndarray] = []
     labels: list[int] = []
     kept: list[Mapping[str, Any]] = []
+    normalized = str(method).strip().lower()
     for record in records:
         if record.get("label") not in (0, 1):
             continue
         try:
-            vector = baseline_vector(record, method)
+            if normalized == "svar":
+                vector = svar_training_vector(
+                    get_baseline_payload(record, normalized),
+                    layer_start=svar_layer_start,
+                    layer_end=svar_layer_end,
+                )
+            else:
+                vector = baseline_vector(record, normalized)
         except (KeyError, TypeError, ValueError):
             continue
         vectors.append(vector)
@@ -69,7 +81,9 @@ def build_dense_baseline_matrix(
         )
     widths = {vector.size for vector in vectors}
     if len(widths) != 1:
-        raise ValueError(f"Inconsistent {method} vector widths: {sorted(widths)}")
+        raise ValueError(
+            f"Inconsistent {normalized} vector widths: {sorted(widths)}"
+        )
     return (
         np.stack(vectors).astype(np.float32, copy=False),
         np.asarray(labels, dtype=np.int64),

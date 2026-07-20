@@ -50,6 +50,7 @@ from .svar import (
     compute_svar_features,
     normalize_svar_protocols,
     prepare_official_svar_spans,
+    svar_training_vector,
 )
 
 __all__ = [
@@ -87,5 +88,6 @@ __all__ = [
     "normalize_svar_protocols",
     "prepare_official_svar_spans",
     "resize_attention_preserve_mass",
+    "svar_training_vector",
     "validate_baseline_record",
 ]

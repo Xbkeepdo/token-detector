@@ -336,13 +336,16 @@ def compute_svar_features(
     layer_end: Optional[int] = None,
     start_fraction: float = 0.15,
     end_fraction: float = 0.55,
+    all_layers: bool = False,
 ) -> SVARFeatures:
     """Return the concatenated per-layer/per-head VAR detector input.
 
     The input is ``[L,H,P]`` and VAR is the attention mass allocated to all
-    visual tokens for every layer/head.  The selected middle-layer matrix is
-    flattened for the paper's one-hidden-layer MLP.  ``score`` is the classic
-    scalar SVAR (sum over layers after averaging heads).
+    visual tokens for every layer/head.  The selected matrix is flattened for
+    the detector MLP.  Production extraction sets ``all_layers=True`` so the
+    saved artifact remains reusable; training applies its configured layer
+    slice later.  ``score`` is the classic scalar SVAR (sum over layers after
+    averaging heads).
     """
 
     attention = torch.as_tensor(visual_attention).detach().float()
@@ -356,16 +359,19 @@ def compute_svar_features(
     if not torch.isfinite(attention).all():
         raise ValueError("visual_attention contains non-finite values")
 
-    start = (
-        int(layer_start)
-        if layer_start is not None
-        else int(math.floor(num_layers * float(start_fraction)))
-    )
-    end = (
-        int(layer_end)
-        if layer_end is not None
-        else int(math.ceil(num_layers * float(end_fraction)))
-    )
+    if all_layers:
+        start, end = 0, int(num_layers)
+    else:
+        start = (
+            int(layer_start)
+            if layer_start is not None
+            else int(math.floor(num_layers * float(start_fraction)))
+        )
+        end = (
+            int(layer_end)
+            if layer_end is not None
+            else int(math.ceil(num_layers * float(end_fraction)))
+        )
     start = max(0, min(start, num_layers - 1))
     end = max(start + 1, min(end, num_layers))
 
@@ -380,3 +386,73 @@ def compute_svar_features(
         layer_start=start,
         layer_end=end,
     )
+
+
+def svar_training_vector(
+    payload: Mapping[str, Any],
+    *,
+    layer_start: int = 5,
+    layer_end: int = 19,
+) -> np.ndarray:
+    """Slice a saved SVAR matrix by absolute layer number for training.
+
+    New artifacts contain every decoder layer.  Legacy artifacts that contain
+    only layers 5--18 remain valid because their ``layer_start`` metadata maps
+    the stored rows back to absolute model-layer indices.
+    """
+
+    start = int(layer_start)
+    end = int(layer_end)
+    if start < 0 or end <= start:
+        raise ValueError(
+            f"Invalid SVAR training layer range [{start},{end}); expected "
+            "0 <= layer_start < layer_end"
+        )
+    matrix_value = payload.get("visual_attention_ratio")
+    stored_start = int(payload.get("layer_start", 0))
+    if matrix_value is None:
+        vector_value = payload.get("vector")
+        if vector_value is None:
+            raise ValueError("SVAR payload has no training vector")
+        vector = np.asarray(vector_value, dtype=np.float32).reshape(-1)
+        if vector.size == 0 or not np.isfinite(vector).all():
+            raise ValueError("SVAR training vector is empty or non-finite")
+        if (
+            "layer_start" not in payload
+            and "layer_end_exclusive" not in payload
+        ):
+            # Very old/test payloads predate layer metadata; their vector is
+            # already the detector input and cannot be resliced further.
+            return vector
+        stored_end = int(payload.get("layer_end_exclusive", end))
+        if (start, end) != (stored_start, stored_end):
+            raise ValueError(
+                "Legacy SVAR payload has no per-layer matrix and cannot be "
+                f"resliced from [{stored_start},{stored_end}) to [{start},{end})"
+            )
+        return vector
+
+    matrix = np.asarray(matrix_value, dtype=np.float32)
+    if matrix.ndim != 2 or min(matrix.shape) <= 0:
+        raise ValueError(
+            "SVAR visual_attention_ratio must have shape [layers,heads], got "
+            f"{matrix.shape}"
+        )
+    stored_end = int(
+        payload.get("layer_end_exclusive", stored_start + matrix.shape[0])
+    )
+    if stored_end - stored_start != matrix.shape[0]:
+        raise ValueError(
+            "SVAR layer metadata does not match visual_attention_ratio rows: "
+            f"[{stored_start},{stored_end}) versus {matrix.shape[0]} rows"
+        )
+    if start < stored_start or end > stored_end:
+        raise ValueError(
+            f"Requested SVAR training layers [{start},{end}) are outside saved "
+            f"layers [{stored_start},{stored_end}); re-extract all-layer SVAR "
+            "features or use a compatible legacy range"
+        )
+    selected = matrix[start - stored_start : end - stored_start]
+    if not np.isfinite(selected).all():
+        raise ValueError("SVAR training slice contains non-finite values")
+    return selected.reshape(-1).astype(np.float32, copy=False)

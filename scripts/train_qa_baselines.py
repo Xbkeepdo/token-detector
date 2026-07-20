@@ -186,6 +186,7 @@ def main() -> None:
     trainer = _normalize_qa_baseline_trainer(
         args.trainer or qa_cfg.get("baseline_trainer", "native_paper")
     )
+    baseline_cfg = baseline_config(config)
     if trainer == "shared_torch_mlp":
         probe_cfg = training_cfg.get("torch_probe") or {}
         if not isinstance(probe_cfg, Mapping) or not probe_cfg:
@@ -205,11 +206,11 @@ def main() -> None:
             split_path=split_path,
             baseline_dir=baseline_dir,
             probe_cfg=dict(probe_cfg),
+            baseline_cfg=baseline_cfg,
             device=_resolve_device(args.device),
             force=bool(args.force),
         )
     else:
-        baseline_cfg = baseline_config(config)
         run_qa_baseline_training(
             model=args.model,
             dataset=args.dataset,
@@ -262,6 +263,7 @@ def run_qa_shared_mlp_training(
     split_path: Path,
     baseline_dir: Path,
     probe_cfg: Mapping[str, Any],
+    baseline_cfg: Mapping[str, Any],
     device: str,
     force: bool = False,
 ) -> None:
@@ -276,12 +278,22 @@ def run_qa_shared_mlp_training(
         )
     protocol = normalize_qa_label_protocol(label_protocol)
     cfg = dict(probe_cfg)
+    svar_cfg = dict(baseline_cfg.get("svar") or {})
+    svar_layer_start = int(svar_cfg.get("layer_start", 5))
+    svar_layer_end = int(svar_cfg.get("layer_end", 19))
+    if svar_layer_start < 0 or svar_layer_end <= svar_layer_start:
+        raise ValueError(
+            "Invalid SVAR training layer range "
+            f"[{svar_layer_start},{svar_layer_end})"
+        )
     fingerprint, provenance = _shared_mlp_fingerprint(
         feature_path=feature_path,
         split_path=split_path,
         probe_cfg=cfg,
         methods=methods,
         label_protocol=protocol,
+        svar_layer_start=svar_layer_start,
+        svar_layer_end=svar_layer_end,
     )
     result_root = baseline_dir / "results" / "shared_torch_mlp"
     seed_outputs: list[dict[str, Any]] = []
@@ -301,6 +313,12 @@ def run_qa_shared_mlp_training(
         else:
             method_results: dict[str, dict[str, Any]] = {}
             for method in methods:
+                method_cfg = dict(cfg)
+                if method == "svar":
+                    method_cfg.update(
+                        svar_layer_start=svar_layer_start,
+                        svar_layer_end=svar_layer_end,
+                    )
                 method_dir = (
                     result_root
                     / f"seed{int(seed)}"
@@ -315,14 +333,14 @@ def run_qa_shared_mlp_training(
                     f"baseline:{method}",
                     int(seed),
                     str(method_dir),
-                    cfg,
+                    method_cfg,
                     device,
                     label_protocol=protocol,
                 )
                 method_results[str(method)] = _qa_result_as_baseline_result(
                     qa_result,
                     checkpoint=method_dir / "checkpoint.pt",
-                    probe_cfg=cfg,
+                    probe_cfg=method_cfg,
                 )
             output = {
                 "model": model,
@@ -361,6 +379,10 @@ def run_qa_shared_mlp_training(
                 "checkpoint_selection": "minimum_train_loss",
                 "threshold_selection": "train_f1",
                 "threshold_reporting": ["fixed_0.5", "train_f1"],
+                "svar_training_layers": {
+                    "start": svar_layer_start,
+                    "end_exclusive": svar_layer_end,
+                },
                 "training_input_fingerprint": fingerprint,
                 "training_provenance": provenance,
             }
@@ -482,15 +504,21 @@ def _shared_mlp_fingerprint(
     probe_cfg: Mapping[str, Any],
     methods: Sequence[str],
     label_protocol: str,
+    svar_layer_start: int,
+    svar_layer_end: int,
 ) -> tuple[str, dict[str, Any]]:
     repo_root = Path(__file__).resolve().parents[1]
     provenance = {
-        "schema_version": "qa-baseline-shared-torch-mlp-v1",
+        "schema_version": "qa-baseline-shared-torch-mlp-v2",
         "features_sha256": sha256_file(feature_path),
         "splits_sha256": sha256_file(split_path),
         "probe_cfg": dict(probe_cfg),
         "methods": list(methods),
         "label_protocol": str(label_protocol),
+        "svar_training_layers": {
+            "start": int(svar_layer_start),
+            "end_exclusive": int(svar_layer_end),
+        },
         "code_sha256": {
             "detection/qa_probe.py": sha256_file(
                 repo_root / "detection" / "qa_probe.py"

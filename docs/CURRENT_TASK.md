@@ -1,5 +1,12 @@
 # Current Task
 
+## 2026-07-21 SVAR 改为全层抽取、训练仅使用第 5–18 层
+
+- SVAR 生产抽取不再按配置提前裁掉 decoder 层；controlled/official、COCO/QA 统一保存完整 `[layer, head]` visual-attention-ratio、全层扁平向量及绝对层范围 `[0,L)`。抽取 provenance 固定记录 `extraction_layers=all`，`layer_start/layer_end` 改为纯训练参数，修改训练层范围不会再误判为需要重抽其他 baseline。
+- 原生单层 SVAR MLP 与统一三层 Torch MLP 的 COCO/QA 路径均在组装训练矩阵时按绝对层号切片。当前两份活动 YAML 保持 `layer_start=5`、`layer_end=19`，即严格训练第 5–18 层；checkpoint、结果 JSON 与 QA 训练指纹均记录该范围。
+- 新增统一的 `svar_training_vector()`：新全层 payload 可选择任意已保存层范围；历史只保存 5–18 层但带绝对层元数据的 payload 仍可按 `[5,19)` 训练；更老的无层元数据 vector 保持原样兼容。越界范围、层元数据不一致及非有限值会明确报错。
+- 验证：相关 Python 文件 `py_compile` 通过；`tests.test_baselines + tests.test_qa_baselines` 共 22/22 通过；SVAR 全层/旧缓存/QA 切片与两项抽取指纹的定向回归 4/4 通过；`tests.test_train_baseline_reporting + tests.test_svar_protocols` 相关路径通过；`git diff --check` 通过。扩展组合 30 项中 27 项通过，另外 3 项仍是本轮开始前已存在的 generation/label manifest resume 断言不一致，与 SVAR 改动无关；本轮未启动正式模型抽取或训练。
+
 ## 2026-07-21 fj01 `run.sh` 合并冲突收尾
 
 - 已读取 `run.sh` 的 base/ours/theirs 三个 stage，并保留当前工作区中已经合并好的服务器入口：默认 `qwen2_5_vl_7b`、输出 `COCO4000-512-VVVP`、服务器统一配置、可覆盖的活动环境 Python、服务器 NLTK 路径和 `CUBLAS_WORKSPACE_CONFIG`；三阶段仍严格为生成标注、特征抽取、训练评估。

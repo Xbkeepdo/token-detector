@@ -24,6 +24,7 @@ from sklearn.metrics import (
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from features.baseline.svar import svar_training_vector
 from features.dgst_t import COST_VARIANT_RISK_KEYS
 
 
@@ -101,9 +102,20 @@ def legacy_feature_sets(dataset: str) -> list[str]:
     return names
 
 
-def feature_vector(row: dict, feature_set: str) -> np.ndarray:
+def feature_vector(
+    row: dict,
+    feature_set: str,
+    *,
+    svar_layer_start: int = 5,
+    svar_layer_end: int = 19,
+) -> np.ndarray:
     if feature_set.startswith("baseline:"):
-        return baseline_probe_vector(row, feature_set.split(":", 1)[1])
+        return baseline_probe_vector(
+            row,
+            feature_set.split(":", 1)[1],
+            svar_layer_start=svar_layer_start,
+            svar_layer_end=svar_layer_end,
+        )
     position = feature_set_position(feature_set)
     if position in QA_POSITIONS:
         block = feature_set.rsplit("@", 1)[0]
@@ -139,7 +151,13 @@ def feature_vector(row: dict, feature_set: str) -> np.ndarray:
     return _concat(target_data[block])
 
 
-def baseline_probe_vector(row: Mapping[str, object], method: str) -> np.ndarray:
+def baseline_probe_vector(
+    row: Mapping[str, object],
+    method: str,
+    *,
+    svar_layer_start: int = 5,
+    svar_layer_end: int = 19,
+) -> np.ndarray:
     """Return one baseline's dense input for the shared QA Torch MLP.
 
     MetaToken and SVAR already serialize their canonical paper feature vector.
@@ -156,7 +174,13 @@ def baseline_probe_vector(row: Mapping[str, object], method: str) -> np.ndarray:
     payload = baselines.get(normalized)
     if not isinstance(payload, Mapping):
         raise KeyError(f"Missing baseline payload {normalized!r}")
-    if normalized in {"metatoken", "svar"}:
+    if normalized == "svar":
+        return svar_training_vector(
+            payload,
+            layer_start=svar_layer_start,
+            layer_end=svar_layer_end,
+        )
+    if normalized == "metatoken":
         vector = payload.get("vector")
     elif normalized == "projectaway":
         per_layer = payload.get("per_layer_internal_confidence")
@@ -302,6 +326,9 @@ def build_matrix(
     rows: Sequence[dict],
     feature_set: str,
     label_protocol: str = "answer_correctness_all",
+    *,
+    svar_layer_start: int = 5,
+    svar_layer_end: int = 19,
 ):
     vectors, labels, kept = [], [], []
     for row in rows:
@@ -309,7 +336,12 @@ def build_matrix(
         if label is None:
             continue
         try:
-            vector = feature_vector(row, feature_set)
+            vector = feature_vector(
+                row,
+                feature_set,
+                svar_layer_start=svar_layer_start,
+                svar_layer_end=svar_layer_end,
+            )
         except (KeyError, TypeError):
             continue
         if vector.size == 0 or not np.isfinite(vector).all():
@@ -457,12 +489,22 @@ def train_one_seed(
 ) -> dict:
     image_counts = validate_image_level_splits(rows)
     split_rows = {split: [row for row in rows if row["probe_split"] == split] for split in ("train", "val", "test")}
+    svar_layer_start = int(cfg.get("svar_layer_start", 5))
+    svar_layer_end = int(cfg.get("svar_layer_end", 19))
     X_train, y_train, train_rows = build_matrix(
-        split_rows["train"], feature_set, label_protocol
+        split_rows["train"], feature_set, label_protocol,
+        svar_layer_start=svar_layer_start,
+        svar_layer_end=svar_layer_end,
     )
-    X_val, y_val, val_rows = build_matrix([], feature_set, label_protocol)
+    X_val, y_val, val_rows = build_matrix(
+        [], feature_set, label_protocol,
+        svar_layer_start=svar_layer_start,
+        svar_layer_end=svar_layer_end,
+    )
     X_test, y_test, test_rows = build_matrix(
-        split_rows["test"], feature_set, label_protocol
+        split_rows["test"], feature_set, label_protocol,
+        svar_layer_start=svar_layer_start,
+        svar_layer_end=svar_layer_end,
     )
     for split, X, y in (("train", X_train, y_train), ("test", X_test, y_test)):
         if len(X) == 0 or len(np.unique(y)) < 2:

@@ -445,15 +445,15 @@ class StageResumeTests(unittest.TestCase):
             _official_svar_feature_config(changed_training),
         )
 
-        changed_extraction = json.loads(json.dumps(baseline_cfg))
-        changed_extraction["svar"]["layer_start"] = 6
-        self.assertNotEqual(
+        changed_training_layers = json.loads(json.dumps(baseline_cfg))
+        changed_training_layers["svar"]["layer_start"] = 6
+        self.assertEqual(
             _controlled_baseline_feature_config(baseline_cfg),
-            _controlled_baseline_feature_config(changed_extraction),
+            _controlled_baseline_feature_config(changed_training_layers),
         )
-        self.assertNotEqual(
+        self.assertEqual(
             _official_svar_feature_config(baseline_cfg),
-            _official_svar_feature_config(changed_extraction),
+            _official_svar_feature_config(changed_training_layers),
         )
 
         official_only = {

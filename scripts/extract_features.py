@@ -1328,13 +1328,9 @@ def _baseline_methods_for_protocol(
 def _svar_extraction_config(
     baseline_cfg: Mapping[str, Any],
 ) -> dict[str, Any]:
-    cfg = dict(baseline_cfg.get("svar") or {})
-    return {
-        "layer_start": cfg.get("layer_start", 5),
-        "layer_end": cfg.get("layer_end", 19),
-        "start_fraction": float(cfg.get("start_fraction", 0.15)),
-        "end_fraction": float(cfg.get("end_fraction", 0.55)),
-    }
+    # The saved payload always keeps every decoder layer.  layer_start/end are
+    # training-only selectors and therefore must not invalidate extraction.
+    return {"extraction_layers": "all"}
 
 
 def _combined_baseline_config(config: Mapping[str, Any]) -> dict[str, Any]:
