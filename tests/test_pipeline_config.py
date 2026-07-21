@@ -214,6 +214,7 @@ class PipelineConfigTests(unittest.TestCase):
             "dgst_t": {
                 "four_gate_methods": ["hpre_raw_logit_gauss"],
                 "branches": {"hpre_raw_logit_gauss": True},
+                "target_modes": ["relative_vll", "raw_logit_gauss"],
             }
         }
         resolved = resolve_run_config(
@@ -250,6 +251,7 @@ class PipelineConfigTests(unittest.TestCase):
         self.assertFalse(dgst["branches"]["hpre_raw_logit_gauss"])
         self.assertTrue(dgst["branches"]["hpre_softmax_prob_gauss"])
         self.assertTrue(dgst["branches"]["raw_attention"])
+        self.assertNotIn("target_modes", dgst)
 
         command = build_root_extract_command(
             resolved,
@@ -392,6 +394,37 @@ class PipelineConfigTests(unittest.TestCase):
         ] = True
         selected = _feature_sets(config, {"extraction_mode": "method_only"})
         self.assertEqual(selected, ["hmid_raw_logit_gauss_risk"])
+
+    def test_target_mode_switch_filters_target_comparison_training(self) -> None:
+        config = {
+            "feature_extraction": {
+                "dgst_t": {
+                    "four_gate_methods": [
+                        "hpre_raw_logit_gauss",
+                        "hpre_raw_logit_relative_vll",
+                    ],
+                    "branches": {
+                        "hpre_raw_logit_gauss": True,
+                        "hpre_raw_logit_relative_vll": True,
+                    },
+                    "target_modes": ["relative_vll"],
+                }
+            },
+            "training": {
+                "feature_sets": {
+                    "method": [
+                        "hpre_raw_logit_gauss_risk_cosine_matched_state",
+                        "hpre_raw_logit_relative_vll_risk_cosine_matched_state",
+                    ],
+                    "ads_cgc": [],
+                }
+            },
+        }
+        selected = _feature_sets(config, {"extraction_mode": "method_only"})
+        self.assertEqual(
+            selected,
+            ["hpre_raw_logit_relative_vll_risk_cosine_matched_state"],
+        )
 
     def test_resume_manifest_fingerprints_feature_configuration(self) -> None:
         config = _minimal_config()

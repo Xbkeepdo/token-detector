@@ -147,6 +147,38 @@ class ExtractionModeTests(unittest.TestCase):
         )
         self.assertEqual(len(cfg["four_gate_methods"]), 4)
 
+    def test_target_modes_independently_select_hpre_target_construction(self) -> None:
+        cfg = {
+            "enabled": True,
+            "four_gate_methods": [
+                "hpre_raw_logit_gauss",
+                "hpre_raw_logit_relative_vll",
+                "hmid_raw_logit_gauss",
+            ],
+            "branches": {
+                "hpre_raw_logit_gauss": True,
+                "hpre_raw_logit_relative_vll": True,
+                "hmid_raw_logit_gauss": True,
+            },
+            "target_modes": ["relative_vll"],
+        }
+        relative_only = _resolve_active_dgst_config(cfg)
+        self.assertEqual(
+            relative_only["four_gate_methods"],
+            ["hmid_raw_logit_gauss", "hpre_raw_logit_relative_vll"],
+        )
+
+        cfg["target_modes"] = ["relative_vll", "raw_logit_gauss"]
+        both = _resolve_active_dgst_config(cfg)
+        self.assertEqual(
+            set(both["four_gate_methods"]),
+            {
+                "hmid_raw_logit_gauss",
+                "hpre_raw_logit_relative_vll",
+                "hpre_raw_logit_gauss",
+            },
+        )
+
     def test_method_and_ads_cgc_can_share_one_record(self) -> None:
         feature_cfg = {
             "method": {"enabled": True},

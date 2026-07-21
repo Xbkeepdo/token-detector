@@ -25,6 +25,7 @@ from utils.config_utils import (  # noqa: E402
     extraction_mode_flags,
     get_model_cfg,
     load_config,
+    resolve_dgst_four_gate_methods,
     resolve_run_config,
 )
 from utils.generation_provenance import (  # noqa: E402
@@ -487,25 +488,8 @@ def _enabled_method_feature_sets(
     dgst = extraction.get("dgst_t") or {} if isinstance(extraction, Mapping) else {}
     if not isinstance(dgst, Mapping):
         return [str(value) for value in feature_sets]
-    known = {
-        "hpre_raw_logit_gauss",
-        "hpre_softmax_prob_gauss",
-        "hmid_raw_logit_gauss",
-        "hmid_softmax_prob_gauss",
-        "hpre_softmax_prob_direct",
-        "raw_attention",
-    }
-    configured = dgst.get("four_gate_methods")
-    active = (
-        {str(method) for method in configured}
-        if isinstance(configured, (list, tuple))
-        else set(known)
-    )
-    branches = dgst.get("branches") or {}
-    if isinstance(branches, Mapping):
-        active = {
-            method for method in active if bool(branches.get(method, True))
-        }
+    known = set(VALID_DGST_BRANCHES)
+    active = set(resolve_dgst_four_gate_methods(dgst))
     disabled = known - active
     configured_support_modes = dgst.get("support_modes")
     if isinstance(configured_support_modes, str):
@@ -574,6 +558,7 @@ def _apply_runtime_overrides(config: dict, run: Mapping[str, object]) -> None:
         dgst["branches"] = {
             method: method in selected_set for method in VALID_DGST_BRANCHES
         }
+        dgst.pop("target_modes", None)
 
 
 def _apply_effective_feature_switches(config: dict, mode: str) -> None:

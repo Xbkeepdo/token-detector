@@ -54,6 +54,7 @@ DEFAULT_FEATURE_SETS = [
 class TorchProbeConfig:
     hidden_sizes: tuple[int, ...] = (128, 64, 32)
     dropout: float = 0.3
+    drop_last: bool = False
     batch_size: int = 256
     num_epochs: int = 100
     learning_rate: float = 1e-3
@@ -130,6 +131,12 @@ def parse_args():
     parser.add_argument("--early-stopping-patience", type=int, default=10)
     parser.add_argument("--fixed-threshold", type=float, default=0.5)
     parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument(
+        "--drop-last",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Drop the final incomplete training batch.",
+    )
     parser.add_argument("--hidden-sizes", nargs="+", type=int, default=[128, 64, 32])
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--device", default="auto")
@@ -168,6 +175,7 @@ def main() -> None:
     config = TorchProbeConfig(
         hidden_sizes=tuple(int(x) for x in args.hidden_sizes),
         dropout=float(args.dropout),
+        drop_last=bool(args.drop_last),
         batch_size=int(args.batch_size),
         num_epochs=int(args.num_epochs),
         learning_rate=float(args.learning_rate),
@@ -298,6 +306,7 @@ def main() -> None:
         metrics["best_params"] = {
             "hidden_sizes": list(config.hidden_sizes),
             "dropout": config.dropout,
+            "drop_last": config.drop_last,
             "batch_size": config.batch_size,
             "num_epochs": config.num_epochs,
             "learning_rate": config.learning_rate,
@@ -367,7 +376,7 @@ def train_and_evaluate_probe(
         MatrixDataset(X_train, train_targets),
         batch_size=config.batch_size,
         shuffle=True,
-        drop_last=(X_train.shape[0] % config.batch_size == 1),
+        drop_last=config.drop_last,
     )
     model = DGSTStyleProbe(
         input_dim=int(X_train.shape[1]),

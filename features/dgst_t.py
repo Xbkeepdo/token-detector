@@ -25,6 +25,7 @@ CAPPED_TOPMASS_MAX_K = 64
 RELATIVE_VLL_MAD_EPSILON = 1e-6
 COSINE16_TOP_K = 16
 GAUSSIAN_MAD_SCALE = 1.4826
+STATEUPD_ALPHA_TENTHS = tuple(range(1, 10))
 
 # The active DGST profile keeps four matched target-gate constructions.  The
 # prefix names deliberately encode both the decoder state used for the logit
@@ -37,10 +38,12 @@ FOUR_GATE_METHODS = (
     "hmid_raw_logit_gauss",
     "hmid_softmax_prob_gauss",
 )
+HPRE_RAW_LOGIT_RELATIVE_VLL_METHOD = "hpre_raw_logit_relative_vll"
 DIRECT_HPRE_SOFTMAX_METHOD = "hpre_softmax_prob_direct"
 RAW_ATTENTION_METHOD = "raw_attention"
 TARGET_COMPARISON_METHODS = (
     *FOUR_GATE_METHODS,
+    HPRE_RAW_LOGIT_RELATIVE_VLL_METHOD,
     DIRECT_HPRE_SOFTMAX_METHOD,
     RAW_ATTENTION_METHOD,
 )
@@ -4263,6 +4266,7 @@ def _compute_four_gate_single_scope_from_captures(
                 ).clamp(-1.0, 1.0)
             gate_input_fields = {
                 "hpre_raw_logit_gauss": "hpre_raw_target_logits",
+                HPRE_RAW_LOGIT_RELATIVE_VLL_METHOD: "hpre_raw_target_logits",
                 "hpre_softmax_prob_gauss": "hpre_softmax_target_probs",
                 "hmid_raw_logit_gauss": "hmid_raw_target_logits",
                 "hmid_softmax_prob_gauss": "hmid_softmax_target_probs",
@@ -4304,10 +4308,16 @@ def _compute_four_gate_single_scope_from_captures(
                         raise RuntimeError(
                             f"Missing compact target values for enabled method {method}."
                         )
-                    gate = _gaussian_mad_gate(
-                        gate_values[target_offset],
-                        epsilon=float(mad_epsilon),
-                    ).detach()
+                    if method == HPRE_RAW_LOGIT_RELATIVE_VLL_METHOD:
+                        gate = _relative_vll_mad_gate(
+                            gate_values[target_offset],
+                            epsilon=float(mad_epsilon),
+                        ).detach()
+                    else:
+                        gate = _gaussian_mad_gate(
+                            gate_values[target_offset],
+                            epsilon=float(mad_epsilon),
+                        ).detach()
                     target_dist = _renormalize(attention_support * gate).detach()
                 support = _topk_union_indices(
                     source_dist,
@@ -4390,6 +4400,15 @@ def _compute_four_gate_single_scope_from_captures(
             "dgst_t_support_scope": str(support_scope),
             "dgst_t_support_size": len(normalized_support_positions),
             "dgst_t_mad_scale": float(GAUSSIAN_MAD_SCALE),
+            "dgst_t_mad_scale_by_method": {
+                method: (
+                    1.0
+                    if method == HPRE_RAW_LOGIT_RELATIVE_VLL_METHOD
+                    else float(GAUSSIAN_MAD_SCALE)
+                )
+                for method in methods
+                if method not in {DIRECT_HPRE_SOFTMAX_METHOD, RAW_ATTENTION_METHOD}
+            },
             "dgst_t_softmax_axis": "vocabulary",
             "dgst_t_source_distribution_mode": "softmax",
             "dgst_t_state_by_method": {
@@ -4411,8 +4430,19 @@ def _compute_four_gate_single_scope_from_captures(
                 record["source"], dim=0
             ).detach().to(device="cpu", dtype=torch.float32),
         }
-        if "sqrt_stateupd_alpha05" in normalized_cost_modes:
-            result["dgst_t_cost_alpha"] = 0.5
+        stateupd_alphas = {
+            active_cost: alpha_value
+            for active_cost in normalized_cost_modes
+            if (alpha_value := _four_gate_stateupd_alpha(active_cost)) is not None
+        }
+        if stateupd_alphas:
+            result["dgst_t_cost_alphas"] = stateupd_alphas
+        primary_alpha = _four_gate_stateupd_alpha(normalized_cost_mode)
+        if primary_alpha is not None:
+            # Historical scalar provenance remains available when a state-update
+            # cost is itself the primary mode. Multi-alpha runs use the mapping
+            # above and keep sqrt_matched_state as their primary mode.
+            result["dgst_t_cost_alpha"] = primary_alpha
         if RAW_ATTENTION_METHOD in methods:
             result["dgst_t_raw_attention_definition"] = (
                 "post_softmax_head_mean_visual_support_renormalized"
@@ -4520,7 +4550,10 @@ def build_compact_four_gate_layer_capture(
     visual_hmid = h_mid.index_select(0, visual_index).float()
 
     hpre_raw = hpre_prob = hmid_raw = hmid_prob = None
-    needs_hpre_raw = "hpre_raw_logit_gauss" in methods
+    needs_hpre_raw = (
+        "hpre_raw_logit_gauss" in methods
+        or HPRE_RAW_LOGIT_RELATIVE_VLL_METHOD in methods
+    )
     needs_hpre_prob = (
         "hpre_softmax_prob_gauss" in methods
         or DIRECT_HPRE_SOFTMAX_METHOD in methods
@@ -4692,20 +4725,30 @@ def _normalize_four_gate_cost_mode(value: str) -> str:
     }:
         return "sqrt_cosine_matched_state"
     if mode in {
+        "cosine_matched_state",
+        "cos_matched_state",
+        "one_minus_cosine_matched_state",
+    }:
+        return "cosine_matched_state"
+    if mode in {
         "geo_stateupd_lu1",
         "geo_state_update_lu1",
         "geo_stateupd_lambda1",
     }:
         return "geo_stateupd_lu1"
-    if mode in {
-        "sqrt_stateupd_alpha05",
-        "sqrt_state_update_alpha05",
-        "sqrt_stateupd_a05",
-    }:
-        return "sqrt_stateupd_alpha05"
+    for alpha_tenth in STATEUPD_ALPHA_TENTHS:
+        slug = f"0{alpha_tenth}"
+        if mode in {
+            f"sqrt_stateupd_alpha{slug}",
+            f"sqrt_state_update_alpha{slug}",
+            f"sqrt_stateupd_a{slug}",
+        }:
+            return f"sqrt_stateupd_alpha{slug}"
     raise ValueError(
         "four_gate cost_mode must be 'sqrt_matched_state' or "
-        "'geo_stateupd_lu1' or 'sqrt_stateupd_alpha05'."
+        "'cosine_matched_state' or "
+        "'geo_stateupd_lu1' or one of 'sqrt_stateupd_alpha01' through "
+        "'sqrt_stateupd_alpha09'."
     )
 
 
@@ -4729,8 +4772,10 @@ def _four_gate_risk_suffix(cost_mode: str, state_name: str) -> str:
     normalized = _normalize_four_gate_cost_mode(cost_mode)
     if normalized == "geo_stateupd_lu1":
         return "risk_geo_stateupd_lu1"
-    if normalized == "sqrt_stateupd_alpha05":
-        return "risk_sqrt_stateupd_alpha05"
+    if _four_gate_stateupd_alpha(normalized) is not None:
+        return f"risk_{normalized}"
+    if normalized == "cosine_matched_state":
+        return f"risk_cosine_{state_name}"
     return f"risk_sqrt_{state_name}"
 
 
@@ -4758,7 +4803,8 @@ def _prepare_four_gate_cost_problem(
             update_lambda=1.0,
             keep_on_device=False,
         )
-    if normalized == "sqrt_stateupd_alpha05":
+    stateupd_alpha = _four_gate_stateupd_alpha(normalized)
+    if stateupd_alpha is not None:
         return _prepare_transport_problem_for_state_cost(
             source_dist=source_dist,
             target_dist=target_dist,
@@ -4766,7 +4812,16 @@ def _prepare_four_gate_cost_problem(
             state_update_states=update_states,
             support=support,
             sqrt_cosine=False,
-            state_update_mix_alpha=0.5,
+            state_update_mix_alpha=stateupd_alpha,
+            keep_on_device=False,
+        )
+    if normalized == "cosine_matched_state":
+        return _prepare_transport_problem_for_state_cost(
+            source_dist=source_dist,
+            target_dist=target_dist,
+            states=matched_states,
+            support=support,
+            sqrt_cosine=False,
             keep_on_device=False,
         )
     return _prepare_transport_problem_for_state_cost(
@@ -4779,6 +4834,15 @@ def _prepare_four_gate_cost_problem(
     )
 
 
+def _four_gate_stateupd_alpha(cost_mode: str) -> float | None:
+    """Return the state/update mixture weight encoded by a canonical mode."""
+    normalized = _normalize_four_gate_cost_mode(cost_mode)
+    prefix = "sqrt_stateupd_alpha0"
+    if not normalized.startswith(prefix):
+        return None
+    return int(normalized.removeprefix(prefix)) / 10.0
+
+
 def _target_comparison_state(method: str) -> str:
     """Return the hidden-state family paired with one target construction."""
     name = str(method).strip().lower()
@@ -4786,6 +4850,7 @@ def _target_comparison_state(method: str) -> str:
         return "hmid"
     if name in {
         "hpre_raw_logit_gauss",
+        HPRE_RAW_LOGIT_RELATIVE_VLL_METHOD,
         "hpre_softmax_prob_gauss",
         DIRECT_HPRE_SOFTMAX_METHOD,
         RAW_ATTENTION_METHOD,
@@ -4810,6 +4875,19 @@ def _solve_exact_emd_problem_series(
             for name, problems in problem_series.items()
         }
         return {name: futures[name].result() for name in problem_series}
+
+
+@torch.no_grad()
+def _relative_vll_mad_gate(values: torch.Tensor, *, epsilon: float) -> torch.Tensor:
+    clean = torch.nan_to_num(
+        values.float(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    if clean.numel() == 0:
+        return clean
+    median = clean.median()
+    mad = torch.abs(clean - median).median()
+    z = (clean - median) / (mad + max(float(epsilon), EPS))
+    return torch.sigmoid(z).detach()
 
 
 @torch.no_grad()

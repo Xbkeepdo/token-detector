@@ -63,6 +63,7 @@ def main() -> None:
     probe_config = TorchProbeConfig(
         hidden_sizes=tuple(int(value) for value in torch_cfg.get("hidden_sizes", [128, 64, 32])),
         dropout=float(torch_cfg.get("dropout", 0.3)),
+        drop_last=bool(torch_cfg.get("drop_last", False)),
         batch_size=int(torch_cfg.get("batch_size", 256)),
         num_epochs=int(torch_cfg.get("max_epochs", torch_cfg.get("num_epochs", 100))),
         learning_rate=float(torch_cfg.get("learning_rate", 1.0e-3)),

@@ -16,12 +16,30 @@ VALID_EXTRACTION_MODES = {
 }
 VALID_DGST_BRANCHES = (
     "hpre_raw_logit_gauss",
+    "hpre_raw_logit_relative_vll",
     "hpre_softmax_prob_gauss",
     "hmid_raw_logit_gauss",
     "hmid_softmax_prob_gauss",
     "hpre_softmax_prob_direct",
     "raw_attention",
 )
+VALID_DGST_TARGET_MODES = (
+    "relative_vll",
+    "raw_logit_gauss",
+)
+_DGST_TARGET_METHODS = {
+    "relative_vll": "hpre_raw_logit_relative_vll",
+    "raw_logit_gauss": "hpre_raw_logit_gauss",
+}
+_DGST_TARGET_MODE_ALIASES = {
+    "relative": "relative_vll",
+    "relative_vll": "relative_vll",
+    "hpre_raw_logit_relative_vll": "relative_vll",
+    "gauss": "raw_logit_gauss",
+    "gaussian": "raw_logit_gauss",
+    "raw_logit_gauss": "raw_logit_gauss",
+    "hpre_raw_logit_gauss": "raw_logit_gauss",
+}
 VALID_LABEL_SAMPLE_UNITS = {"first_canonical_mention"}
 VALID_LABEL_LOCATORS = {"exact_response_offsets"}
 VALID_ALIGNMENT_FAILURE_POLICIES = {"error", "skip"}
@@ -32,6 +50,76 @@ PIPELINE_STAGES = (
     "training",
     "plotting",
 )
+
+
+def resolve_dgst_four_gate_methods(dgst: Mapping[str, Any]) -> list[str]:
+    """Resolve branch booleans and the independent hpre target-mode switch.
+
+    ``target_modes`` is authoritative for the two hpre/raw-logit target
+    constructors.  Other historical Gaussian/direct branches continue to use
+    ``four_gate_methods`` plus ``branches`` exactly as before.
+    """
+
+    configured = dgst.get("four_gate_methods")
+    branches = dgst.get("branches") or {}
+    if isinstance(configured, str):
+        methods = [configured]
+    elif isinstance(configured, (list, tuple)):
+        methods = [str(method) for method in configured]
+    elif isinstance(branches, Mapping) and branches:
+        methods = [str(method) for method in branches]
+    else:
+        # Preserve the historical default: the four Gaussian constructions,
+        # not the opt-in direct controls or the new Relative-VLL comparison.
+        methods = [
+            "hpre_raw_logit_gauss",
+            "hpre_softmax_prob_gauss",
+            "hmid_raw_logit_gauss",
+            "hmid_softmax_prob_gauss",
+        ]
+
+    if isinstance(branches, Mapping):
+        methods = [
+            method for method in methods if bool(branches.get(method, True))
+        ]
+
+    raw_target_modes = dgst.get("target_modes")
+    if raw_target_modes is not None:
+        requested = (
+            [raw_target_modes]
+            if isinstance(raw_target_modes, str)
+            else list(raw_target_modes)
+        )
+        if not requested:
+            raise ValueError("dgst_t.target_modes cannot be empty")
+        target_modes: list[str] = []
+        unknown: list[str] = []
+        for raw_mode in requested:
+            alias = str(raw_mode).strip().lower().replace("-", "_")
+            mode = _DGST_TARGET_MODE_ALIASES.get(alias)
+            if mode is None:
+                unknown.append(alias)
+            elif mode not in target_modes:
+                target_modes.append(mode)
+        if unknown:
+            raise ValueError(
+                f"Unknown DGST target modes {unknown}; expected a subset of "
+                f"{list(VALID_DGST_TARGET_MODES)}"
+            )
+        selectable_methods = set(_DGST_TARGET_METHODS.values())
+        methods = [method for method in methods if method not in selectable_methods]
+        methods.extend(_DGST_TARGET_METHODS[mode] for mode in target_modes)
+
+    methods = list(dict.fromkeys(methods))
+    unknown_methods = sorted(set(methods) - set(VALID_DGST_BRANCHES))
+    if unknown_methods:
+        raise ValueError(
+            f"Unknown DGST branches {unknown_methods}; expected a subset of "
+            f"{list(VALID_DGST_BRANCHES)}"
+        )
+    if not methods:
+        raise ValueError("All DGST branch/target switches are disabled.")
+    return methods
 
 _LABELING_DEFAULTS = {
     "schema_version": 2,

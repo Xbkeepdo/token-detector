@@ -5,7 +5,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-MODEL="${MODEL:-qwen2_5_vl_7b}"
+MODEL="${MODEL:-llava_1_5_7b}"  # llava_1_5_7b
 OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-512-VVVP}"
 CONFIG="${CONFIG:-configs/model_configs_server_fj01.yaml}"
 

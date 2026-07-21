@@ -598,6 +598,7 @@ def _register_four_gate_aliases() -> None:
     """Register aliases for the active gates and raw-attention control."""
     methods = (
         "hpre_raw_logit_gauss",
+        "hpre_raw_logit_relative_vll",
         "hpre_softmax_prob_gauss",
         "hmid_raw_logit_gauss",
         "hmid_softmax_prob_gauss",
@@ -637,10 +638,15 @@ def _register_four_gate_aliases() -> None:
             f"{method}_risk_geo_stateupd_lu1": (
                 f"dgst_t_{method}_risk_geo_stateupd_lu1_per_layer"
             ),
-            f"{method}_risk_sqrt_stateupd_alpha05": (
-                f"dgst_t_{method}_risk_sqrt_stateupd_alpha05_per_layer"
+            f"{method}_risk_cosine_matched_state": (
+                f"dgst_t_{method}_risk_cosine_{state_name}_per_layer"
             ),
         }
+        for alpha_tenth in range(1, 10):
+            alpha_slug = f"0{alpha_tenth}"
+            cost_risk_specs[
+                f"{method}_risk_sqrt_stateupd_alpha{alpha_slug}"
+            ] = f"dgst_t_{method}_risk_sqrt_stateupd_alpha{alpha_slug}_per_layer"
         for block, feature_key in cost_risk_specs.items():
             FEATURE_ALIASES[block] = block
             FEATURE_KEYS[block] = feature_key
@@ -672,10 +678,15 @@ def _register_four_gate_aliases() -> None:
             f"{scoped_method}_risk_geo_stateupd_lu1": (
                 f"dgst_t_{scoped_method}_risk_geo_stateupd_lu1_per_layer"
             ),
-            f"{scoped_method}_risk_sqrt_stateupd_alpha05": (
-                f"dgst_t_{scoped_method}_risk_sqrt_stateupd_alpha05_per_layer"
+            f"{scoped_method}_risk_cosine_matched_state": (
+                f"dgst_t_{scoped_method}_risk_cosine_{state_name}_per_layer"
             ),
         }
+        for alpha_tenth in range(1, 10):
+            alpha_slug = f"0{alpha_tenth}"
+            specs[
+                f"{scoped_method}_risk_sqrt_stateupd_alpha{alpha_slug}"
+            ] = f"dgst_t_{scoped_method}_risk_sqrt_stateupd_alpha{alpha_slug}_per_layer"
         for block, feature_key in specs.items():
             FEATURE_ALIASES[block] = block
             FEATURE_KEYS[block] = feature_key
@@ -716,6 +727,7 @@ FOUR_GATE_SOURCE_TARGET_JS_BLOCKS = {
     f"{method}_source_target_js": method
     for method in (
         "hpre_raw_logit_gauss",
+        "hpre_raw_logit_relative_vll",
         "hpre_softmax_prob_gauss",
         "hmid_raw_logit_gauss",
         "hmid_softmax_prob_gauss",
@@ -726,12 +738,14 @@ FOUR_GATE_SOURCE_TARGET_JS_BLOCKS = {
 FOUR_GATE_RISK_BLOCKS = {}
 for _four_gate_method in (
     "hpre_raw_logit_gauss",
+    "hpre_raw_logit_relative_vll",
     "hpre_softmax_prob_gauss",
     "hmid_raw_logit_gauss",
     "hmid_softmax_prob_gauss",
     "hpre_softmax_prob_direct",
     "raw_attention",
     "vp_hpre_raw_logit_gauss",
+    "vp_hpre_raw_logit_relative_vll",
     "vp_hpre_softmax_prob_gauss",
     "vp_hmid_raw_logit_gauss",
     "vp_hmid_softmax_prob_gauss",
@@ -742,11 +756,19 @@ for _four_gate_method in (
         _four_gate_method,
         None,
     )
-    for _cost_alias, _cost_mode in (
+    _four_gate_cost_aliases = [
         ("sqrt_matched_state", "sqrt_cosine_matched_state"),
+        ("cosine_matched_state", "cosine_matched_state"),
         ("geo_stateupd_lu1", "geo_stateupd_lu1"),
-        ("sqrt_stateupd_alpha05", "sqrt_stateupd_alpha05"),
-    ):
+        *[
+            (
+                f"sqrt_stateupd_alpha0{alpha_tenth}",
+                f"sqrt_stateupd_alpha0{alpha_tenth}",
+            )
+            for alpha_tenth in range(1, 10)
+        ],
+    ]
+    for _cost_alias, _cost_mode in _four_gate_cost_aliases:
         FOUR_GATE_RISK_BLOCKS[
             f"{_four_gate_method}_risk_{_cost_alias}"
         ] = (_four_gate_method, _cost_mode)
@@ -755,6 +777,7 @@ FOUR_GATE_SOURCE_TARGET_UNION_TOPK_JS_BLOCKS = {
     f"{method}_source_target_union_topk_js": method
     for method in (
         "hpre_raw_logit_gauss",
+        "hpre_raw_logit_relative_vll",
         "hpre_softmax_prob_gauss",
         "hmid_raw_logit_gauss",
         "hmid_softmax_prob_gauss",
@@ -769,6 +792,7 @@ FOUR_GATE_ONE_MINUS_TARGET_MASS_COSINE_BLOCKS = {
     f"{method}_one_minus_target_dist_mass_x_cosine": method
     for method in (
         "hpre_raw_logit_gauss",
+        "hpre_raw_logit_relative_vll",
         "hpre_softmax_prob_gauss",
         "hmid_raw_logit_gauss",
         "hmid_softmax_prob_gauss",
@@ -1119,8 +1143,11 @@ def _four_gate_risk_block(feat: dict, block: str) -> np.ndarray:
     cost_mode = explicit_cost_mode or feat.get("dgst_t_cost")
     if cost_mode == "geo_stateupd_lu1":
         key = f"dgst_t_{method}_risk_geo_stateupd_lu1_per_layer"
-    elif cost_mode == "sqrt_stateupd_alpha05":
-        key = f"dgst_t_{method}_risk_sqrt_stateupd_alpha05_per_layer"
+    elif str(cost_mode).startswith("sqrt_stateupd_alpha0"):
+        key = f"dgst_t_{method}_risk_{cost_mode}_per_layer"
+    elif cost_mode == "cosine_matched_state":
+        state_name = "hmid" if method.removeprefix("vp_").startswith("hmid_") else "hpre"
+        key = f"dgst_t_{method}_risk_cosine_{state_name}_per_layer"
     else:
         key = FEATURE_KEYS[block]
     values = feat.get(key)

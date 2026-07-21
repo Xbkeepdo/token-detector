@@ -9,7 +9,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from scripts.train_and_eval import build_training_commands
+from scripts.train_and_eval import _torch_probe_cli_args, build_training_commands
 from utils.config_utils import load_config
 
 
@@ -125,6 +125,18 @@ class UnifiedTrainStageTests(unittest.TestCase):
         self.assertNotIn("--run-name", root)
         self.assertEqual(root[root.index("--seed") + 1], "42")
         self.assertEqual(baseline[1], "scripts/train_baselines.py")
+
+    def test_torch_probe_drop_last_flag_follows_yaml_boolean(self) -> None:
+        probe = copy.deepcopy(self.config["training"]["torch_probe"])
+        probe["drop_last"] = True
+        self.assertIn("--drop-last", _torch_probe_cli_args(probe))
+
+        probe["drop_last"] = False
+        self.assertIn("--no-drop-last", _torch_probe_cli_args(probe))
+
+        probe["drop_last"] = "true"
+        with self.assertRaisesRegex(ValueError, "drop_last must be a boolean"):
+            _torch_probe_cli_args(probe)
 
     def test_feature_override_and_run_name_isolate_seed_outputs(self) -> None:
         config = copy.deepcopy(self.config)

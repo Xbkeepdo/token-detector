@@ -260,6 +260,9 @@ def _torch_probe_cli_args(config: object) -> list[str]:
         "fixed_threshold": "--fixed-threshold",
         "dropout": "--dropout",
     }
+    boolean_options = {
+        "drop_last": ("--drop-last", "--no-drop-last"),
+    }
     protocol_options = {
         "structure": "Linear-BatchNorm-ReLU-Dropout",
         "activation": "relu",
@@ -275,6 +278,7 @@ def _torch_probe_cli_args(config: object) -> list[str]:
     }
     allowed = {
         *scalar_options,
+        *boolean_options,
         *protocol_options,
         "threshold_reporting",
         "hidden_sizes",
@@ -302,6 +306,12 @@ def _torch_probe_cli_args(config: object) -> list[str]:
     for key, option in scalar_options.items():
         if key in config:
             result.extend([option, str(config[key])])
+    for key, (true_option, false_option) in boolean_options.items():
+        if key not in config:
+            continue
+        if not isinstance(config[key], bool):
+            raise ValueError(f"training.torch_probe.{key} must be a boolean")
+        result.append(true_option if config[key] else false_option)
     if config.get("hidden_sizes") is not None:
         hidden_sizes = config["hidden_sizes"]
         if not isinstance(hidden_sizes, Sequence) or isinstance(hidden_sizes, (str, bytes)):

@@ -1,5 +1,62 @@
 # Current Task
 
+## 2026-07-21 hpre raw-logit Gaussian 的 VV/VP state-update alpha sweep
+
+- 两份活动 YAML 均收敛到 `method_only`、唯一 target 方法 `hpre_raw_logit_gauss`、`target_modes=[raw_logit_gauss]` 与 `support_modes=[vv,vp]`；Relative-VLL、hmid、softmax-prob、raw-attention 和 FAD 均未启用。主 `cost_mode` 固定为 `sqrt_matched_state`，无后缀主 risk 继续解析到 matched-state 字段。
+- state-update cost 已从仅支持 `alpha05` 扩展为 `sqrt_stateupd_alpha01` 到 `alpha09`。每个模式严格计算 `C_alpha=(1-alpha)*sqrt((1-cos(hpre_i,hpre_j))/2)+alpha*sqrt((1-cos(o_ffn_i,o_ffn_j))/2)`；九个 alpha 共用同一次模型 forward/capture，但分别求精确 EMD。`alpha05` 字段和主模式为 alpha05 时的旧标量 provenance 保持兼容；多 alpha 结果新增 `dgst_t_cost_alphas` 映射，避免用单个 0.5 描述整组 sweep。
+- serializer 与训练 alias 已覆盖 VV/VP 的九个独立 alpha 字段。YAML 训练列表严格为 40 组：2 个 support ×（1 个 matched 基准 + 9 个 alpha）×（risk 单独、risk + 同范围 `mass×cosine`）；不存在 VV risk + VP EV 或相反方向的交叉组合。训练超参继续使用当前三层 MLP 与 `drop_last: true`。
+- 新增 `tests/test_stateupd_alpha_sweep.py`：验证 0.1/0.5/0.9 cost 矩阵的手算凸组合、九个名称/权重、VV/VP 全字段与 provenance 序列化、全部 40 个训练 alias，以及两份 YAML/三 seed 命令展开。第一次 4 项测试为 3 pass + 1 failure，原因是统一 YAML 仍为 `extraction_mode=all` 而额外带入 ADS/CGC；改为 `method_only` 后 4/4 通过。原 `tests.test_four_gate_dgst + tests.test_extraction_modes` 29/29 通过；相关 `py_compile`、生产 YAML dry-run（3 seeds、alpha01-alpha09、无 hmid/Relative-VLL/FAD）和 `git diff --check` 通过。
+- 本轮只完成实现、配置和合成验证，没有启动 COCO4000 正式重提取或 120 次 probe 训练。现有 `COCO4000-512-VVVP/features.pkl` 只有旧 cost 字段，必须使用新配置重新提取后才能训练/画 alpha sweep 结果；resume fingerprint 会阻止把旧特征误当成新产物。
+
+## 2026-07-21 默认训练 DataLoader 启用 `drop_last`
+
+- `configs/model_configs_unified.yaml` 与服务器活动配置 `configs/model_configs_server_fj01.yaml` 的 `training.torch_probe` 均新增 `drop_last: true`；原 `dropout: 0.3` 保持不变。该开关只丢弃训练集最后一个不完整 batch，测试/评估预测仍保留全部样本。
+- `TorchProbeConfig`、主训练 CLI 和 `train_and_eval.py` 的 YAML 参数展开已接通布尔 `--drop-last/--no-drop-last`，且非布尔 YAML 值会明确报错；实际训练 DataLoader 不再使用“仅余数为 1 时丢弃”的隐式规则，而是严格服从该开关。共享三层 baseline 与 source-target divergence probe 同步读取同一配置；结果的 `best_params` 记录 `drop_last` provenance。
+- 验证：相关 5 个 Python 文件及定向测试 `py_compile` 通过；两个 YAML 均解析为布尔 `true`，主 probe 命令得到 `--drop-last`，共享 baseline 配置得到 `True`；新增布尔开关单测 1/1 通过；5 条训练样本、batch 4 的真实 CPU smoke 验证训练 DataLoader 仅保留 1 个完整 batch；`git diff --check` 通过。完整 `tests.test_train_and_eval_stage` 仍有本轮开始前的 2 failure + 1 error：旧断言要求当前配置已关闭的 `raw_attention` 分支，与 `drop_last` 改动无关。
+
+## 2026-07-21 LLaVA VV/VP `mass × cosine` 幻觉/非幻觉逐层曲线
+
+- 复用 `outputs/llava_1_5_7b/COCO4000-512-VVVP/features.pkl`，严格按当前特征定义绘制 `target-distribution top-k mass × matched hpre target cosine`；覆盖 Gaussian/Relative-VLL × VV/VP 四个分支，没有重新抽取特征或训练 probe。
+- 新增可复现脚本 `scripts/plot_vv_vp_mass_cosine_by_label.py`，按原始 token 标签汇总 12,686 行、3,968 张图片、32 层；hallucination 3,146 行、real 9,540 行。曲线展示 class 内 token 均值与 95% CI。
+- 四个分支的全层均值 `Hall/Real/Hall-Real` 分别为：Gaussian-VV `0.118587/0.139632/-0.021045`，Gaussian-VP `0.165977/0.195085/-0.029108`，Relative-VLL-VV `0.121211/0.142112/-0.020901`，Relative-VLL-VP `0.165420/0.194447/-0.029027`。四者整体均为 Real 更高；最大绝对差分别位于第 29/31/29/31 层，差值 `-0.051051/-0.060745/-0.050504/-0.060219`。
+- PNG/PDF、128 行逐层 CSV、JSON 和 Markdown 摘要位于 `outputs/llava_1_5_7b/COCO4000-512-VVVP/results/relative_vll_gaussian_vv_vp_mass_x_cosine_by_label/`。脚本 `py_compile`、四字段/全有限值检查、CSV 4 分支 × 32 层、5 个非空产物、人工图像检查和 `git diff --check` 均通过。
+
+## 2026-07-21 LLaVA-1.5 COCO4000 baseline 统一三层 MLP 双正类报告
+
+- 在 `outputs/llava_1_5_7b/COCO4000-512-AC/baseline/features.pkl` 上完成 MetaToken、SVAR、ProjectAway 的统一三层 MLP 训练；DHCP 仍不属于 shared dense-vector MLP 支持范围，没有混入本轮。输入维度分别为 42、448（SVAR 第 5–18 层）和 33。
+- 正式协议为严格图片级 8:2、无 validation，3200/0/800 张图片，对应 10109/0/2577 个 token 样本；seeds `43/44/45`。网络严格为 `input→128→64→32→1`、BatchNorm-ReLU-Dropout 0.3、Kaiming-uniform ReLU initialization、Adam `lr=1e-3`、weight decay `1e-5`、batch 256、最多 100 epochs、BCEWithLogitsLoss、train-loss scheduler/early stopping、minimum-train-loss checkpoint，同时报告固定 0.5 与 train Real-F1 阈值。
+- 旧根 `image_splits.json` 是 8:1:1，第一次启动在任何训练前被 strict-82 validator 拒绝，日志保留为 `baseline/shared_torch_mlp_train_initial_split_failure.log`。随后 `train_baselines.py` 新增可选 `--split-path`，并兼容统一实验已保存的 `strict_train80_test20_no_validation` 报告 schema；复用 `unified_hallucination_positive_probe_train80_test20_no_validation_relu/outer80_split.json`，已验证覆盖原来完全相同的 4000 张图片，没有重新随机划分或覆盖根 split。
+- 首次结果虽然读取了活动 YAML，但当时未识别出该 dirty YAML 的三项 probe 超参已从正式值被改为 `dropout=0.2/lr=3e-4/weight_decay=1e-4`；该组不能作为正式结果，已连同 checkpoint 完整归档到 `baseline/{results,checkpoints}/shared_torch_mlp_drop02_lr3e4_wd1e4/`。随后只将活动 YAML 这三项恢复为用户指定的 `0.3/1e-3/1e-5`，逐 seed 保存的 trainer config 也已反向核验一致，再完成正式重跑。
+- 正式 train Real-F1 阈值的 Test 三 seed mean±population-std：MetaToken Accuracy/Real-F1/AUROC/Hall-F1=`0.8260±0.0020/0.8898±0.0012/0.8833±0.0001/0.5865±0.0066`；SVAR=`0.8280±0.0032/0.8858±0.0023/0.8858±0.0024/0.6517±0.0096`；ProjectAway=`0.7716±0.0010/0.8637±0.0006/0.8112±0.0007/0.2940±0.0123`。
+- 正式固定 0.5 的 Test 三 seed mean±population-std：MetaToken Accuracy/Real-F1/Hall-F1=`0.8290±0.0005/0.8889±0.0014/0.6276±0.0147`；SVAR=`0.8220±0.0041/0.8827±0.0027/0.6283±0.0340`；ProjectAway=`0.7721±0.0021/0.8509±0.0009/0.5166±0.0091`。AUROC/AUPR 与阈值无关；完整报告还列出 Real/Hall 两种正类的 Precision、Recall、F1 和各自 AUPR。
+- 新增可复用 `scripts/summarize_baseline_dual_positive.py`；完整 MD/CSV/JSON 位于 `baseline/results/shared_torch_mlp/llava_1_5_7b_baselines_shared_torch_mlp_3seed_dual_positive.*`，逐 seed JSON 与 9 个 checkpoint 位于同目录的 `seed{43,44,45}/` 和 `baseline/checkpoints/shared_torch_mlp/`。
+- 验证：`tests.test_train_baseline_reporting` 5/5 通过；两个脚本 `py_compile`、strict split adapter、6 行双正类汇总、3 seeds × 3 methods、所有有限指标、正式/归档超参辨识和 9/9 checkpoint Linear weight shape 检查通过；`git diff --check` 通过，训练后两张 GPU 均为空闲。
+
+## 2026-07-21 LLaVA Relative-VLL/Gaussian 三种 cost 的 FAD×risk 曲线
+
+- 继续复用 `outputs/llava_1_5_7b/COCO4000-512-VVVP/features.pkl`，按训练代码的 `fad` alias 使用 `ffn_fad = dgst_t_ffn_attn_dominance_per_layer`；组合严格为同层 float32 Hadamard product `ffn_fad * risk`，没有改变 risk、标签或样本集合。
+- `scripts/plot_relative_vll_gauss_three_cost_risk.py` 新增可选 `--multiply-fad` 与 `--stem`；默认不传开关时仍绘制原始 risk，并保持原来的 float64 统计口径。新图覆盖 Gaussian/Relative-VLL × VV/VP × `sqrt_matched`/`1-cos(hpre)`/`sqrt_stateupd_alpha05` 共 12 组 Hall/Real 曲线和 95% CI。
+- PNG/PDF、384 行逐层 CSV、JSON 与摘要位于 `outputs/llava_1_5_7b/COCO4000-512-VVVP/results/relative_vll_gaussian_three_cost_fad_x_risk_by_label/`。统计仍为 12,686 行、3,968 张图片、32 层，hallucination 3,146、real 9,540。
+- 乘 FAD 后 12 组的全层平均 `Hall-Real` 全部反转为负。Gaussian VV 三种 cost 分别为 `-0.012518/-0.013374/-0.012714`，Gaussian VP 为 `-0.025394/-0.033495/-0.025993`；Relative-VLL VV 为 `-0.012366/-0.013154/-0.012557`，Relative-VLL VP 为 `-0.024405/-0.031650/-0.025012`。VP 反转普遍约为 VV 的两倍，绝对分离最大的分支是 Gaussian/VP `1-cos(hpre)`，平均差 `-0.033495`。
+- 峰值绝对差位置：VV 的两个 sqrt cost 在第 32 层、`1-cos(hpre)` 在第 1 层；VP 三种 cost 均在第 28 层。图已人工检查；脚本 `py_compile`、12 series × 32 layers、有限值、标签计数、transform provenance 和 `git diff --check` 均通过。
+
+## 2026-07-21 LLaVA Relative-VLL/Gaussian 三种 cost 曲线与 probe
+
+- 复用 `outputs/llava_1_5_7b/COCO4000-512-VVVP/features.pkl`，没有重新做模型抽取。完整产物包含 12,686 个 object-token 行、3,968 张图片、32 层；标签为 hallucination 3,146、real 9,540。12 个 risk 字段（2 target × VV/VP × 3 cost）和 4 个对应 EV 字段均存在且全部有限。
+- 新增可复现画图脚本 `scripts/plot_relative_vll_gauss_three_cost_risk.py`。曲线 PNG/PDF、384 行逐层 CSV、JSON 和摘要写入 `outputs/llava_1_5_7b/COCO4000-512-VVVP/results/relative_vll_gaussian_three_cost_risk_by_label/`。
+- 曲线结论：Gaussian 与 Relative-VLL 的整体形状非常接近；VV 的全层 Hall-Real 均值差约 `+0.0150` 到 `+0.0228`，明显大于 VP 的 `+0.0047` 到 `+0.0080`。`1-cos(hpre)` 在 VV 上的平均分离最大（Gaussian `+0.021944`、Relative-VLL `+0.022827`），峰值都在第 8 层；VP 三种 cost 的最大绝对差都位于第 2 层且方向反转。
+- 完成 24 个 feature set × seeds `43/44/45` = 72 次 Torch probe：每个 target/scope/cost 分别训练 risk 与 `risk + 对应 target 的 mass×cosine`。协议为严格 image-level 8:2、无 validation、Real 正类、hidden `[128,64,32]`、BatchNorm-ReLU-Dropout `0.2`、Adam `lr=3e-4`、weight decay `1e-4`、batch `256`、最多 100 epochs、train-loss early stopping patience 10，并同时报告固定 0.5 与训练集 Real-F1 阈值。
+- 训练集阈值结果中，最高 AUC 是 Gaussian/VV `sqrt_stateupd_alpha05 risk + EV`：`0.8859±0.0002`；最高 Real-F1 是 Gaussian/VV `sqrt_matched_state risk + EV`：`0.8842±0.0010`。12 个分支加入对应 EV 后 AUC 全部提升 `+0.0240` 到 `+0.0298`，Real-F1 全部提升 `+0.0078` 到 `+0.0136`。固定 0.5 下最佳仍是 Gaussian/VV `sqrt_stateupd_alpha05 risk + EV`，Accuracy/Real-F1/Hall-F1 为 `0.8258±0.0018 / 0.8826±0.0008 / 0.6623±0.0095`。
+- 三 seed 汇总位于 `outputs/llava_1_5_7b/COCO4000-512-VVVP/results/llava_1_5_7b_relative_vll_gaussian_three_cost_risk_ev_3seed_summary.{md,csv,json}`；逐 seed 结果位于 `results/relative_vll_gaussian_three_cost_seed{43,44,45}/`。已校验 3 个 JSON 均严格包含相同的 24 个 feature set、Real 正类、两套阈值报告、正确 seed 与 32/64 输入维度；画图脚本 `py_compile`、曲线行数/层数/有限值检查和 `git diff --check` 通过。
+
+## 2026-07-21 hpre `1-cosine` cost 与 Relative-VLL/Gaussian target 开关
+
+- compact four-gate 新增可选 cost `cosine_matched_state`：严格使用 `C_ij=1-cos(h_state_i,h_state_j)`，不除以 2、不开平方；hpre 分支的 matched state 为 `h_prev`。原 `sqrt_matched_state` 与 `sqrt_stateupd_alpha05` 保留，可通过 YAML `cost_modes` 在同一次 capture/source/target 上并行提取。
+- 新增 hpre target 分支 `hpre_raw_logit_relative_vll`，与 `hpre_raw_logit_gauss` 共用同一组 hpre raw target logits、attention、source distribution、support 和 EMD。Relative-VLL gate 使用 `sigmoid((logit-median)/(1.0*MAD+eps))`，Gaussian gate 使用 `sigmoid((logit-median)/(1.4826*MAD+eps))`；两者不是同一 target，前者通常更尖锐，后者更平滑。
+- 两份活动 YAML 新增独立 `target_modes`，支持 `relative_vll`、`raw_logit_gauss` 或同时选择；该列表只控制上述两个 hpre/raw-logit target，不影响其他历史分支。当前默认两者同时启用，并同时提取 `sqrt_matched_state`、`cosine_matched_state`、`sqrt_stateupd_alpha05`。显式 CLI `--dgst-branches` 仍具有最高优先级，会移除 YAML target-mode 便利开关，避免被静默重新启用。
+- serializer、VV/VP 字段、训练 alias 和 pipeline 训练项过滤均已接通。新增四个活动 risk 对比项：VV/VP 下 Gaussian 与 Relative-VLL 各自的 `sqrt_matched_state` 和 `cosine_matched_state`；结果同时保存每个 target method 的 MAD scale provenance。
+- 验证：相关 Python `py_compile` 与两份 YAML 解析通过；`tests.test_extraction_modes + tests.test_four_gate_dgst` 共 29/29 通过；CLI override、禁用分支和 target-mode 训练过滤 3/3 通过；两份 YAML 的 relative-only/Gaussian-only 展开均无另一 target 泄漏；服务器配置 `train_and_eval.py --dry-run` 已列出新增 VV/VP risk 对比项；`git diff --check` 通过。本轮没有启动正式模型重抽取或训练，旧 `features.pkl` 不包含新增字段，不能直接训练这些新项。
+
 ## 2026-07-21 Qwen2.5-VL VV/VP hpre-risk 与 FFAD 乘积曲线
 
 - 对 `outputs/qwen2_5_vl_7b/COCO4000-512-VVVP/features.pkl` 的完整 7,924 条 object-token 记录按原始标签分组：幻觉 `label=0` 共 972 条，非幻觉/real `label=1` 共 6,952 条；没有使用仅含 2/3 条记录的残留 `features.part0/1.pkl`。hpre-risk 严格读取当前主 cost `sqrt_cosine_matched_state` 的 VV/VP 训练字段，FFAD 组合严格按训练代码做逐层 Hadamard 乘积。

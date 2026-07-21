@@ -20,6 +20,7 @@ from utils.io_utils import load_json, load_pkl, save_pkl
 
 FOUR_GATE_METHODS = (
     "hpre_raw_logit_gauss",
+    "hpre_raw_logit_relative_vll",
     "hpre_softmax_prob_gauss",
     "hmid_raw_logit_gauss",
     "hmid_softmax_prob_gauss",
@@ -128,6 +129,9 @@ def main():
         dgst_t_cfg["branches"] = {
             method: method in selected_set for method in FOUR_GATE_METHODS
         }
+        # An explicit CLI branch list must override the YAML target-mode
+        # convenience switch rather than silently re-enabling a target branch.
+        dgst_t_cfg.pop("target_modes", None)
     baseline_section = dict(feature_cfg.get("baseline") or {})
     effective_baseline_config = _combined_baseline_config(config)
     baseline_enabled = bool(baseline_section.get("enabled", False))

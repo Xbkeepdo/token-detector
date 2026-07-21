@@ -503,6 +503,115 @@ class FourGateDGSTTests(unittest.TestCase):
         self.assertAlmostEqual(float(matrix[0, 0]), expected_risk, places=6)
         self.assertEqual(labels.tolist(), [1])
 
+    def test_hpre_cosine_cost_compares_relative_vll_and_gaussian_targets(self) -> None:
+        layer = self._output_layer()
+        h_prev = torch.tensor(
+            [[
+                [1.0, -2.0],
+                [0.0, -0.5],
+                [-1.0, 0.7],
+                [0.5, 3.0],
+                [1.0, 1.0],
+            ]],
+            dtype=torch.float32,
+        )
+        o_attn = torch.zeros_like(h_prev)
+        o_attn[0, :4] = torch.tensor(
+            [[0.0, 0.1], [0.1, 0.0], [0.0, -0.1], [-0.1, 0.0]]
+        )
+        o_ffn = torch.zeros_like(h_prev)
+        o_ffn[0, :4] = torch.tensor(
+            [[0.1, 0.0], [0.0, 0.2], [-0.1, 0.1], [0.2, 0.1]]
+        )
+        attention = torch.zeros(1, 2, 5, 5, dtype=torch.float32)
+        attention[0, 0, 4, :4] = torch.tensor([0.4, 0.2, 0.1, 0.3])
+        attention[0, 1, 4, :4] = torch.tensor([0.1, 0.3, 0.2, 0.4])
+        capture = {
+            "h_prev": h_prev,
+            "h_mid": h_prev + o_attn,
+            "o_attn": o_attn,
+            "o_ffn": o_ffn,
+            "attn_weights": attention,
+        }
+        methods = [
+            "hpre_raw_logit_gauss",
+            "hpre_raw_logit_relative_vll",
+        ]
+        result = compute_four_gate_dgst_batch_from_captures(
+            model=SimpleNamespace(get_output_embeddings=lambda: layer),
+            captures=[capture],
+            visual_start=0,
+            visual_end=4,
+            target_token_ids=[1],
+            prediction_positions=[4],
+            transport_top_k=4,
+            target_region_top_k=4,
+            cost_mode="sqrt_matched_state",
+            cost_modes=["sqrt_matched_state", "cosine_matched_state"],
+            enabled_methods=methods,
+        )[0]
+
+        self.assertEqual(
+            result["dgst_t_cost_modes"],
+            ["sqrt_cosine_matched_state", "cosine_matched_state"],
+        )
+        self.assertEqual(
+            result["dgst_t_mad_scale_by_method"],
+            {
+                "hpre_raw_logit_gauss": 1.4826,
+                "hpre_raw_logit_relative_vll": 1.0,
+            },
+        )
+        relative_gate = result[
+            "dgst_t_hpre_raw_logit_relative_vll_gate_per_layer"
+        ][0]
+        gaussian_gate = result["dgst_t_hpre_raw_logit_gauss_gate_per_layer"][0]
+        self.assertFalse(torch.allclose(relative_gate, gaussian_gate))
+        self.assertGreater(
+            float(relative_gate.max() - relative_gate.min()),
+            float(gaussian_gate.max() - gaussian_gate.min()),
+        )
+
+        source = result["dgst_t_source_dist_per_layer"][0]
+        attention_dist = result["dgst_t_attention_support_per_layer"][0]
+        for method, gate in (
+            ("hpre_raw_logit_gauss", gaussian_gate),
+            ("hpre_raw_logit_relative_vll", relative_gate),
+        ):
+            target = attention_dist * gate
+            target = target / target.sum()
+            support = _topk_union_indices(source, target, 4)
+            expected_problem = _prepare_transport_problem_for_state_cost(
+                source_dist=source,
+                target_dist=target,
+                states=h_prev[0, :4],
+                support=support,
+                sqrt_cosine=False,
+            )
+            expected_risk = _solve_transport_problem(expected_problem, "emd")
+            risk_key = f"dgst_t_{method}_risk_cosine_hpre_per_layer"
+            self.assertAlmostEqual(
+                float(result[risk_key][0]), expected_risk, places=6
+            )
+
+        record = _build_four_gate_feature_record(
+            image_id=13,
+            span={"word": "chair", "label": 1},
+            response_index=4,
+            target_token_id=1,
+            model_out=SimpleNamespace(token_id=1),
+            dgst_t=result,
+        )
+        matrix, labels = build_selected_matrix(
+            [record],
+            parse_feature_set(
+                "hpre_raw_logit_gauss_risk_cosine_matched_state+"
+                "hpre_raw_logit_relative_vll_risk_cosine_matched_state"
+            ),
+        )
+        self.assertEqual(matrix.shape, (1, 2))
+        self.assertEqual(labels.tolist(), [1])
+
     def test_sqrt_stateupd_alpha05_matches_requested_mixture(self) -> None:
         layer = self._output_layer()
         h_prev = torch.tensor(

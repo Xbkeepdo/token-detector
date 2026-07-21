@@ -23,6 +23,7 @@ from features.dgst_t import (
     _four_gate_risk_suffix,
     _target_comparison_state,
 )
+from utils.config_utils import resolve_dgst_four_gate_methods
 from utils.io_utils import append_pkl, load_json, load_pkl, save_pkl
 
 
@@ -523,17 +524,7 @@ def _resolve_active_dgst_config(cfg_dgst_t: dict) -> dict:
     resolved = dict(cfg_dgst_t or {})
     if not bool(resolved.get("enabled", True)):
         raise ValueError("feature_extraction.method is enabled but dgst_t.enabled=false.")
-    branches = resolved.get("branches")
-    if isinstance(branches, dict):
-        configured = resolved.get("four_gate_methods") or list(branches)
-        enabled_methods = [
-            str(method)
-            for method in configured
-            if bool(branches.get(str(method), True))
-        ]
-        if not enabled_methods:
-            raise ValueError("All four DGST branch switches are disabled.")
-        resolved["four_gate_methods"] = enabled_methods
+    resolved["four_gate_methods"] = resolve_dgst_four_gate_methods(resolved)
     return resolved
 
 
@@ -1208,7 +1199,16 @@ def _build_four_gate_feature_record(
     }
     for key in required_metadata:
         feat[key] = dgst_t[key]
+    if "dgst_t_mad_scale_by_method" in dgst_t:
+        feat["dgst_t_mad_scale_by_method"] = dict(
+            dgst_t["dgst_t_mad_scale_by_method"]
+        )
     feat["dgst_t_cost_modes"] = list(cost_modes)
+    if "dgst_t_cost_alphas" in dgst_t:
+        feat["dgst_t_cost_alphas"] = {
+            str(mode): float(alpha)
+            for mode, alpha in dgst_t["dgst_t_cost_alphas"].items()
+        }
     if "dgst_t_cost_alpha" in dgst_t:
         feat["dgst_t_cost_alpha"] = float(dgst_t["dgst_t_cost_alpha"])
     if has_raw_attention:

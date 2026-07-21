@@ -71,6 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--split-path",
+        default=None,
+        help=(
+            "Optional strict 8:2 image split JSON. Defaults to "
+            "<output-dir>/image_splits.json."
+        ),
+    )
     parser.add_argument("--device", default="auto")
     seed_group = parser.add_mutually_exclusive_group()
     seed_group.add_argument(
@@ -109,6 +117,41 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _load_training_image_splits(path: Path) -> Mapping[str, Sequence[int]]:
+    payload = load_json(str(path))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"Image split must be a mapping: {path}")
+    if set(payload) == {"train", "val", "test"}:
+        return payload
+
+    # Unified strict-8:2 experiment reports retain provenance/count fields and
+    # omit the empty compatibility ``val`` list.  Accept that known schema when
+    # an explicit --split-path is supplied, while still passing only the three
+    # canonical partitions to the shared validator below.
+    if str(payload.get("protocol") or "") == "strict_train80_test20_no_validation":
+        train = payload.get("train")
+        test = payload.get("test")
+        if not isinstance(train, list) or not isinstance(test, list):
+            raise ValueError(f"Invalid strict outer split lists: {path}")
+        expected_counts = {
+            "train": int(payload.get("train_images", -1)),
+            "val": int(payload.get("validation_images", -1)),
+            "test": int(payload.get("test_images", -1)),
+        }
+        actual_counts = {
+            "train": len(train),
+            "val": 0,
+            "test": len(test),
+        }
+        if expected_counts != actual_counts:
+            raise ValueError(
+                f"Strict outer split metadata mismatch in {path}: "
+                f"metadata={expected_counts}, actual={actual_counts}"
+            )
+        return {"train": train, "val": [], "test": test}
+    return payload
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -125,10 +168,14 @@ def main() -> None:
     baseline_dir = Path(args.output_dir) / str(
         baseline_cfg.get("output_subdir", "baseline")
     )
-    split_path = Path(args.output_dir) / "image_splits.json"
+    split_path = (
+        Path(args.split_path)
+        if args.split_path is not None
+        else Path(args.output_dir) / "image_splits.json"
+    )
     if not split_path.exists():
         raise FileNotFoundError(split_path)
-    image_splits = load_json(str(split_path))
+    image_splits = _load_training_image_splits(split_path)
     image_split_counts = validate_strict_82_split(image_splits)
     configured_count = int((config.get("dataset") or {}).get("num_images", 0))
     if configured_count and sum(image_split_counts.values()) != configured_count:
@@ -643,6 +690,7 @@ def _shared_probe_config(
     return TorchProbeConfig(
         hidden_sizes=hidden_sizes,
         dropout=float(probe_cfg.get("dropout", 0.3)),
+        drop_last=bool(probe_cfg.get("drop_last", False)),
         batch_size=int(probe_cfg.get("batch_size", 256)),
         num_epochs=int(probe_cfg.get(
             "max_epochs", probe_cfg.get("num_epochs", 100)
