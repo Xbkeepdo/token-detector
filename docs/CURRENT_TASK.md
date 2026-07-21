@@ -1,5 +1,12 @@
 # Current Task
 
+## 2026-07-21 Qwen2.5-VL VV/VP hpre-risk 与 FFAD 乘积曲线
+
+- 对 `outputs/qwen2_5_vl_7b/COCO4000-512-VVVP/features.pkl` 的完整 7,924 条 object-token 记录按原始标签分组：幻觉 `label=0` 共 972 条，非幻觉/real `label=1` 共 6,952 条；没有使用仅含 2/3 条记录的残留 `features.part0/1.pkl`。hpre-risk 严格读取当前主 cost `sqrt_cosine_matched_state` 的 VV/VP 训练字段，FFAD 组合严格按训练代码做逐层 Hadamard 乘积。
+- 新增可复现脚本 `scripts/plot_vv_vp_fad_risk_by_label.py`，输出 28 层、1-based 横轴、class 内 token 均值与 95% CI 的 2×2 PNG/PDF，并同时写逐层 CSV、机器可读 JSON 和 Markdown 摘要。产物位于 `outputs/qwen2_5_vl_7b/COCO4000-512-VVVP/analysis/vv_vp_fad_risk_by_label/`。
+- 全层均值 Hall/Real/Hall-Real：VV hpre-risk=`0.276035/0.254535/+0.021500`，VP hpre-risk=`0.410546/0.382826/+0.027721`；两者最大绝对差均在第 21 层，分别为 `+0.049516/+0.055561`。乘 FFAD 后全层差几乎消失：FFAD×VV=`0.084322/0.084546/-0.000225`，FFAD×VP=`0.148562/0.147675/+0.000887`；最大局部差分别在第 28 层 `-0.038404` 和第 27 层 `+0.042182`，且多层发生符号翻转。
+- 脚本 Python 编译、完整 artifact 运行、PNG/PDF 类型检查、CSV/JSON/Markdown 生成与输出 SHA256 校验均通过；本轮只做统计绘图，没有启动 GPU 抽取或训练。
+
 ## 2026-07-21 SVAR 改为全层抽取、训练仅使用第 5–18 层
 
 - SVAR 生产抽取不再按配置提前裁掉 decoder 层；controlled/official、COCO/QA 统一保存完整 `[layer, head]` visual-attention-ratio、全层扁平向量及绝对层范围 `[0,L)`。抽取 provenance 固定记录 `extraction_layers=all`，`layer_start/layer_end` 改为纯训练参数，修改训练层范围不会再误判为需要重抽其他 baseline。
