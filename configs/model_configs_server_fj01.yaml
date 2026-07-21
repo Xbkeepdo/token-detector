@@ -317,7 +317,8 @@ training:
   baseline:
     # Training-only selection: this does not change/re-extract baseline/features.pkl.
     # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
-    trainer: "shared_torch_mlp"             # Same 128→64→32 Torch MLP as method probes.
+    # Run both heads on the same split/seeds and emit a side-by-side report.
+    trainers: ["native_paper", "shared_torch_mlp"]
     methods: ["metatoken", "svar", "projectaway"]
     positive_class: "real"                  # real | hallucination; train F1 selects its threshold.
     seeds: [43, 44, 45]                     # Use [43] for a quick single-seed run.

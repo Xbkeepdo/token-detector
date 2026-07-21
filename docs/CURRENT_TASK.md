@@ -1,5 +1,14 @@
 # Current Task
 
+## 2026-07-22 COCO baseline 原方法与 YAML 三层 MLP 对比
+
+- `training.baseline` 从单个 `trainer` 扩展为有序 `trainers`，两份活动 YAML 默认同时运行 `native_paper` 与 `shared_torch_mlp`；CLI 保留 `--trainer` 单头兼容入口，并新增 `--trainers` 临时覆盖。默认比较范围严格为两种 head 都支持的 MetaToken、SVAR、ProjectAway，不把 DHCP/HalLoc 强行改造成不对应其原方法的 dense MLP。
+- 原生 MetaToken-LR/GB、SVAR 单层 MLP和 training-free ProjectAway 现在与方法 probe 使用相同的报告 schema：同一权重同时评估固定 `0.5` 与 train-F1 搜索阈值，每套均保存 Accuracy，以及 Real/Hall 两种正类各自的 Precision、Recall、F1、AUROC、AUPR。旧 headline 扁平字段继续保留，避免已有汇总读取器失效。
+- 双头运行严格共用同一份 baseline 特征、image split、token cohort、seeds 和指标实现；原生结果隔离到 `baseline/results/native_paper/` 与 `baseline/checkpoints/native_paper/`，共享三层 MLP 保持原隔离目录。新的 JSON/Markdown 对比表写入 `baseline/results/comparison/`，逐行标明原方法 head 或 YAML 三层 MLP，不覆盖已有实验。
+- YAML 三层 MLP 继续直接读取 `training.torch_probe`：`128→64→32`、Linear-BatchNorm-ReLU-Dropout、dropout `0.3`、`drop_last=true`、Adam `lr=1e-3`、weight decay `1e-5`、batch `256`、最多 `100` epochs、minimum-train-loss checkpoint；没有在脚本中复制第二套隐藏超参。
+- 兼容性：只有 COCO 双头运行显式启用 native 目录 namespace；QA baseline 和 `--trainer native_paper` 单头旧调用仍沿用原路径。验证已覆盖 trainer 列表解析、双阈值双正类指标、三 seed 聚合、Markdown 和 native-vs-MLP JSON/Markdown 生成；`tests.test_train_baseline_reporting` 8/8、`tests.test_svar_protocols` 11/11、两份生产 YAML 加载、CLI help、`py_compile` 与 `git diff --check` 通过。`td` 环境第一次尝试 `pytest` 在收集前报 `No module named pytest`，随后改用仓库兼容的 `unittest` 全部通过，不是实现失败。第一次正式命令又在训练前暴露 `trainer_namespace` 误加到 shared 签名，报 `unexpected keyword argument`；修正到 native 签名并增加双签名回归断言后，正式重跑完成。
+- 已在当前 `run.sh` 活动实验 `outputs/llava_1_5_7b/COCO4000-512-ENDAC` 上完成 seeds `43/44/45` 正式双头训练；复用严格 3200/800 image split 和 10109/2577 token 样本，没有重提特征。train-F1 阈值下，原生 SVAR 的 Accuracy/Real-F1/Hall-F1/AUROC 为 `0.8439/0.8964/0.6830/0.9063`，对应 YAML 三层 MLP 为 `0.8293/0.8862/0.6578/0.8851`；MetaToken 原生 LR 为 `0.8386/0.8947/0.6539/0.9002`，三层 MLP 为 `0.8252/0.8893/0.5852/0.8827`；ProjectAway 原规则为 `0.7621/0.8583/0.2606/0.7652`，三层 MLP 为 `0.7691/0.8616/0.3040/0.8121`。完整两阈值、双正类报告位于 `baseline/results/comparison/llava_1_5_7b_baselines_native_vs_shared_mlp_3seed_summary.md`；14 个 trainer×method×threshold 行的所有指标均为有限值，GPU 训练结束后已释放。
+
 ## 2026-07-21 hpre raw-logit Gaussian 的 VV/VP state-update alpha sweep
 
 - 两份活动 YAML 均收敛到 `method_only`、唯一 target 方法 `hpre_raw_logit_gauss`、`target_modes=[raw_logit_gauss]` 与 `support_modes=[vv,vp]`；Relative-VLL、hmid、softmax-prob、raw-attention 和 FAD 均未启用。主 `cost_mode` 固定为 `sqrt_matched_state`，无后缀主 risk 继续解析到 matched-state 字段。

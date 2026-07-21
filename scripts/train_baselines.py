@@ -64,6 +64,7 @@ SUMMARY_METRICS = (
     "aupr",
     "other_f1",
 )
+CLASS_METRICS = ("precision", "recall", "f1", "auc", "aupr")
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,13 +101,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the configured baseline methods (for example, omit halloc).",
     )
-    parser.add_argument(
+    trainer_group = parser.add_mutually_exclusive_group()
+    trainer_group.add_argument(
         "--trainer",
         choices=("native_paper", "shared_torch_mlp"),
         default=None,
         help=(
             "Override training.baseline.trainer. shared_torch_mlp gives every "
             "dense baseline the same configured three-hidden-layer probe."
+        ),
+    )
+    trainer_group.add_argument(
+        "--trainers",
+        nargs="+",
+        choices=("native_paper", "shared_torch_mlp"),
+        default=None,
+        help=(
+            "Run one or both classifier heads. Overrides "
+            "training.baseline.trainers."
         ),
     )
     parser.add_argument(
@@ -214,11 +226,9 @@ def main() -> None:
     positive_class = _normalize_reporting_positive_class(
         training_cfg.get("positive_class", "real")
     )
-    trainer = _normalize_baseline_trainer(
-        args.trainer or training_cfg.get("trainer", "native_paper")
-    )
+    trainers = _configured_baseline_trainers(args, training_cfg)
     probe_cfg = (config.get("training") or {}).get("torch_probe") or {}
-    if trainer == "shared_torch_mlp" and not isinstance(probe_cfg, Mapping):
+    if "shared_torch_mlp" in trainers and not isinstance(probe_cfg, Mapping):
         raise ValueError(
             "shared_torch_mlp requires training.torch_probe to be a mapping"
         )
@@ -254,16 +264,28 @@ def main() -> None:
             "write_summary": write_summary,
             "positive_class": positive_class,
         }
-        if trainer == "shared_torch_mlp":
-            _run_shared_mlp_protocol(
-                **training_kwargs,
+        trainer_runs = {}
+        for trainer in trainers:
+            if trainer == "shared_torch_mlp":
+                trainer_runs[trainer] = _run_shared_mlp_protocol(
+                    **training_kwargs,
+                    probe_cfg=dict(probe_cfg),
+                    baseline_cfg=baseline_cfg,
+                )
+            else:
+                trainer_runs[trainer] = _run_training_protocol(
+                    **training_kwargs,
+                    baseline_cfg=baseline_cfg,
+                    trainer_namespace=(
+                        "native_paper" if len(trainers) > 1 else None
+                    ),
+                )
+        if write_summary and len(trainer_runs) > 1:
+            _write_trainer_comparison(
+                result_root=baseline_dir,
+                result_stem=f"{args.model}_baselines",
+                trainer_runs=trainer_runs,
                 probe_cfg=dict(probe_cfg),
-                baseline_cfg=baseline_cfg,
-            )
-        else:
-            _run_training_protocol(
-                **training_kwargs,
-                baseline_cfg=baseline_cfg,
             )
 
     if official_svar_enabled:
@@ -311,16 +333,28 @@ def main() -> None:
             "write_summary": write_summary,
             "positive_class": positive_class,
         }
-        if trainer == "shared_torch_mlp":
-            _run_shared_mlp_protocol(
-                **training_kwargs,
+        trainer_runs = {}
+        for trainer in trainers:
+            if trainer == "shared_torch_mlp":
+                trainer_runs[trainer] = _run_shared_mlp_protocol(
+                    **training_kwargs,
+                    probe_cfg=dict(probe_cfg),
+                    baseline_cfg=baseline_cfg,
+                )
+            else:
+                trainer_runs[trainer] = _run_training_protocol(
+                    **training_kwargs,
+                    baseline_cfg=baseline_cfg,
+                    trainer_namespace=(
+                        "native_paper" if len(trainers) > 1 else None
+                    ),
+                )
+        if write_summary and len(trainer_runs) > 1:
+            _write_trainer_comparison(
+                result_root=official_dir,
+                result_stem=f"{args.model}_svar_official",
+                trainer_runs=trainer_runs,
                 probe_cfg=dict(probe_cfg),
-                baseline_cfg=baseline_cfg,
-            )
-        else:
-            _run_training_protocol(
-                **training_kwargs,
-                baseline_cfg=baseline_cfg,
             )
 
 
@@ -472,7 +506,7 @@ def _run_shared_mlp_protocol(
     write_summary: bool,
     positive_class: str,
     sample_audit: Optional[Mapping[str, Any]] = None,
-) -> None:
+) -> tuple[dict[str, Any], list[Path]]:
     """Train every dense baseline with the same configured Torch probe."""
 
     supported = {"metatoken", "svar", "projectaway"}
@@ -585,12 +619,12 @@ def _run_shared_mlp_protocol(
             )
         print(f"[BaselineSharedMLP] saved {seed_path}")
 
+    summary = aggregate_baseline_outputs(
+        run_outputs, positive_class=positive_class
+    )
+    summary["trainer"] = "shared_torch_mlp"
+    summary["seed_result_paths"] = [str(path) for path in run_paths]
     if write_summary:
-        summary = aggregate_baseline_outputs(
-            run_outputs, positive_class=positive_class
-        )
-        summary["trainer"] = "shared_torch_mlp"
-        summary["seed_result_paths"] = [str(path) for path in run_paths]
         stem = f"{result_stem}_shared_torch_mlp_{len(seeds)}seed"
         json_path = result_dir / f"{stem}.json"
         markdown_path = result_dir / f"{stem}_summary.md"
@@ -602,6 +636,7 @@ def _run_shared_mlp_protocol(
         )
         print(f"[BaselineSharedMLP] saved {json_path}")
         print(f"[BaselineSharedMLP] saved {markdown_path}")
+    return summary, run_paths
 
 
 def _shared_mlp_baseline_matrix(
@@ -763,7 +798,8 @@ def _run_training_protocol(
     write_summary: bool,
     positive_class: str,
     sample_audit: Optional[Mapping[str, Any]] = None,
-) -> None:
+    trainer_namespace: Optional[str] = None,
+) -> tuple[dict[str, Any], list[Path]]:
     run_outputs: list[dict[str, Any]] = []
     run_paths: list[Path] = []
     for seed in seeds:
@@ -789,6 +825,7 @@ def _run_training_protocol(
             label_protocol=label_protocol,
             sample_audit=sample_audit,
             positive_class=positive_class,
+            trainer_namespace=trainer_namespace,
         )
         run_outputs.append(output)
         run_paths.append(result_path)
@@ -801,7 +838,15 @@ def _run_training_protocol(
             result_paths=run_paths,
             result_stem=result_stem,
             positive_class=positive_class,
+            trainer_namespace=trainer_namespace,
         )
+    summary = aggregate_baseline_outputs(
+        run_outputs,
+        positive_class=positive_class,
+    )
+    summary["trainer"] = "native_paper"
+    summary["seed_result_paths"] = [str(path) for path in run_paths]
+    return summary, run_paths
 
 
 def _train_one_seed(
@@ -823,9 +868,14 @@ def _train_one_seed(
     ),
     sample_audit: Optional[Mapping[str, Any]] = None,
     positive_class: str = "real",
+    trainer_namespace: Optional[str] = None,
 ) -> tuple[dict[str, Any], Path]:
     result_dir = baseline_dir / "results"
     checkpoint_dir = baseline_dir / "checkpoints"
+    if trainer_namespace is not None:
+        namespace = _safe_run_name(trainer_namespace)
+        result_dir = result_dir / namespace
+        checkpoint_dir = checkpoint_dir / namespace
     if run_name is not None:
         run_name = _safe_run_name(run_name)
         result_dir = result_dir / run_name
@@ -837,6 +887,7 @@ def _train_one_seed(
     output: dict[str, Any] = {
         "model": model,
         "seed": int(seed),
+        "trainer": "native_paper",
         "configured_methods": list(methods),
         "feature_path": str(feature_path),
         "split_path": str(split_path),
@@ -905,6 +956,16 @@ def _train_one_seed(
         output["methods"][method] = result
         save_json(output, str(result_path))
 
+    variants = _baseline_method_variants(output)
+    if variants and all(
+        {"fixed_0.5", "train_f1"}.issubset(
+            (result.get("threshold_reports") or {}).keys()
+        )
+        for _, result in variants.values()
+    ):
+        output["threshold_reporting"] = ["fixed_0.5", "train_f1"]
+        save_json(output, str(result_path))
+
     print(f"[BaselineTrain] saved {result_path}")
     return output, result_path
 
@@ -935,6 +996,7 @@ def _baseline_training_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "write_summary",
         "positive_class",
         "trainer",
+        "trainers",
     }
     unknown = sorted(set(baseline) - allowed)
     if unknown:
@@ -958,6 +1020,32 @@ def _normalize_baseline_trainer(value: object) -> str:
             "training.baseline.trainer must be native_paper or "
             f"shared_torch_mlp, got {value!r}"
         )
+    return normalized
+
+
+def _configured_baseline_trainers(
+    args: argparse.Namespace,
+    training_cfg: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Resolve an ordered, duplicate-free list of baseline classifier heads."""
+
+    if args.trainers is not None:
+        values: object = args.trainers
+    elif args.trainer is not None:
+        values = [args.trainer]
+    elif "trainers" in training_cfg:
+        values = training_cfg["trainers"]
+    else:
+        values = [training_cfg.get("trainer", "native_paper")]
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, Sequence) or not values:
+        raise ValueError("training.baseline.trainers must be a non-empty list")
+    normalized = tuple(
+        dict.fromkeys(_normalize_baseline_trainer(value) for value in values)
+    )
+    if not normalized:
+        raise ValueError("No baseline trainers selected")
     return normalized
 
 
@@ -1013,6 +1101,7 @@ def _write_training_summaries(
     result_paths: Sequence[Path],
     result_stem: Optional[str] = None,
     positive_class: str = "real",
+    trainer_namespace: Optional[str] = None,
 ) -> None:
     if len(outputs) != len(result_paths):
         raise ValueError("Baseline outputs and result paths must have equal length")
@@ -1036,6 +1125,8 @@ def _write_training_summaries(
             positive_class=positive_class,
         )
         result_dir = baseline_dir / "results"
+        if trainer_namespace is not None:
+            result_dir = result_dir / _safe_run_name(trainer_namespace)
         result_dir.mkdir(parents=True, exist_ok=True)
         stem = f"{base_stem}_{len(outputs)}seed"
         json_path = result_dir / f"{stem}.json"
@@ -1049,6 +1140,150 @@ def _write_training_summaries(
         )
         print(f"[BaselineTrain] saved {json_path}")
         print(f"[BaselineTrain] saved {markdown_path}")
+
+
+def _write_trainer_comparison(
+    *,
+    result_root: Path,
+    result_stem: str,
+    trainer_runs: Mapping[
+        str,
+        tuple[Mapping[str, Any], Sequence[Path]],
+    ],
+    probe_cfg: Mapping[str, Any],
+) -> None:
+    """Write a side-by-side native-head versus YAML-MLP report."""
+
+    required = {"native_paper", "shared_torch_mlp"}
+    if set(trainer_runs) != required:
+        raise ValueError(
+            "Trainer comparison requires native_paper and shared_torch_mlp"
+        )
+    summaries = {
+        trainer: run[0]
+        for trainer, run in trainer_runs.items()
+    }
+    native = summaries["native_paper"]
+    shared = summaries["shared_torch_mlp"]
+    for field in (
+        "model",
+        "seeds",
+        "split_protocol",
+        "label_protocol",
+        "counts",
+        "image_split_counts",
+    ):
+        if native.get(field) != shared.get(field):
+            raise ValueError(
+                f"Trainer comparison mismatch for {field}: "
+                f"{native.get(field)!r} != {shared.get(field)!r}"
+            )
+
+    rows: list[dict[str, Any]] = []
+    for trainer in ("native_paper", "shared_torch_mlp"):
+        summary = summaries[trainer]
+        for method_key, method_row in (summary.get("methods") or {}).items():
+            reports = method_row.get("threshold_reports") or {}
+            for threshold_mode in ("train_f1", "fixed_0.5"):
+                if threshold_mode not in reports:
+                    continue
+                rows.append({
+                    "trainer": trainer,
+                    "method_key": method_key,
+                    "display_name": method_row["display_name"],
+                    "threshold_mode": threshold_mode,
+                    "threshold": reports[threshold_mode]["threshold"],
+                    "test_metrics": reports[threshold_mode]["test_metrics"],
+                })
+
+    source_paths = {
+        trainer: [str(path) for path in run[1]]
+        for trainer, run in trainer_runs.items()
+    }
+    payload = {
+        "model": native["model"],
+        "comparison": "native_paper_vs_yaml_shared_three_layer_mlp",
+        "seeds": native["seeds"],
+        "std_definition": native.get("std_definition"),
+        "split_protocol": native.get("split_protocol"),
+        "label_protocol": native.get("label_protocol"),
+        "counts": native.get("counts"),
+        "image_split_counts": native.get("image_split_counts"),
+        "threshold_reporting": ["train_f1", "fixed_0.5"],
+        "yaml_shared_mlp_config": dict(probe_cfg),
+        "source_paths": source_paths,
+        "rows": rows,
+    }
+    output_dir = result_root / "results" / "comparison"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{result_stem}_native_vs_shared_mlp_{len(native['seeds'])}seed"
+    json_path = output_dir / f"{stem}.json"
+    markdown_path = output_dir / f"{stem}_summary.md"
+    save_json(payload, str(json_path))
+    _write_trainer_comparison_markdown(markdown_path, payload)
+    print(f"[BaselineCompare] saved {json_path}")
+    print(f"[BaselineCompare] saved {markdown_path}")
+
+
+def _write_trainer_comparison_markdown(
+    path: Path,
+    comparison: Mapping[str, Any],
+) -> None:
+    seeds = list(comparison["seeds"])
+    multi_seed = len(seeds) > 1
+    probe = comparison.get("yaml_shared_mlp_config") or {}
+    lines = [
+        f"# {comparison['model']} baseline 原方法 vs YAML 三层 MLP",
+        "",
+        "## 公平比较协议",
+        "",
+        "- 两组使用完全相同的 image split、token 样本、随机种子和指标实现。",
+        "- 原方法保留论文/仓库定义的分类头；共享 MLP 只替换分类头，不重提特征。",
+        "- test 仅作最终评估；同时报告 train-F1 搜索阈值与固定 0.5。",
+        f"- 随机种子：`{', '.join(str(seed) for seed in seeds)}`。",
+        "- YAML MLP：hidden_sizes={}，BatchNorm={}，dropout={}，drop_last={}。".format(
+            probe.get("hidden_sizes"),
+            probe.get("batch_norm"),
+            probe.get("dropout"),
+            probe.get("drop_last"),
+        ),
+        "- 指标为总体均值"
+        + (" ± 总体标准差。" if multi_seed else "（单 seed）。"),
+    ]
+    trainer_labels = {
+        "native_paper": "Baseline 原方法",
+        "shared_torch_mlp": "YAML 三层 MLP",
+    }
+    for mode, title in (
+        ("train_f1", "Test（train-F1 搜索阈值）"),
+        ("fixed_0.5", "Test（固定阈值 0.5）"),
+    ):
+        lines.extend([
+            "",
+            f"## {title}",
+            "",
+            "| 分类头 | 方法 | Threshold | Accuracy | Real P | Real R | "
+            "Real F1 | Real AUROC | Real AUPR | Hall P | Hall R | Hall F1 | "
+            "Hall AUROC | Hall AUPR |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+        for row in comparison["rows"]:
+            if row["threshold_mode"] != mode:
+                continue
+            metrics = row["test_metrics"]
+            formatted = [
+                _format_summary_value(row["threshold"], multi_seed),
+                *(
+                    _format_summary_value(metric, multi_seed)
+                    for metric in _dual_summary_metric_sequence(metrics)
+                ),
+            ]
+            lines.append(
+                f"| {trainer_labels[row['trainer']]} | {row['display_name']} | "
+                + " | ".join(formatted)
+                + " |"
+            )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def aggregate_baseline_outputs(
@@ -1098,6 +1333,21 @@ def aggregate_baseline_outputs(
                 )
                 for metric in SUMMARY_METRICS
             }
+            full_metrics = [
+                _result_metrics_payload(
+                    _baseline_method_variants(output)[key][1],
+                    split,
+                )
+                for output in outputs
+            ]
+            for class_key in ("real_positive", "hallucination_positive"):
+                row[f"{split}_metrics"][class_key] = {
+                    metric: _metric_statistics([
+                        float(values[class_key][metric])
+                        for values in full_metrics
+                    ])
+                    for metric in CLASS_METRICS
+                }
         first_result = first_variants[key][1]
         first_reports = first_result.get("threshold_reports") or {}
         if first_reports:
@@ -1135,6 +1385,25 @@ def aggregate_baseline_outputs(
                         ])
                         for metric in SUMMARY_METRICS
                     }
+                    full_metrics = [
+                        _result_metrics_payload(
+                            _baseline_method_variants(output)[key][1],
+                            split,
+                            threshold_mode=mode,
+                        )
+                        for output in outputs
+                    ]
+                    for class_key in (
+                        "real_positive",
+                        "hallucination_positive",
+                    ):
+                        mode_row[f"{split}_metrics"][class_key] = {
+                            metric: _metric_statistics([
+                                float(values[class_key][metric])
+                                for values in full_metrics
+                            ])
+                            for metric in CLASS_METRICS
+                        }
                 row["threshold_reports"][mode] = mode_row
         rows[key] = row
 
@@ -1205,12 +1474,11 @@ def _headline_metrics(
     positive_class: str,
     threshold_mode: str | None = None,
 ) -> dict[str, float]:
-    if threshold_mode is None:
-        metrics = result.get(f"{split}_metrics") or {}
-    else:
-        reports = result.get("threshold_reports") or {}
-        report = reports.get(threshold_mode) or {}
-        metrics = report.get(f"{split}_metrics") or {}
+    metrics = _result_metrics_payload(
+        result,
+        split,
+        threshold_mode=threshold_mode,
+    )
     hallucination = metrics.get("hallucination_positive") or {}
     real = metrics.get("real_positive") or {}
     positive = real if positive_class == "real" else hallucination
@@ -1224,6 +1492,23 @@ def _headline_metrics(
         "aupr": float(positive["aupr"]),
         "other_f1": float(other["f1"]),
     }
+
+
+def _result_metrics_payload(
+    result: Mapping[str, Any],
+    split: str,
+    *,
+    threshold_mode: str | None = None,
+) -> Mapping[str, Any]:
+    if threshold_mode is None:
+        metrics = result.get(f"{split}_metrics") or {}
+    else:
+        reports = result.get("threshold_reports") or {}
+        report = reports.get(threshold_mode) or {}
+        metrics = report.get(f"{split}_metrics") or {}
+    if not isinstance(metrics, Mapping):
+        raise ValueError(f"Invalid {split} metric payload")
+    return metrics
 
 
 def _metric_statistics(values: Sequence[float]) -> dict[str, Any]:
@@ -1332,10 +1617,9 @@ def _write_baseline_markdown(
                 if dual_threshold else "## Test 结果"
             ),
             "",
-            f"| 方法 | Accuracy | {positive_label} Precision | "
-            f"{positive_label} Recall | {positive_label} F1 | AUROC | AUPR | "
-            f"{other_label} F1 |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|",
+            "| 方法 | Accuracy | Real P | Real R | Real F1 | Real AUROC | "
+            "Real AUPR | Hall P | Hall R | Hall F1 | Hall AUROC | Hall AUPR |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in methods.values():
@@ -1343,8 +1627,8 @@ def _write_baseline_markdown(
         lines.append(
             f"| {row['display_name']} | "
             + " | ".join(
-                _format_summary_value(metrics[metric], multi_seed)
-                for metric in SUMMARY_METRICS
+                _format_summary_value(metric, multi_seed)
+                for metric in _dual_summary_metric_sequence(metrics)
             )
             + " |"
         )
@@ -1354,10 +1638,9 @@ def _write_baseline_markdown(
                 "",
                 "## Test 结果（固定阈值 0.5）",
                 "",
-                f"| 方法 | Accuracy | {positive_label} Precision | "
-                f"{positive_label} Recall | {positive_label} F1 | AUROC | AUPR | "
-                f"{other_label} F1 |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|",
+                "| 方法 | Accuracy | Real P | Real R | Real F1 | Real AUROC | "
+                "Real AUPR | Hall P | Hall R | Hall F1 | Hall AUROC | Hall AUPR |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in methods.values():
@@ -1365,8 +1648,8 @@ def _write_baseline_markdown(
             lines.append(
                 f"| {row['display_name']} | "
                 + " | ".join(
-                    _format_summary_value(metrics[metric], multi_seed)
-                    for metric in SUMMARY_METRICS
+                    _format_summary_value(metric, multi_seed)
+                    for metric in _dual_summary_metric_sequence(metrics)
                 )
                 + " |"
             )
@@ -1375,10 +1658,9 @@ def _write_baseline_markdown(
             "",
             "## Train 结果（train-F1 模式在此选择阈值）",
             "",
-            f"| 方法 | Accuracy | {positive_label} Precision | "
-            f"{positive_label} Recall | {positive_label} F1 | AUROC | AUPR | "
-            f"{other_label} F1 |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|",
+            "| 方法 | Accuracy | Real P | Real R | Real F1 | Real AUROC | "
+            "Real AUPR | Hall P | Hall R | Hall F1 | Hall AUROC | Hall AUPR |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in methods.values():
@@ -1386,8 +1668,8 @@ def _write_baseline_markdown(
         lines.append(
             f"| {row['display_name']} | "
             + " | ".join(
-                _format_summary_value(metrics[metric], multi_seed)
-                for metric in SUMMARY_METRICS
+                _format_summary_value(metric, multi_seed)
+                for metric in _dual_summary_metric_sequence(metrics)
             )
             + " |"
         )
@@ -1431,6 +1713,50 @@ def _format_summary_value(statistics: Mapping[str, Any], multi_seed: bool) -> st
     if not multi_seed:
         return f"{mean:.4f}"
     return f"{mean:.4f} ± {float(statistics['std']):.4f}"
+
+
+def _dual_summary_metric_sequence(
+    metrics: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    values = [metrics["accuracy"]]
+    for class_key in ("real_positive", "hallucination_positive"):
+        values.extend(metrics[class_key][metric] for metric in CLASS_METRICS)
+    return values
+
+
+def _build_threshold_reports(
+    *,
+    train_labels: Sequence[int],
+    train_scores: Sequence[float],
+    test_labels: Sequence[int],
+    test_scores: Sequence[float],
+    selected_threshold: float,
+    positive_class: str,
+    fixed_threshold: float = 0.5,
+) -> dict[str, Any]:
+    """Evaluate one trained head with the same two thresholds as method probes."""
+
+    reports: dict[str, Any] = {}
+    for mode, threshold in (
+        ("fixed_0.5", float(fixed_threshold)),
+        ("train_f1", float(selected_threshold)),
+    ):
+        reports[mode] = {
+            "threshold": threshold,
+            "train_metrics": evaluate_detection_scores(
+                train_labels,
+                train_scores,
+                threshold,
+                positive_class=positive_class,
+            ),
+            "test_metrics": evaluate_detection_scores(
+                test_labels,
+                test_scores,
+                threshold,
+                positive_class=positive_class,
+            ),
+        }
+    return reports
 
 
 def _train_metatoken(
@@ -1497,6 +1823,14 @@ def _train_metatoken(
                 threshold,
                 positive_class=positive_class,
             ),
+            "threshold_reports": _build_threshold_reports(
+                train_labels=matrices["val"][1],
+                train_scores=val_scores,
+                test_labels=matrices["test"][1],
+                test_scores=test_scores,
+                selected_threshold=threshold,
+                positive_class=positive_class,
+            ),
             "checkpoint": str(path),
             "selection_protocol": (
                 "fixed_last_fit_train_f1_threshold"
@@ -1557,6 +1891,17 @@ def _train_svar(
             cfg.get("_strict_82_no_validation", False)
         ),
     )
+    chosen_device = torch.device(device)
+    train_scores = torch_hallucination_scores(
+        model,
+        matrices["val"][0],
+        chosen_device,
+    )
+    test_scores = torch_hallucination_scores(
+        model,
+        matrices["test"][0],
+        chosen_device,
+    )
     path = checkpoint_dir / "svar.pt"
     _atomic_torch_save(
         path,
@@ -1594,6 +1939,14 @@ def _train_svar(
         "threshold_score_class": str(positive_class),
         "val_metrics": trained.val_metrics,
         "test_metrics": trained.test_metrics,
+        "threshold_reports": _build_threshold_reports(
+            train_labels=matrices["val"][1],
+            train_scores=train_scores,
+            test_labels=matrices["test"][1],
+            test_scores=test_scores,
+            selected_threshold=trained.threshold,
+            positive_class=positive_class,
+        ),
         "history": trained.history,
         "checkpoint": str(path),
     }
@@ -1805,6 +2158,14 @@ def _evaluate_projectaway(
             labels["test"],
             scores["test"],
             threshold,
+            positive_class=positive_class,
+        ),
+        "threshold_reports": _build_threshold_reports(
+            train_labels=labels["val"],
+            train_scores=scores["val"],
+            test_labels=labels["test"],
+            test_scores=scores["test"],
+            selected_threshold=threshold,
             positive_class=positive_class,
         ),
     }
