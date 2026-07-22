@@ -70,6 +70,15 @@ class QAAnswerOnlyConfigTests(unittest.TestCase):
             {"mode": "all", "method": True, "ads_cgc": True, "baseline": True},
         )
 
+    def test_clevr_9k_defaults_are_configured(self) -> None:
+        config = load_config(str(ROOT / "configs/model_configs_unified.yaml"))
+        self.assertEqual(
+            config["qa_benchmarks"]["clevr_dataset_name"], "clevr_exist_9k"
+        )
+        self.assertEqual(config["qa_benchmarks"]["clevr_train_questions"], 7200)
+        self.assertEqual(config["qa_benchmarks"]["clevr_val_questions"], 0)
+        self.assertEqual(config["qa_benchmarks"]["clevr_test_questions"], 1800)
+
     def test_qa_extraction_modes_match_coco_family_semantics(self) -> None:
         base = {
             "feature_extraction": {

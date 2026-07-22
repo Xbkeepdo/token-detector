@@ -10,4 +10,4 @@ fi
 OUT=outputs/qa_benchmarks_smoke
 export CUDA_VISIBLE_DEVICES=1
 "$PYTHON_BIN" scripts/qa_pipeline.py --model internvl_2_5_8b --dataset pope --output-root "$OUT" --limit 10 --stage all --feature-shard-size 2
-"$PYTHON_BIN" scripts/qa_pipeline.py --model internvl_2_5_8b --dataset clevr_exist_5k --output-root "$OUT" --limit 10 --stage all --feature-shard-size 2
+"$PYTHON_BIN" scripts/qa_pipeline.py --model internvl_2_5_8b --dataset clevr_exist_9k --output-root "$OUT" --limit 10 --stage all --feature-shard-size 2

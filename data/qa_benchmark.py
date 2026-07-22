@@ -199,18 +199,22 @@ def prepare_clevr_exist(
     clevr_root: str,
     output_dir: str,
     seed: int = 42,
-    train_count: int = 4000,
+    train_count: int = 7200,
     val_count: int = 0,
-    test_count: int = 1000,
+    test_count: int = 1800,
+    dataset_name: str = "clevr_exist_9k",
 ) -> list[dict]:
     if int(val_count) != 0:
         raise ValueError(
             "Strict outer 8:2 CLEVR protocol requires val_count=0; "
             "this protocol does not use a validation split"
         )
+    dataset_name = str(dataset_name).strip()
+    if not dataset_name:
+        raise ValueError("CLEVR dataset_name cannot be empty")
     root = Path(clevr_root)
-    train = _load_clevr_exist(root, "train")
-    official_val = _load_clevr_exist(root, "val")
+    train = _load_clevr_exist(root, "train", dataset_name=dataset_name)
+    official_val = _load_clevr_exist(root, "val", dataset_name=dataset_name)
     rng = random.Random(seed)
     selected_train = rng.sample(train, train_count)
 
@@ -245,7 +249,7 @@ def prepare_clevr_exist(
         questions,
         image_splits,
         seed,
-        "CLEVR official exist 5K subset",
+        f"CLEVR official exist {len(questions)}-question subset",
     )
     return questions
 
@@ -388,7 +392,11 @@ def _physical_image_identity(row: dict) -> tuple:
     return dataset, str(row.get("source_split") or ""), image_id
 
 
-def _load_clevr_exist(root: Path, source_split: str) -> list[dict]:
+def _load_clevr_exist(
+    root: Path,
+    source_split: str,
+    dataset_name: str = "clevr_exist_9k",
+) -> list[dict]:
     path = root / "questions" / f"CLEVR_{source_split}_questions.json"
     with open(path, encoding="utf-8") as handle:
         raw = json.load(handle)
@@ -405,7 +413,7 @@ def _load_clevr_exist(root: Path, source_split: str) -> list[dict]:
             program,
         )
         row = {
-            "dataset": "clevr_exist_5k",
+            "dataset": str(dataset_name),
             "source_split": source_split,
             "question_id": int(item["question_index"]),
             "image_id": int(item["image_index"]),

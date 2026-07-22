@@ -57,21 +57,21 @@ run_pipeline internvl_2_5_8b pope 0 "$LOGS/internvl_pope.log"
 validate_run internvl_2_5_8b pope 9000
 
 echo "[coordinator] all POPE extraction complete; starting CLEVR"
-run_pipeline llava_1_5_7b clevr_exist_5k 0 "$LOGS/llava_clevr.log" &
+run_pipeline llava_1_5_7b clevr_exist_9k 0 "$LOGS/llava_clevr.log" &
 pid_llava=$!
-run_pipeline qwen2_5_vl_7b clevr_exist_5k 1 "$LOGS/qwen_clevr.log" &
+run_pipeline qwen2_5_vl_7b clevr_exist_9k 1 "$LOGS/qwen_clevr.log" &
 pid_qwen=$!
 wait "$pid_llava"
 wait "$pid_qwen"
-validate_run llava_1_5_7b clevr_exist_5k 5000
-validate_run qwen2_5_vl_7b clevr_exist_5k 5000
+validate_run llava_1_5_7b clevr_exist_9k 9000
+validate_run qwen2_5_vl_7b clevr_exist_9k 9000
 
-run_pipeline internvl_2_5_8b clevr_exist_5k 0 "$LOGS/internvl_clevr.log"
-validate_run internvl_2_5_8b clevr_exist_5k 5000
+run_pipeline internvl_2_5_8b clevr_exist_9k 0 "$LOGS/internvl_clevr.log"
+validate_run internvl_2_5_8b clevr_exist_9k 9000
 
 echo "[coordinator] summarizing original-model results"
 for model in llava_1_5_7b qwen2_5_vl_7b internvl_2_5_8b; do
-  for dataset in pope clevr_exist_5k; do
+  for dataset in pope clevr_exist_9k; do
     "$PYTHON_BIN" scripts/summarize_qa_generations.py --run-dir "$ROOT/$model/$dataset"
   done
 done
@@ -80,15 +80,15 @@ echo "[coordinator] starting strict outer 8:2 probes"
 (
   export CUDA_VISIBLE_DEVICES=0
   "$PYTHON_BIN" scripts/train_qa_probes.py --model llava_1_5_7b --dataset pope --config "$CONFIG" --output-root "$ROOT"
-  "$PYTHON_BIN" scripts/train_qa_probes.py --model llava_1_5_7b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
+  "$PYTHON_BIN" scripts/train_qa_probes.py --model llava_1_5_7b --dataset clevr_exist_9k --config "$CONFIG" --output-root "$ROOT"
   "$PYTHON_BIN" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset pope --config "$CONFIG" --output-root "$ROOT"
-  "$PYTHON_BIN" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
+  "$PYTHON_BIN" scripts/train_qa_probes.py --model internvl_2_5_8b --dataset clevr_exist_9k --config "$CONFIG" --output-root "$ROOT"
 ) > "$LOGS/probes_gpu0.log" 2>&1 &
 pid_probe0=$!
 (
   export CUDA_VISIBLE_DEVICES=1
   "$PYTHON_BIN" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset pope --config "$CONFIG" --output-root "$ROOT"
-  "$PYTHON_BIN" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset clevr_exist_5k --config "$CONFIG" --output-root "$ROOT"
+  "$PYTHON_BIN" scripts/train_qa_probes.py --model qwen2_5_vl_7b --dataset clevr_exist_9k --config "$CONFIG" --output-root "$ROOT"
 ) > "$LOGS/probes_gpu1.log" 2>&1 &
 pid_probe1=$!
 wait "$pid_probe0"

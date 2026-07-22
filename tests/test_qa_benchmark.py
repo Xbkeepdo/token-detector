@@ -1,4 +1,7 @@
+import json
+
 from data.qa_benchmark import (
+    _load_clevr_exist,
     _amber_dimension,
     assert_no_image_leakage,
     infer_clevr_query_object_span,
@@ -48,6 +51,38 @@ def test_amber_dimensions_and_shared_image_namespace():
         pass
     else:
         raise AssertionError("AMBER image leakage across dimensions was accepted")
+
+
+def test_clevr_loader_records_the_configured_dataset_name(tmp_path):
+    questions_dir = tmp_path / "questions"
+    questions_dir.mkdir()
+    payload = {
+        "questions": [
+            {
+                "question_index": 7,
+                "image_index": 3,
+                "image_filename": "CLEVR_train_000003.png",
+                "question": "Are there any spheres?",
+                "answer": "yes",
+                "question_family_index": 1,
+                "program": [
+                    {"function": "scene", "inputs": []},
+                    {
+                        "function": "filter_shape",
+                        "inputs": [0],
+                        "value_inputs": ["sphere"],
+                    },
+                    {"function": "exist", "inputs": [1]},
+                ],
+            }
+        ]
+    }
+    (questions_dir / "CLEVR_train_questions.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    rows = _load_clevr_exist(tmp_path, "train", "clevr_exist_9k")
+    assert rows[0]["dataset"] == "clevr_exist_9k"
+    assert rows[0]["key"] == "clevr_exist_9k::train::7"
 
 
 def test_clevr_image_identity_includes_official_source_split():

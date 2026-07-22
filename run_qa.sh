@@ -10,7 +10,7 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     exit 2
 fi
 MODEL="${MODEL:-qwen3_vl_8b}"
-DATASET="${DATASET:-pope}"                 # pope | clevr_exist_5k | amber_discriminative
+DATASET="${DATASET:-pope}"                 # pope | clevr_exist_9k | amber_discriminative
 CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 DEVICE="${DEVICE:-cuda:0}"
@@ -28,12 +28,12 @@ fi
 # Step 1: Prepare one immutable outer image-level 8:2 question split.
 if [[ "$DATASET" == "pope" ]]; then
     PREPARE_DATASET="pope"
-elif [[ "$DATASET" == "clevr_exist_5k" ]]; then
+elif [[ "$DATASET" == "clevr_exist_5k" || "$DATASET" == "clevr_exist_9k" ]]; then
     PREPARE_DATASET="clevr"
 elif [[ "$DATASET" == "amber_discriminative" ]]; then
     PREPARE_DATASET="amber"
 else
-    echo "DATASET must be pope, clevr_exist_5k, or amber_discriminative" >&2
+    echo "DATASET must be pope, clevr_exist_9k, clevr_exist_5k, or amber_discriminative" >&2
     exit 2
 fi
 "$PYTHON_BIN" scripts/prepare_qa_benchmarks.py \

@@ -34,6 +34,10 @@ qa_benchmarks:
   pope_dir: "/home/apulis-dev/userdata/datasets/POPE"
   coco_image_dir: "/home/apulis-dev/userdata/datasets/POPE/val2014"
   clevr_root: "/home/apulis-dev/userdata/datasets/CLEVR_v1.0"
+  clevr_dataset_name: "clevr_exist_9k"
+  clevr_train_questions: 7200
+  clevr_val_questions: 0
+  clevr_test_questions: 1800
   amber_root: "/home/apulis-dev/userdata/AMBER"
   prepared_root: "/home/apulis-dev/userdata/datasets/qa_benchmarks"
   output_root: "/home/apulis-dev/userdata/CODEX/test-cocochair/token-detector/outputs/qa_benchmarks"

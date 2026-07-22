@@ -57,7 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument(
         "--dataset",
-        choices=("pope", "clevr_exist_5k", "amber_discriminative"),
+        choices=(
+            "pope",
+            "clevr_exist_9k",
+            "clevr_exist_5k",
+            "amber_discriminative",
+        ),
         required=True,
     )
     parser.add_argument(

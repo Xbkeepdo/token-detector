@@ -28,6 +28,10 @@ def parse_args():
     parser.add_argument("--clevr-root")
     parser.add_argument("--amber-root")
     parser.add_argument("--output-root")
+    parser.add_argument("--clevr-dataset-name")
+    parser.add_argument("--clevr-train-questions", type=int)
+    parser.add_argument("--clevr-val-questions", type=int)
+    parser.add_argument("--clevr-test-questions", type=int)
     parser.add_argument("--seed", type=int)
     return parser.parse_args()
 
@@ -62,12 +66,35 @@ def main():
     if args.dataset in ("clevr", "all"):
         if not clevr_root:
             raise ValueError("CLEVR root is required by CLI or YAML")
+        dataset_name = str(
+            args.clevr_dataset_name
+            or cfg.get("clevr_dataset_name", "clevr_exist_9k")
+        )
+        train_count = int(
+            args.clevr_train_questions
+            if args.clevr_train_questions is not None
+            else cfg.get("clevr_train_questions", 7200)
+        )
+        val_count = int(
+            args.clevr_val_questions
+            if args.clevr_val_questions is not None
+            else cfg.get("clevr_val_questions", 0)
+        )
+        test_count = int(
+            args.clevr_test_questions
+            if args.clevr_test_questions is not None
+            else cfg.get("clevr_test_questions", 1800)
+        )
         rows = prepare_clevr_exist(
             clevr_root,
-            os.path.join(output_root, "clevr_exist_5k"),
+            os.path.join(output_root, dataset_name),
             seed,
+            train_count=train_count,
+            val_count=val_count,
+            test_count=test_count,
+            dataset_name=dataset_name,
         )
-        print(f"[prepare] CLEVR official exist 5K subset: {len(rows)} questions")
+        print(f"[prepare] CLEVR {dataset_name}: {len(rows)} questions")
     if args.dataset in ("amber", "all"):
         if not amber_root:
             raise ValueError("AMBER root is required by CLI or YAML")

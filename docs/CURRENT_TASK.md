@@ -1,5 +1,11 @@
 # Current Task
 
+## 2026-07-23 CLEVR-Exist 扩展为可配置 9K 严格 8:2
+
+- CLEVR 数据规模和数据集 slug 不再埋在准备代码中：两份活动 YAML 新增 `clevr_dataset_name`、`clevr_train_questions`、`clevr_val_questions`、`clevr_test_questions`，当前默认分别为 `clevr_exist_9k`、`7200/0/1800`。`scripts/prepare_qa_benchmarks.py` 同时提供同名 CLI 覆盖参数，并把实际 dataset 名传入每条 question 的 `dataset`、`key`、prepared 目录和 manifest 描述，避免 9K 内容继续伪装成 5K。
+- `run_clevr.sh`、统一 `run_qa.sh`、QA generation/extraction/probe/baseline/comparison CLI、全量 coordinator 和 smoke 入口均已接入 `clevr_exist_9k`；coordinator 完整性检查从 5000 改为 9000。为读取已有历史产物，相关 CLI 仍接受 `clevr_exist_5k`，但新默认入口和两份活动配置只生成独立的 `clevr_exist_9k` 目录。
+- seed 42 的真实 CLEVR_v1.0 准备验证生成 9000 条问题，严格为 train/val/test=`7200/0/1800`，question metadata 全部为 `clevr_exist_9k`；对应唯一图片数为 `6896/0/1733`，官方 train/val 物理命名空间保证 train/test 无图片泄漏。Python 编译、四个 shell 入口 `bash -n`、五个 QA CLI 的 9K 参数解析、两份 YAML 解析、CLEVR dataset-name 定向测试、QA baseline/parallel/comparison 19/19 和 `git diff --check` 通过。`tests.test_qa_answer_only_config` 的其余 6 项中 5 项通过；旧的 active-YAML 断言仍要求已关闭的 `hmid_softmax_prob` 组合而失败，与本次 CLEVR 改动无关，本轮没有改回用户当前特征配置。
+
 ## 2026-07-22 InsLen Prompt CAFE 特征
 
 - compact four-gate 抽取新增 Prompt CAFE：对每层的 post-visual instruction hpre 状态 (z_j) 使用 LM Head/反嵌入矩阵，按 `softmax(W_u z_j / temperature)` 计算固定生成物体 `target_token_id` 的概率，再严格只在 instruction 位置维取最大值；不是在词表维取最大值。当前 COCO object span 沿用既有因果目标协议，使用该物体 mention 的首个生成 token ID。

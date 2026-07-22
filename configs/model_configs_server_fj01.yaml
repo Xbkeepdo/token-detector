@@ -35,6 +35,10 @@ qa_benchmarks:
   pope_dir: "/root/rivermind-data/dataset/pope"
   coco_image_dir: "/root/rivermind-data/dataset/coco/val2014"
   clevr_root: "/root/rivermind-data/dataset/CLEVR_v1.0"
+  clevr_dataset_name: "clevr_exist_9k"
+  clevr_train_questions: 7200
+  clevr_val_questions: 0
+  clevr_test_questions: 1800
   amber_root: "/root/rivermind-data/dataset/AMBER"
   prepared_root: "/root/rivermind-data/dataset/qa_benchmarks"
   output_root: "/root/rivermind-data/accept/token-detector/outputs/qa_benchmarks"
