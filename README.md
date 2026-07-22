@@ -110,14 +110,15 @@ QA probe combinations are read verbatim from `training.feature_sets.method`
 and `training.feature_sets.ads_cgc`; the trainer only appends the configured QA
 position suffix. There is no separate hard-coded QA feature matrix.
 
-QA baseline heads are also selected in YAML. The default
-`qa_benchmarks.baseline_trainer: shared_torch_mlp` sends MetaToken's canonical
-`10+H` vector, SVAR's selected `layer×head` vector, and ProjectAway's global
-plus per-layer internal-confidence vector through the same
-`training.torch_probe` MLP used by DGST and ADS+CGC. This is a controlled
-same-trainer comparison and is reported as `shared_torch_mlp`; set the value to
-`native_paper` to run each baseline's original classifier/head instead. The two
-result families use distinct filenames and are never silently mixed.
+QA baseline training uses the same `training.baseline.trainers` list and report
+protocol as COCO. The default runs both `native_paper` and
+`shared_torch_mlp` on the same strict 8:2 split and seeds, then writes their
+side-by-side comparison. The shared MLP receives MetaToken's canonical `10+H`
+vector, SVAR's selected `layer×head` vector, the flattened DHCP spatial tensor,
+and ProjectAway's global plus per-layer internal-confidence vector. Both heads
+report fixed-0.5 and train-F1 thresholds with real-positive and
+hallucination-positive metrics. `qa_benchmarks.baseline_trainer` only selects
+which trained baseline family appears in the cross-family QA headline table.
 
 By default QA baselines use the POPE-style
 `object_hallucination_yes_only` protocol. To additionally run the all-answer

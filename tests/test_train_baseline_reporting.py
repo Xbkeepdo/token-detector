@@ -14,6 +14,7 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+from features.baseline import DHCPShardReader  # noqa: E402
 from scripts.train_baselines import (  # noqa: E402
     _build_threshold_reports,
     _configured_baseline_trainers,
@@ -205,6 +206,42 @@ class BaselineReportingTests(unittest.TestCase):
         self.assertEqual(svar.shape, (2, 3))
         self.assertEqual(projectaway.shape, (2, 4))
         np.testing.assert_allclose(projectaway[0], [0.8, 0.1, 0.2, 0.3])
+        np.testing.assert_array_equal(labels, [0, 1])
+
+    def test_shared_mlp_flattens_dhcp_shard_features(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = np.asarray(
+                [[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]],
+                dtype=np.float16,
+            )
+            np.save(root / "shard_000000.npy", values)
+            records = [
+                {
+                    "baseline_schema_version": "1.0",
+                    "image_id": index,
+                    "response_token_idx": 0,
+                    "label": label,
+                    "baselines": {
+                        "dhcp": {
+                            "shard_reference": {
+                                "shard": "shard_000000.npy",
+                                "index": index,
+                                "shape": [2, 2],
+                            }
+                        }
+                    },
+                }
+                for index, label in enumerate((0, 1))
+            ]
+            matrix, labels = _shared_mlp_baseline_matrix(
+                records,
+                "dhcp",
+                dhcp_reader=DHCPShardReader(root),
+            )
+        self.assertEqual(matrix.dtype, np.float32)
+        self.assertEqual(matrix.shape, (2, 4))
+        np.testing.assert_allclose(matrix[0], [1.0, 2.0, 3.0, 4.0])
         np.testing.assert_array_equal(labels, [0, 1])
 
     def test_shared_mlp_aggregate_and_markdown_report_both_thresholds(self) -> None:

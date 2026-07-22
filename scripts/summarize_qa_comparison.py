@@ -1202,7 +1202,10 @@ def _discover_baseline_summary(
             f"{model}_{dataset}_{label_protocol}_qa_baselines_"
             f"{int(num_seeds)}seed.json"
         )
-        candidates = (base / stem,)
+        candidates = (
+            base / "native_paper" / stem,
+            base / stem,
+        )
     else:
         raise ValueError(
             "qa_benchmarks.baseline_trainer must be native_paper or "

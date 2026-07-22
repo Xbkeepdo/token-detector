@@ -28,7 +28,7 @@ qa_benchmarks:
   # QA uses the same four extraction modes as COCO. "all" shares one answer-
   # token forward across DGST, ADS+CGC and every enabled baseline.
   extraction_mode: "all"                  # all | method_only | ads_cgc_only | baseline_only
-  baseline_trainer: "shared_torch_mlp"    # shared_torch_mlp | native_paper; shared uses training.torch_probe for every dense baseline.
+  baseline_trainer: "shared_torch_mlp"    # Headline baseline in the cross-family QA table; actual runs follow training.baseline.trainers.
   baseline_label_protocols:
     - "object_hallucination_yes_only"
     - "answer_correctness_all"
@@ -179,7 +179,7 @@ feature_extraction:
   baseline:
     enabled: true
     output_subdir: "baseline"
-    methods: ["metatoken", "svar", "projectaway","dhcp"]           # Optional: "dhcp", "halloc"
+    methods: ["metatoken", "svar", "dhcp", "projectaway"]         # Optional: "halloc"
     seed: 42
     metatoken:
       classifiers: ["lr", "gb"]             # LR(lbfgs), GB(100 estimators).
@@ -329,7 +329,7 @@ training:
     # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
     # Run both heads on the same split/seeds and emit a side-by-side report.
     trainers: ["native_paper", "shared_torch_mlp"]
-    methods: ["metatoken", "svar", "projectaway"]
+    methods: ["metatoken", "svar", "dhcp", "projectaway"]
     positive_class: "real"                  # real | hallucination; train F1 selects its threshold.
     seeds: [43, 44, 45]                     # Use [43] for a quick single-seed run.
     write_summary: true                     # Per-seed MD + aggregate mean/std MD.

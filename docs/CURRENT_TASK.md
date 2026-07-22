@@ -202,7 +202,7 @@
 
 ## 2026-07-19 AMBER baseline 统一三层 MLP
 
-- QA baseline 训练器现由 YAML 的 `qa_benchmarks.baseline_trainer` 控制：`shared_torch_mlp`（默认）或 `native_paper`。默认路径不再把 MetaToken/SVAR/ProjectAway 分别交给不同 head，而是统一复用 `training.torch_probe` 的 `[256,128,64]`、dropout 0.1、lr 3e-4、batch 128、120 epochs、seeds 42/43/44。
+- QA baseline 训练与 COCO baseline 对齐：由 `training.baseline.trainers` 同时运行 `native_paper` 和 `shared_torch_mlp`，在相同严格 8:2 划分与 seeds 上报告 fixed-0.5/train-F1 阈值、real/hall 双正类指标及双训练器对照；训练特征包含 MetaToken/SVAR/DHCP/ProjectAway。`qa_benchmarks.baseline_trainer` 仅选择跨 family QA 总表中的 headline baseline。
 - 统一输入保持各方法特征定义：MetaToken 为 42 维 canonical `10+H`；SVAR 为 448 维中层 `layer×head`；ProjectAway 为 1 个 global internal confidence 加 36 层曲线，共 37 维。ProjectAway 的 `1-confidence` 未重复拼接。所有方法仍使用物理图片互斥的严格 8:2、最后一轮权重及 train Real-F1 阈值。
 - 结果显式命名 `shared_torch_mlp` 并与原生 baseline 文件隔离。`summarize_qa_comparison.py` 会按 YAML 选择对应汇总，避免将统一 MLP 结果误称为论文原生 head。
 - AMBER `object_hallucination_yes_only` 三 seed Test：MetaToken AUC/Real-F1/Hall-F1/Acc=`0.8771/0.9314/0.6007/0.8829`；SVAR=`0.8793/0.9411/0.6250/0.8982`；ProjectAway=`0.5154/0.9085/0.0000/0.8323`。

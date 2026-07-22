@@ -509,11 +509,12 @@ def _run_shared_mlp_protocol(
 ) -> tuple[dict[str, Any], list[Path]]:
     """Train every dense baseline with the same configured Torch probe."""
 
-    supported = {"metatoken", "svar", "projectaway"}
+    supported = {"metatoken", "svar", "dhcp", "projectaway"}
     unsupported = sorted(set(methods) - supported)
     if unsupported:
         raise ValueError(
-            "shared_torch_mlp supports MetaToken, SVAR, and ProjectAway; "
+            "shared_torch_mlp supports MetaToken, SVAR, DHCP, and "
+            "ProjectAway; "
             f"unsupported methods: {unsupported}"
         )
     result_dir = result_root / "results" / "shared_torch_mlp"
@@ -521,6 +522,11 @@ def _run_shared_mlp_protocol(
     run_outputs: list[dict[str, Any]] = []
     run_paths: list[Path] = []
     svar_layer_start, svar_layer_end = _svar_training_layer_range(baseline_cfg)
+    dhcp_reader = (
+        DHCPShardReader(result_root / "dhcp" / "shards")
+        if "dhcp" in methods
+        else None
+    )
     for seed in seeds:
         seed_name = run_name or f"seed{int(seed)}"
         seed_name = _safe_run_name(seed_name)
@@ -556,6 +562,7 @@ def _run_shared_mlp_protocol(
                     method,
                     svar_layer_start=svar_layer_start,
                     svar_layer_end=svar_layer_end,
+                    dhcp_reader=dhcp_reader,
                 )
                 for split in ("train", "test")
             }
@@ -645,6 +652,7 @@ def _shared_mlp_baseline_matrix(
     *,
     svar_layer_start: int = 5,
     svar_layer_end: int = 19,
+    dhcp_reader: Optional[DHCPShardReader] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     vectors: list[np.ndarray] = []
     labels: list[int] = []
@@ -675,6 +683,14 @@ def _shared_mlp_baseline_matrix(
                 np.asarray([confidence], dtype=np.float32),
                 np.asarray(per_layer, dtype=np.float32).reshape(-1),
             ))
+        elif normalized == "dhcp":
+            if dhcp_reader is None:
+                raise ValueError(
+                    "DHCP shared MLP requires a DHCPShardReader"
+                )
+            vector = dhcp_reader.load(
+                _dhcp_reference(get_baseline_payload(record, normalized))
+            )
         else:
             raise ValueError(f"Unsupported shared-MLP baseline: {method!r}")
         vector = np.asarray(vector, dtype=np.float32).reshape(-1)

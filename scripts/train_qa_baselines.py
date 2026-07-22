@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train native paper-baseline heads on QA question probe splits."""
+"""Train and compare COCO-aligned baseline heads on QA question splits."""
 
 from __future__ import annotations
 
@@ -36,9 +36,12 @@ from scripts.extract_qa_baselines import (  # noqa: E402
     SPLIT_MANIFEST_NAME,
 )
 from scripts.train_baselines import (  # noqa: E402
+    _configured_baseline_trainers,
     _resolve_device,
+    _run_shared_mlp_protocol,
     _run_training_protocol,
     _write_baseline_markdown,
+    _write_trainer_comparison,
     aggregate_baseline_outputs,
 )
 from utils.config_utils import (  # noqa: E402
@@ -77,13 +80,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--methods", nargs="+", default=None)
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
-    parser.add_argument(
+    trainer_group = parser.add_mutually_exclusive_group()
+    trainer_group.add_argument(
         "--trainer",
         choices=("native_paper", "shared_torch_mlp"),
         default=None,
-        help="Override qa_benchmarks.baseline_trainer without editing YAML.",
+        help="Run one baseline trainer instead of training.baseline.trainers.",
     )
-    parser.add_argument("--force", action="store_true")
+    trainer_group.add_argument(
+        "--trainers",
+        nargs="+",
+        choices=("native_paper", "shared_torch_mlp"),
+        default=None,
+        help="Run one or both baseline trainers, overriding YAML.",
+    )
     return parser.parse_args()
 
 
@@ -187,52 +197,55 @@ def main() -> None:
     ))
     if not seeds:
         raise ValueError("At least one QA baseline seed is required")
-    qa_cfg = config.get("qa_benchmarks") or {}
-    trainer = _normalize_qa_baseline_trainer(
-        args.trainer or qa_cfg.get("baseline_trainer", "native_paper")
-    )
+    trainers = _configured_baseline_trainers(args, baseline_training_cfg)
     baseline_cfg = baseline_config(config)
-    if trainer == "shared_torch_mlp":
-        probe_cfg = training_cfg.get("torch_probe") or {}
-        if not isinstance(probe_cfg, Mapping) or not probe_cfg:
-            raise ValueError(
-                "qa_benchmarks.baseline_trainer=shared_torch_mlp requires "
-                "training.torch_probe"
-            )
-        run_qa_shared_mlp_training(
-            model=args.model,
-            dataset=args.dataset,
-            label_protocol=label_protocol,
-            seeds=seeds,
-            methods=methods,
-            records=records,
-            image_split_counts=expected_split_manifest["image_counts"],
-            feature_path=feature_path,
-            split_path=split_path,
-            baseline_dir=baseline_dir,
-            probe_cfg=dict(probe_cfg),
-            baseline_cfg=baseline_cfg,
-            device=_resolve_device(args.device),
-            force=bool(args.force),
+    probe_cfg = training_cfg.get("torch_probe") or {}
+    if "shared_torch_mlp" in trainers and (
+        not isinstance(probe_cfg, Mapping) or not probe_cfg
+    ):
+        raise ValueError(
+            "shared_torch_mlp requires training.torch_probe"
         )
-    else:
-        run_qa_baseline_training(
-            model=args.model,
-            dataset=args.dataset,
-            label_protocol=label_protocol,
-            seeds=seeds,
-            methods=methods,
-            split_records=split_records,
-            image_split_counts=expected_split_manifest["image_counts"],
-            feature_path=feature_path,
-            split_path=split_path,
-            baseline_dir=baseline_dir,
-            baseline_cfg=baseline_cfg,
-            device=_resolve_device(args.device),
+    common_kwargs = {
+        "model": args.model,
+        "dataset": args.dataset,
+        "label_protocol": label_protocol,
+        "seeds": seeds,
+        "methods": methods,
+        "split_records": split_records,
+        "image_split_counts": expected_split_manifest["image_counts"],
+        "feature_path": feature_path,
+        "split_path": split_path,
+        "baseline_dir": baseline_dir,
+        "baseline_cfg": baseline_cfg,
+        "device": _resolve_device(args.device),
+    }
+    trainer_runs: dict[str, tuple[dict[str, Any], list[Path]]] = {}
+    for trainer in trainers:
+        if trainer == "shared_torch_mlp":
+            trainer_runs[trainer] = run_qa_shared_mlp_training(
+                **common_kwargs,
+                probe_cfg=dict(probe_cfg),
+            )
+        else:
+            trainer_runs[trainer] = run_qa_baseline_training(
+                **common_kwargs,
+                trainer_namespace=(
+                    "native_paper" if len(trainers) > 1 else None
+                ),
+            )
+    if len(trainer_runs) > 1:
+        _write_trainer_comparison(
+            result_root=baseline_dir,
+            result_stem=(
+                f"{args.model}_{args.dataset}_{label_protocol}_qa_baselines"
+            ),
+            trainer_runs=trainer_runs,
+            probe_cfg=dict(probe_cfg),
         )
     print(
         f"[train_qa_baselines] Complete: {args.model}/{args.dataset}/"
-        f"{label_protocol}; trainer={trainer}, seeds={seeds}, "
+        f"{label_protocol}; trainers={list(trainers)}, seeds={seeds}, "
         f"methods={list(methods)}, "
         f"output={baseline_dir / 'results'}"
     )
@@ -262,7 +275,7 @@ def run_qa_shared_mlp_training(
     label_protocol: str,
     seeds: Sequence[int],
     methods: Sequence[str],
-    records: Sequence[dict],
+    split_records: Mapping[str, Sequence[Mapping[str, Any]]],
     image_split_counts: Mapping[str, int],
     feature_path: Path,
     split_path: Path,
@@ -270,160 +283,31 @@ def run_qa_shared_mlp_training(
     probe_cfg: Mapping[str, Any],
     baseline_cfg: Mapping[str, Any],
     device: str,
-    force: bool = False,
-) -> None:
-    """Fit every dense QA baseline with the same configured Torch MLP."""
+) -> tuple[dict[str, Any], list[Path]]:
+    """Run the exact shared-MLP protocol used by COCO baselines."""
 
-    supported = {"metatoken", "svar", "projectaway"}
-    unsupported = sorted(set(methods) - supported)
-    if unsupported:
-        raise ValueError(
-            "shared_torch_mlp supports MetaToken, SVAR, and ProjectAway; "
-            f"unsupported methods: {unsupported}"
-        )
     protocol = normalize_qa_label_protocol(label_protocol)
-    cfg = dict(probe_cfg)
-    svar_cfg = dict(baseline_cfg.get("svar") or {})
-    svar_layer_start = int(svar_cfg.get("layer_start", 5))
-    svar_layer_end = int(svar_cfg.get("layer_end", 19))
-    if svar_layer_start < 0 or svar_layer_end <= svar_layer_start:
-        raise ValueError(
-            "Invalid SVAR training layer range "
-            f"[{svar_layer_start},{svar_layer_end})"
-        )
-    fingerprint, provenance = _shared_mlp_fingerprint(
+    return _run_shared_mlp_protocol(
+        model=model,
+        seeds=seeds,
+        methods=methods,
+        split_records=split_records,
+        image_split_counts=image_split_counts,
         feature_path=feature_path,
         split_path=split_path,
-        probe_cfg=cfg,
-        methods=methods,
-        label_protocol=protocol,
-        svar_layer_start=svar_layer_start,
-        svar_layer_end=svar_layer_end,
-    )
-    result_root = baseline_dir / "results" / "shared_torch_mlp"
-    seed_outputs: list[dict[str, Any]] = []
-    seed_paths: list[Path] = []
-    for seed in seeds:
-        seed_path = result_root / f"seed{int(seed)}" / (
-            f"{model}_{dataset}_{protocol}_qa_baselines_shared_torch_mlp.json"
-        )
-        if seed_path.is_file() and not force:
-            output = _load_json_object(seed_path)
-            _validate_shared_mlp_seed_output(
-                output,
-                seed=int(seed),
-                methods=methods,
-                fingerprint=fingerprint,
-            )
-        else:
-            method_results: dict[str, dict[str, Any]] = {}
-            for method in methods:
-                method_cfg = dict(cfg)
-                if method == "svar":
-                    method_cfg.update(
-                        svar_layer_start=svar_layer_start,
-                        svar_layer_end=svar_layer_end,
-                    )
-                method_dir = (
-                    result_root
-                    / f"seed{int(seed)}"
-                    / str(method)
-                )
-                print(
-                    f"[QABaselineSharedMLP] protocol={protocol} seed={seed} "
-                    f"method={method} device={device}"
-                )
-                qa_result = train_one_seed(
-                    records,
-                    f"baseline:{method}",
-                    int(seed),
-                    str(method_dir),
-                    method_cfg,
-                    device,
-                    label_protocol=protocol,
-                )
-                method_results[str(method)] = _qa_result_as_baseline_result(
-                    qa_result,
-                    checkpoint=method_dir / "checkpoint.pt",
-                    probe_cfg=method_cfg,
-                )
-            output = {
-                "model": model,
-                "dataset": dataset,
-                "seed": int(seed),
-                "trainer": "shared_torch_mlp",
-                "configured_methods": list(methods),
-                "feature_path": str(feature_path),
-                "split_path": str(split_path),
-                "stored_label_semantics": {
-                    "0": "hallucination",
-                    "1": "real",
-                },
-                "detector_target_semantics": {
-                    "0": "hallucination",
-                    "1": "real",
-                },
-                "headline_positive_class": "real",
-                "label_protocol": (
-                    f"qa_{protocol}_0hall_1real_question_probe_split_"
-                    "physical_image_disjoint_shared_torch_mlp"
-                ),
-                "counts": _record_split_counts(records),
-                "image_split_counts": dict(image_split_counts),
-                "methods": {
-                    "metatoken": {"shared_mlp": method_results["metatoken"]}
-                    if "metatoken" in method_results
-                    else None,
-                    **{
-                        method: result
-                        for method, result in method_results.items()
-                        if method != "metatoken"
-                    },
-                },
-                "split_protocol": "strict_82_no_validation",
-                "checkpoint_selection": "minimum_train_loss",
-                "threshold_selection": "train_f1",
-                "threshold_reporting": ["fixed_0.5", "train_f1"],
-                "svar_training_layers": {
-                    "start": svar_layer_start,
-                    "end_exclusive": svar_layer_end,
-                },
-                "training_input_fingerprint": fingerprint,
-                "training_provenance": provenance,
-            }
-            output["methods"] = {
-                key: value for key, value in output["methods"].items()
-                if value is not None
-            }
-            _atomic_json(seed_path, output)
-        seed_outputs.append(output)
-        seed_paths.append(seed_path)
-
-    summary = aggregate_baseline_outputs(
-        seed_outputs,
+        result_root=baseline_dir,
+        probe_cfg=probe_cfg,
+        baseline_cfg=baseline_cfg,
+        device=device,
+        run_name=None,
+        result_stem=f"{model}_{dataset}_{protocol}_qa_baselines",
+        label_protocol=(
+            f"qa_{protocol}_0hall_1real_question_probe_split_"
+            "physical_image_disjoint"
+        ),
+        write_summary=True,
         positive_class="real",
     )
-    summary.update({
-        "dataset": dataset,
-        "trainer": "shared_torch_mlp",
-        "training_input_fingerprint": fingerprint,
-        "training_provenance": provenance,
-        "seed_result_paths": [str(path) for path in seed_paths],
-    })
-    stem = (
-        f"{model}_{dataset}_{protocol}_qa_baselines_"
-        f"shared_torch_mlp_{len(seeds)}seed"
-    )
-    json_path = result_root / f"{stem}.json"
-    markdown_path = result_root / f"{stem}_summary.md"
-    _atomic_json(json_path, summary)
-    _write_baseline_markdown(
-        markdown_path,
-        summary,
-        source_paths=seed_paths,
-    )
-    print(f"[QABaselineSharedMLP] Summary: {json_path}")
-    print(f"[QABaselineSharedMLP] Markdown: {markdown_path}")
 
 
 def _qa_result_as_baseline_result(
@@ -591,11 +475,12 @@ def run_qa_baseline_training(
     baseline_dir: Path,
     baseline_cfg: Mapping[str, Any],
     device: str,
-) -> None:
+    trainer_namespace: str | None = None,
+) -> tuple[dict[str, Any], list[Path]]:
     """Run native heads and write isolated per-seed plus aggregate reports."""
 
     protocol = normalize_qa_label_protocol(label_protocol)
-    _run_training_protocol(
+    return _run_training_protocol(
         model=model,
         seeds=seeds,
         methods=methods,
@@ -614,6 +499,7 @@ def run_qa_baseline_training(
         ),
         write_summary=True,
         positive_class="real",
+        trainer_namespace=trainer_namespace,
     )
 
 
