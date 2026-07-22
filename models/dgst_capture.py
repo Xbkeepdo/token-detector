@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Sequence
 
 import torch
@@ -950,8 +951,12 @@ def target_probabilities_multi(
     states: torch.Tensor,
     target_token_ids: Sequence[int],
     chunk_size: int = 64,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
     """Compute p(target_token | state) for several targets with one logsumexp pass."""
+    temperature_value = float(temperature)
+    if not math.isfinite(temperature_value) or temperature_value <= 0.0:
+        raise ValueError("temperature must be a finite positive value.")
     weight = output_layer.weight
     bias = getattr(output_layer, "bias", None)
     token_ids = [int(token_id) for token_id in target_token_ids]
@@ -971,7 +976,8 @@ def target_probabilities_multi(
     for start in range(0, int(flat_states.shape[0]), max(1, int(chunk_size))):
         chunk = flat_states[start : start + int(chunk_size)].to(device=weight.device, dtype=weight.dtype)
         logits = F.linear(chunk, weight, bias.to(dtype=weight.dtype) if bias is not None else None)
-        log_denominator = torch.logsumexp(logits.float(), dim=-1)
+        scaled_logits = logits.float() / temperature_value
+        log_denominator = torch.logsumexp(scaled_logits, dim=-1)
         chunk_probs = torch.zeros(
             int(chunk.shape[0]),
             len(token_ids),
@@ -983,7 +989,7 @@ def target_probabilities_multi(
             dtype=torch.long,
             device=logits.device,
         )
-        target_logits = logits.index_select(dim=1, index=valid_token_index).float()
+        target_logits = scaled_logits.index_select(dim=1, index=valid_token_index)
         valid_probs = torch.exp((target_logits - log_denominator.unsqueeze(1)).clamp(max=0.0)).to(states.device)
         for valid_offset, (column, _token_id) in enumerate(valid_columns):
             chunk_probs[:, column] = valid_probs[:, valid_offset]

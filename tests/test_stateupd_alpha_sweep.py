@@ -30,6 +30,12 @@ from utils.config_utils import load_config, resolve_dgst_four_gate_methods
 
 ALPHA_MODES = [f"sqrt_stateupd_alpha0{value}" for value in range(1, 10)]
 METHOD = "hpre_raw_logit_gauss"
+SOFTMAX_METHOD = "hpre_softmax_prob_gauss"
+SOFTMAX_RISK = f"{SOFTMAX_METHOD}_risk"
+SOFTMAX_EV = f"{SOFTMAX_METHOD}_ev_target_dist_mass_x_cosine"
+VP_SOFTMAX_METHOD = f"vp_{SOFTMAX_METHOD}"
+VP_SOFTMAX_RISK = f"{VP_SOFTMAX_METHOD}_risk"
+VP_SOFTMAX_EV = f"{VP_SOFTMAX_METHOD}_ev_target_dist_mass_x_cosine"
 EV = f"{METHOD}_ev_target_dist_mass_x_cosine"
 VP_METHOD = f"vp_{METHOD}"
 VP_EV = f"{VP_METHOD}_ev_target_dist_mass_x_cosine"
@@ -42,6 +48,20 @@ def _expected_feature_sets() -> list[str]:
         for cost in costs:
             risk = f"{method}_risk_{cost}"
             values.extend((risk, f"{risk}+{ev}"))
+    return values
+
+
+def _expected_active_feature_sets() -> list[str]:
+    values = list(_expected_feature_sets())
+    for method, risk, ev in (
+        (SOFTMAX_METHOD, SOFTMAX_RISK, SOFTMAX_EV),
+        (VP_SOFTMAX_METHOD, VP_SOFTMAX_RISK, VP_SOFTMAX_EV),
+    ):
+        values.extend((risk, ev, f"{risk}+{ev}"))
+        for cost in ALPHA_MODES:
+            alpha_risk = f"{method}_risk_{cost}"
+            values.extend((alpha_risk, f"{alpha_risk}+{ev}"))
+    values.append("prompt_cafe")
     return values
 
 
@@ -134,8 +154,11 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
             target_region_top_k=3,
             cost_mode="sqrt_matched_state",
             cost_modes=["sqrt_matched_state", *ALPHA_MODES],
-            enabled_methods=[METHOD],
+            enabled_methods=[METHOD, SOFTMAX_METHOD],
             support_modes=["vv", "vp"],
+            compute_prompt_cafe=True,
+            prompt_cafe_temperature=10.0,
+            prompt_cafe_layer=0,
         )[0]
 
         self.assertEqual(result["dgst_t_cost"], "sqrt_cosine_matched_state")
@@ -153,6 +176,20 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
                 key = f"dgst_t_{scope_prefix}{METHOD}_risk_{mode}_per_layer"
                 self.assertEqual(tuple(result[key].shape), (1,))
                 self.assertTrue(math.isfinite(float(result[key][0])))
+        self.assertEqual(
+            tuple(result[
+                "dgst_t_hpre_softmax_prob_gauss_risk_sqrt_hpre_per_layer"
+            ].shape),
+            (1,),
+        )
+        for scope_prefix in ("", "vp_"):
+            for mode in ALPHA_MODES:
+                key = (
+                    f"dgst_t_{scope_prefix}{SOFTMAX_METHOD}_"
+                    f"risk_{mode}_per_layer"
+                )
+                self.assertEqual(tuple(result[key].shape), (1,))
+                self.assertTrue(math.isfinite(float(result[key][0])))
 
         record = _build_four_gate_feature_record(
             image_id=12,
@@ -163,7 +200,7 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
             dgst_t=result,
         )
         self.assertEqual(record["dgst_t_cost_alphas"], result["dgst_t_cost_alphas"])
-        for feature_set in _expected_feature_sets():
+        for feature_set in _expected_active_feature_sets():
             matrix, labels = build_selected_matrix(
                 [record], parse_feature_set(feature_set)
             )
@@ -171,15 +208,18 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
             self.assertEqual(matrix.shape, (1, expected_width))
             self.assertEqual(labels.tolist(), [1])
 
-    def test_active_yamls_define_only_the_requested_40_feature_sets(self) -> None:
-        expected = _expected_feature_sets()
+    def test_active_yamls_add_softmax_prob_vv_vp_alpha_risk_and_mass_probes(self) -> None:
+        expected = _expected_active_feature_sets()
         for relative_path in (
             "configs/model_configs_unified.yaml",
             "configs/model_configs_server_fj01.yaml",
         ):
             config = load_config(os.path.join(ROOT, relative_path))
             dgst = config["feature_extraction"]["dgst_t"]
-            self.assertEqual(resolve_dgst_four_gate_methods(dgst), [METHOD])
+            self.assertEqual(
+                resolve_dgst_four_gate_methods(dgst),
+                [SOFTMAX_METHOD, METHOD],
+            )
             self.assertEqual(dgst["target_modes"], ["raw_logit_gauss"])
             self.assertEqual(dgst["support_modes"], ["vv", "vp"])
             self.assertEqual(dgst["cost_mode"], "sqrt_matched_state")
@@ -187,6 +227,9 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
                 dgst["cost_modes"], ["sqrt_matched_state", *ALPHA_MODES]
             )
             self.assertFalse(dgst["compute_ffn_injection_features"])
+            self.assertTrue(dgst["compute_prompt_cafe"])
+            self.assertEqual(float(dgst["prompt_cafe_temperature"]), 10.0)
+            self.assertEqual(int(dgst["prompt_cafe_layer"]), 22)
             configured = config["training"]["feature_sets"]["method"]
             self.assertEqual(configured, expected)
             self.assertEqual(_enabled_method_feature_sets(config, configured), expected)
@@ -207,7 +250,10 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
             for command in root_commands:
                 start = command.index("--feature-sets") + 1
                 end = command.index("--device")
-                self.assertEqual(command[start:end], expected)
+                expected_command_features = list(expected)
+                if config["run"]["extraction_mode"] == "all":
+                    expected_command_features.extend(("ads", "cgc", "ads+cgc"))
+                self.assertEqual(command[start:end], expected_command_features)
 
 
 if __name__ == "__main__":

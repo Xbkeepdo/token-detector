@@ -1211,6 +1211,26 @@ def _build_four_gate_feature_record(
         }
     if "dgst_t_cost_alpha" in dgst_t:
         feat["dgst_t_cost_alpha"] = float(dgst_t["dgst_t_cost_alpha"])
+    if "dgst_t_prompt_cafe" in dgst_t:
+        feat["dgst_t_prompt_cafe"] = float(dgst_t["dgst_t_prompt_cafe"])
+        feat["dgst_t_prompt_cafe_per_layer"] = _compact_numpy(
+            dgst_t["dgst_t_prompt_cafe_per_layer"], dtype=np.float32
+        )
+        for key in (
+            "dgst_t_prompt_cafe_layer",
+            "dgst_t_prompt_cafe_requested_layer",
+            "dgst_t_prompt_cafe_prompt_size",
+        ):
+            feat[key] = int(dgst_t[key])
+        feat["dgst_t_prompt_cafe_temperature"] = float(
+            dgst_t["dgst_t_prompt_cafe_temperature"]
+        )
+        feat["dgst_t_prompt_cafe_definition"] = str(
+            dgst_t["dgst_t_prompt_cafe_definition"]
+        )
+        feat["dgst_t_prompt_cafe_position_scope"] = str(
+            dgst_t["dgst_t_prompt_cafe_position_scope"]
+        )
     if has_raw_attention:
         feat["dgst_t_raw_attention_definition"] = dgst_t.get(
             "dgst_t_raw_attention_definition",

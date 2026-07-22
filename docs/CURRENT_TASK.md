@@ -1,5 +1,19 @@
 # Current Task
 
+## 2026-07-22 InsLen Prompt CAFE 特征
+
+- compact four-gate 抽取新增 Prompt CAFE：对每层的 post-visual instruction hpre 状态 (z_j) 使用 LM Head/反嵌入矩阵，按 `softmax(W_u z_j / temperature)` 计算固定生成物体 `target_token_id` 的概率，再严格只在 instruction 位置维取最大值；不是在词表维取最大值。当前 COCO object span 沿用既有因果目标协议，使用该物体 mention 的首个生成 token ID。
+- 两份活动 YAML 均启用 `compute_prompt_cafe: true`、`prompt_cafe_temperature: 10.0`、`prompt_cafe_layer: 22`。这与 InsLen 官方代码的 `scale: 0.1` 和 `(scale * logits).softmax()` 数值等价，即论文公式中的温度 `tau=10`；第 22 层也对应其 LLaVA-1.5-7B 配置。为便于本项目后续画逐层曲线，抽取同时保存 `dgst_t_prompt_cafe_per_layer`；论文式指定层标量保存为 `dgst_t_prompt_cafe`，训练 alias `prompt_cafe` 使用该单值，另提供 `prompt_cafe_per_layer` 全层 alias。
+- CAFE 与 VV/VP transport scope 正交，只计算一次并共享给同一物体的分支；所有 caption wrapper 和 prompt-target wrapper 均已透传独立 CAFE 开关、温度和层号。serializer 保存公式、温度、实际/请求层、instruction token 数量和位置范围 provenance。两份 YAML 的 method feature set 从 82 增为 83，新增项为独立 `prompt_cafe`，未自动与 risk/EV 拼接。
+- 文献核对：原始 GLSim 的 Visual Logit Lens 公式直接使用 `softmax(VLL_l(v_i))[o]`，没有在 softmax 内加入 temperature；其 `tau` 是最后 real/hall 判定阈值。InsLen 官方评测代码会用共同的 `scale=0.1` 计算其 GLSim/ILS 概率，这是 InsLen 复现代码的实现选择，不能反写成 GLSim 原论文的 softmax 温度。
+- 验证：新增 CAFE 温度 softmax 手算、instruction 位置最大值、pre-visual 排除、指定层标量/逐层曲线、serializer 和两个训练 alias 测试；`prompt_cafe + stateupd_alpha_sweep` 6/6，通过 wrapper/因果位置/QA 抽取 21/21，通过 pipeline 中直接相关配置路由 10/10。相关 Python 全部 `py_compile`、两份 YAML 83 项解析和 `git diff --check` 通过。本轮没有启动 COCO4000 正式重提取；旧 `features.pkl` 不包含 CAFE 字段。
+
+## 2026-07-22 YAML 启用 hpre softmax-prob Gaussian risk
+
+- 两份活动 YAML 的 `feature_extraction.dgst_t.four_gate_methods` 与 `branches` 已同时启用 `hpre_softmax_prob_gauss`，确保抽取阶段实际执行 hpre hidden state 的全词表 softmax、读取目标 token 概率、构造 Gaussian gate，并保存默认 `sqrt-hpre` transport risk。不能只在训练列表写 alias，否则旧特征中没有底层字段。
+- 当前 `target_modes: [raw_logit_gauss]` 保持不变：该便利开关只负责 hpre raw-logit 的 Gaussian/Relative-VLL 二选一，与 softmax-prob 分支正交。当前 `support_modes: [vv, vp]` 会让同一次 forward 同时保存 VV 的 `dgst_t_hpre_softmax_prob_gauss_risk_sqrt_hpre_per_layer`/对应 mass×cosine，以及 VP 对应字段。训练列表对 VV 和 VP 各保留 matched risk、mass×cosine 单独及 matched risk+mass×cosine 三项，并新增 `sqrt_stateupd_alpha01` 至 `alpha09` 的 risk 与 risk+同作用域 mass×cosine；没有 VV risk+VP mass 或反向交叉组合。
+- 全局 `cost_modes` 已包含 matched-state 与九个 alpha，因此无需再改特征计算代码；本轮把已经能够抽取和解析的 softmax-prob alpha 字段正式加入 YAML 训练对比。softmax-prob 每个作用域为 3 个基础项 + 9×2 个 alpha 项，共 21 项；VV/VP 合计 42 项。原 raw-logit 40 项保持原顺序，活动 method feature set 总数由 46 增至 82。回归测试同步验证两份 YAML 的 resolved method、82 项命令展开、合成抽取的 VV/VP 九组 softmax alpha 字段，以及全部训练 alias 均可构建。初次只加入 risk 时的定向测试曾两次为 32/33：第一次是测试误以为 resolved 顺序与 YAML 相同，而 `target_modes` 设计上会在解析末尾追加 raw-logit；第二次是服务器 YAML 原有 `extraction_mode=all` 会在 method 项后合法追加 `ads/cgc/ads+cgc`。两条断言均按真实协议修正，且没有覆盖服务器的 `all`。最终 `stateupd_alpha_sweep + extraction_modes + four_gate_dgst` 33/33、pipeline 中直接相关的 10/10 均通过；两份 YAML 均验证为 82 个方法组合、其中 softmax-prob 42 个，VV/VP 交叉拼接为 0，`git diff --check` 通过。完整 `tests.test_pipeline_config` 此前仍有 6 failure + 4 error，均来自本轮未修改的 manifest/resume 契约：4 项找不到测试期望的 `pipeline_manifest.json`，其余 6 项未触发旧断言期待的 resume 拒绝；与新增 softmax 分支无关。本轮只改配置与测试，不启动 COCO4000 正式重提取，已有 ENDAC/VVVP `features.pkl` 不会凭配置修改自动出现新字段。
+
 ## 2026-07-22 COCO baseline 原方法与 YAML 三层 MLP 对比
 
 - `training.baseline` 从单个 `trainer` 扩展为有序 `trainers`，两份活动 YAML 默认同时运行 `native_paper` 与 `shared_torch_mlp`；CLI 保留 `--trainer` 单头兼容入口，并新增 `--trainers` 临时覆盖。默认比较范围严格为两种 head 都支持的 MetaToken、SVAR、ProjectAway，不把 DHCP/HalLoc 强行改造成不对应其原方法的 dense MLP。

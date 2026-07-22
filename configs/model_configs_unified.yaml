@@ -230,7 +230,7 @@ feature_extraction:
     # vocabulary softmax first.  Methods can also be removed from this list.
     four_gate_methods:
       - "hpre_raw_logit_gauss"
-     # - "hpre_softmax_prob_gauss"
+      - "hpre_softmax_prob_gauss"
      # - "hmid_raw_logit_gauss"
      # - "hmid_softmax_prob_gauss"
       # Direct control: visual_hpre -> vocabulary softmax -> target-token
@@ -246,7 +246,7 @@ feature_extraction:
     branches:
       hpre_raw_logit_gauss: true
       hpre_raw_logit_relative_vll: false
-      hpre_softmax_prob_gauss: false
+      hpre_softmax_prob_gauss: true
       hmid_raw_logit_gauss: false
       hmid_softmax_prob_gauss: false
       hpre_softmax_prob_direct: false
@@ -254,6 +254,12 @@ feature_extraction:
 
     # Shared transport math for all four gates and both direct controls.
     tau: 0.07
+    # InsLen CAFE: max over prompt positions of the generated object-token
+    # probability from hpre Logit Lens. The paper/code use scale=0.1, which is
+    # equivalent to softmax(logits / temperature) with temperature=10.
+    compute_prompt_cafe: true
+    prompt_cafe_temperature: 10.0
+    prompt_cafe_layer: 22
     source_distribution_mode: "softmax"
     support_scope: "visual"
     # Explicit support-mode switch. Choose ["vv"], ["vp"], or both; when both
@@ -392,8 +398,49 @@ training:
       - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha09"
       - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha09+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       # Generic risk resolves to the primary sqrt_matched_state field.
-     # - "hpre_softmax_prob_gauss_risk"
-     # - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk"
+      - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha02"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha02+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha03"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha03+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha04"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha04+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha05"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha05+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha06"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha06+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha07"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha07+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha08"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha08+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha09"
+      - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha09+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk"
+      - "vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha02"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha02+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha03"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha03+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha04"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha04+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha05"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha05+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha06"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha06+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha07"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha07+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha08"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha08+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha09"
+      - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha09+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "prompt_cafe"
       # - "hmid_raw_logit_gauss_risk"
       # - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
     #  - "hmid_softmax_prob_gauss_risk"

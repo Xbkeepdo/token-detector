@@ -738,6 +738,9 @@ def _compute_dgst_result_from_captures(
         four_gate_methods=cfg.get("four_gate_methods"),
         four_gate_cost_modes=cfg.get("cost_modes"),
         four_gate_support_modes=cfg.get("support_modes"),
+        compute_prompt_cafe=bool(cfg.get("compute_prompt_cafe", False)),
+        prompt_cafe_temperature=float(cfg.get("prompt_cafe_temperature", 10.0)),
+        prompt_cafe_layer=int(cfg.get("prompt_cafe_layer", 22)),
         release_layer_captures=bool(release_layer_captures),
     )
     if len(results) != 1:

@@ -325,6 +325,7 @@ class InternVLWrapper(BaseLVLMWrapper):
                     visual_end=img_end,
                     target_token_ids=[dgst_target_id],
                     prediction_positions=[seq_len - 1],
+                    prompt_positions=prompt_positions_override,
                     semantic_chunk_size=int(cfg_dgst_t.get("semantic_chunk_size", 64)),
                     tau=float(cfg_dgst_t.get("tau", 0.07)),
                     transport_top_k=int(cfg_dgst_t.get("transport_top_k", 64)),
@@ -340,6 +341,15 @@ class InternVLWrapper(BaseLVLMWrapper):
                         )
                     ),
                     support_modes=cfg_dgst_t.get("support_modes"),
+                    compute_prompt_cafe=bool(
+                        cfg_dgst_t.get("compute_prompt_cafe", False)
+                    ),
+                    prompt_cafe_temperature=float(
+                        cfg_dgst_t.get("prompt_cafe_temperature", 10.0)
+                    ),
+                    prompt_cafe_layer=int(
+                        cfg_dgst_t.get("prompt_cafe_layer", 22)
+                    ),
                     compute_ffn_injection_features=bool(
                         cfg_dgst_t.get("compute_ffn_injection_features", False)
                     ),
@@ -619,6 +629,13 @@ class InternVLWrapper(BaseLVLMWrapper):
                 four_gate_methods=cfg_dgst_t.get("four_gate_methods"),
                 four_gate_cost_modes=cfg_dgst_t.get("cost_modes"),
                 four_gate_support_modes=cfg_dgst_t.get("support_modes"),
+                compute_prompt_cafe=bool(
+                    cfg_dgst_t.get("compute_prompt_cafe", False)
+                ),
+                prompt_cafe_temperature=float(
+                    cfg_dgst_t.get("prompt_cafe_temperature", 10.0)
+                ),
+                prompt_cafe_layer=int(cfg_dgst_t.get("prompt_cafe_layer", 22)),
                 release_layer_captures=(not keep_attention and not keep_hidden),
             )
 

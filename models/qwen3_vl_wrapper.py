@@ -381,6 +381,13 @@ class Qwen3VLWrapper(BaseLVLMWrapper):
                 four_gate_methods=cfg_dgst_t.get("four_gate_methods"),
                 four_gate_cost_modes=cfg_dgst_t.get("cost_modes"),
                 four_gate_support_modes=cfg_dgst_t.get("support_modes"),
+                compute_prompt_cafe=bool(
+                    cfg_dgst_t.get("compute_prompt_cafe", False)
+                ),
+                prompt_cafe_temperature=float(
+                    cfg_dgst_t.get("prompt_cafe_temperature", 10.0)
+                ),
+                prompt_cafe_layer=int(cfg_dgst_t.get("prompt_cafe_layer", 22)),
                 release_layer_captures=True,
             )
             if len(results) != 1:

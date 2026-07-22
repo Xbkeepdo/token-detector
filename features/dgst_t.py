@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import lru_cache
+import math
 import multiprocessing as mp
 import os
 from typing import Any, Sequence
@@ -310,6 +311,9 @@ def compute_dgst_t_batch_from_captures(
     four_gate_methods: Sequence[str] | None = None,
     four_gate_cost_modes: Sequence[str] | str | None = None,
     four_gate_support_modes: Sequence[str] | str | None = None,
+    compute_prompt_cafe: bool = False,
+    prompt_cafe_temperature: float = 10.0,
+    prompt_cafe_layer: int = 22,
     release_layer_captures: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute DGST-T for several target tokens directly from shared captures."""
@@ -363,6 +367,9 @@ def compute_dgst_t_batch_from_captures(
             enabled_methods=four_gate_methods,
             compute_dual_scope=bool(compute_dual_scope),
             support_modes=four_gate_support_modes,
+            compute_prompt_cafe=bool(compute_prompt_cafe),
+            prompt_cafe_temperature=float(prompt_cafe_temperature),
+            prompt_cafe_layer=int(prompt_cafe_layer),
             compute_ffn_injection_features=bool(compute_ffn_injection_features),
             ffn_injection_eps=float(ffn_injection_eps),
             release_layer_captures=bool(release_layer_captures),
@@ -3983,6 +3990,9 @@ def compute_four_gate_dgst_batch_from_captures(
     enabled_methods: Sequence[str] | None = None,
     compute_dual_scope: bool = False,
     support_modes: Sequence[str] | str | None = None,
+    compute_prompt_cafe: bool = False,
+    prompt_cafe_temperature: float = 10.0,
+    prompt_cafe_layer: int = 22,
     compute_ffn_injection_features: bool = False,
     ffn_injection_eps: float = EPS,
     release_layer_captures: bool = False,
@@ -3995,6 +4005,10 @@ def compute_four_gate_dgst_batch_from_captures(
     ``dgst_t_vp_*``.
     ``compute_ffn_injection_features`` adds the historical layerwise FAD
     curve without re-enabling the other legacy FFN diagnostics.
+    ``compute_prompt_cafe`` adds the InsLen calibration confidence: at every
+    layer, project each hpre instruction state through the LM head with
+    temperature scaling, read the generated object token probability, and
+    take the maximum over prompt positions.
     """
     active_modes = _normalize_four_gate_support_modes(
         support_modes,
@@ -4077,6 +4091,80 @@ def compute_four_gate_dgst_batch_from_captures(
                     }
                 ):
                     result[f"dgst_t_vp_{key[len('dgst_t_'):]}"] = value
+
+    if compute_prompt_cafe:
+        from models.dgst_capture import (
+            resolve_output_embedding_layer,
+            target_probabilities_multi,
+        )
+
+        instruction_positions = [
+            int(position)
+            for position in prompt_positions or ()
+            if int(position) >= int(visual_end)
+        ]
+        if not instruction_positions:
+            raise ValueError(
+                "prompt CAFE extraction requires at least one post-visual "
+                "instruction token."
+            )
+        temperature_value = float(prompt_cafe_temperature)
+        if not math.isfinite(temperature_value) or temperature_value <= 0.0:
+            raise ValueError(
+                "prompt_cafe_temperature must be a finite positive value."
+            )
+        layer_count = len(captures)
+        requested_layer = int(prompt_cafe_layer)
+        resolved_layer = (
+            requested_layer
+            if requested_layer >= 0
+            else layer_count + requested_layer
+        )
+        if resolved_layer < 0 or resolved_layer >= layer_count:
+            raise ValueError(
+                f"prompt_cafe_layer={requested_layer} is outside {layer_count} "
+                "decoder layers."
+            )
+        output_layer = resolve_output_embedding_layer(model)
+        prompt_index = torch.tensor(
+            instruction_positions,
+            dtype=torch.long,
+            device=captures[0]["h_prev"].device,
+        )
+        cafe_by_target: list[list[float]] = [[] for _ in target_token_ids]
+        for layer_index, capture in enumerate(captures):
+            h_prev = capture.get("h_prev")
+            if h_prev is None:
+                raise RuntimeError(
+                    f"prompt CAFE layer {layer_index} is missing h_prev capture."
+                )
+            layer_prompt_index = prompt_index.to(device=h_prev.device)
+            prompt_hpre = h_prev[0].index_select(0, layer_prompt_index)
+            prompt_target_probs = target_probabilities_multi(
+                output_layer=output_layer,
+                states=prompt_hpre,
+                target_token_ids=target_token_ids,
+                chunk_size=int(semantic_chunk_size),
+                temperature=temperature_value,
+            )
+            layer_maxima = prompt_target_probs.float().max(dim=0).values
+            for target_offset, value in enumerate(layer_maxima):
+                cafe_by_target[target_offset].append(float(value.item()))
+        for result, values in zip(results, cafe_by_target):
+            curve = torch.tensor(values, dtype=torch.float32)
+            result["dgst_t_prompt_cafe_per_layer"] = curve
+            result["dgst_t_prompt_cafe"] = float(curve[resolved_layer].item())
+            result["dgst_t_prompt_cafe_layer"] = int(resolved_layer)
+            result["dgst_t_prompt_cafe_requested_layer"] = requested_layer
+            result["dgst_t_prompt_cafe_temperature"] = temperature_value
+            result["dgst_t_prompt_cafe_prompt_size"] = int(prompt_index.numel())
+            result["dgst_t_prompt_cafe_position_scope"] = (
+                "post_visual_instruction_tokens"
+            )
+            result["dgst_t_prompt_cafe_definition"] = (
+                "max_prompt_position_softmax_lm_head_hpre_over_temperature_"
+                "target_token_probability"
+            )
 
     if compute_ffn_injection_features:
         pred_positions = [int(position) for position in prediction_positions]
