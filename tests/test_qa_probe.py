@@ -37,11 +37,18 @@ def _current_row():
     dgst = {
         method: {
             "risk": np.array([0.1, 0.2], dtype=np.float32),
+            "risk_sqrt_stateupd_alpha01": np.array(
+                [0.15, 0.25], dtype=np.float32
+            ),
             "target_cosine": np.array([0.3, 0.4], dtype=np.float32),
             "ev": np.array([0.5, 0.6], dtype=np.float32),
         }
         for method in QA_DGST_METHODS
     }
+    dgst["prompt_cafe"] = 0.75
+    dgst["prompt_cafe_per_layer"] = np.asarray(
+        [0.25, 0.75], dtype=np.float32
+    )
     position = {
         "dgst": dgst,
         "ads_score": 0.7,
@@ -85,6 +92,20 @@ def test_feature_vectors_have_expected_blocks():
         "hpre_softmax_prob_gauss_target_cosine+"
         "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine@prompt_last_token",
     ).shape == (6,)
+    assert feature_vector(
+        current,
+        "vp_hpre_softmax_prob_gauss_risk+"
+        "vp_hpre_softmax_prob_gauss_target_cosine+"
+        "vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine@prompt_last_token",
+    ).shape == (6,)
+    assert feature_vector(
+        current,
+        "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01"
+        "@prompt_last_token",
+    ).shape == (2,)
+    assert feature_vector(
+        current, "prompt_cafe@prompt_last_token"
+    ).shape == (1,)
 
 
 def test_yes_only_protocol_filters_non_yes_rows():

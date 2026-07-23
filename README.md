@@ -109,6 +109,11 @@ root `features.pkl`.
 QA probe combinations are read verbatim from `training.feature_sets.method`
 and `training.feature_sets.ads_cgc`; the trainer only appends the configured QA
 position suffix. There is no separate hard-coded QA feature matrix.
+QA schema `qa-prompt-last-token-v6` serializes every enabled support scope:
+VV keeps its historical unprefixed method names, while VP uses explicit
+`vp_...` method names. VP-only runs therefore do not require dummy VV tensors.
+The compact payload also retains configured state-update risk curves and
+Prompt CAFE so every YAML-selected QA feature can be read directly by probes.
 
 QA baseline training uses the same `training.baseline.trainers` list and report
 protocol as COCO. The default runs both `native_paper` and

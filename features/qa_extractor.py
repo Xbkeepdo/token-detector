@@ -33,7 +33,7 @@ from features.extractor import (
 from models.base_wrapper import PromptTargetRequest
 
 
-QA_FEATURE_SCHEMA_VERSION = "qa-prompt-last-token-v5"
+QA_FEATURE_SCHEMA_VERSION = "qa-prompt-last-token-v6"
 _IMAGE_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
 DIRECT_SOFTMAX_METHOD = "hpre_softmax_prob_direct"
 
@@ -683,7 +683,7 @@ def find_answer_semantic_token(response_ids: list[int], tokenizer, answer: str |
 
 
 def _compact_dgst(result: dict) -> dict:
-    """Serialize the active six-target DGST profile without legacy aliases."""
+    """Serialize every active VV/VP DGST scope without legacy aliases."""
 
     methods = tuple(str(value) for value in result.get("dgst_t_four_gate_methods") or ())
     if not methods:
@@ -701,66 +701,159 @@ def _compact_dgst(result: dict) -> dict:
         "dgst_t_cost",
         "dgst_t_ot_solver",
     )
-    required = [
-        "dgst_t_attention_support_per_layer",
-        "dgst_t_source_dist_per_layer",
-        *metadata_keys,
-    ]
-    missing = [key for key in required if key not in result]
+    missing = [key for key in metadata_keys if key not in result]
     if missing:
-        raise KeyError(f"Missing QA DGST shared fields: {missing}")
+        raise KeyError(f"Missing QA DGST metadata fields: {missing}")
+
+    raw_scopes = tuple(
+        str(value)
+        for value in result.get("dgst_t_four_gate_support_scopes") or ()
+    )
+    if not raw_scopes:
+        # Compatibility with captures created before support scopes were
+        # serialized explicitly.
+        inferred = []
+        if "dgst_t_attention_support_per_layer" in result:
+            inferred.append("visual")
+        if "dgst_t_vp_attention_support_per_layer" in result:
+            inferred.append("visual_prompt")
+        raw_scopes = tuple(inferred)
+    unknown_scopes = sorted(set(raw_scopes) - {"visual", "visual_prompt"})
+    if unknown_scopes:
+        raise ValueError(f"Unknown QA DGST support scopes: {unknown_scopes}")
+    scope_specs = []
+    if "visual" in raw_scopes:
+        scope_specs.append(("vv", "", ""))
+    if "visual_prompt" in raw_scopes:
+        scope_specs.append(("vp", "vp_", "vp_"))
+    if not scope_specs:
+        raise KeyError("Missing QA DGST VV/VP support scope")
+
+    matrices_by_scope: dict[str, dict[str, np.ndarray]] = {}
+    for scope_name, raw_prefix, _ in scope_specs:
+        attention_key = f"dgst_t_{raw_prefix}attention_support_per_layer"
+        source_key = f"dgst_t_{raw_prefix}source_dist_per_layer"
+        scope_missing = [
+            key for key in (attention_key, source_key) if key not in result
+        ]
+        if scope_missing:
+            raise KeyError(
+                f"Missing QA DGST {scope_name.upper()} shared fields: "
+                f"{scope_missing}"
+            )
+        matrices_by_scope[scope_name] = {
+            "attention_support": _as_float32_array(result[attention_key]),
+            "source_dist": _as_float32_array(result[source_key]),
+        }
+
+    primary_scope = "vv" if "vv" in matrices_by_scope else "vp"
     compact: dict = {
         "schema_version": "dgst-target-comparison-v3",
         "methods": list(methods),
-        "metadata": {key: result[key] for key in metadata_keys},
-        "matrices": {
-            "attention_support": _as_float32_array(
-                result["dgst_t_attention_support_per_layer"]
-            ),
-            "source_dist": _as_float32_array(result["dgst_t_source_dist_per_layer"]),
+        "support_modes": [scope[0] for scope in scope_specs],
+        "metadata": {
+            **{key: result[key] for key in metadata_keys},
+            "dgst_t_four_gate_support_scopes": list(raw_scopes),
         },
+        # Preserve the historical primary matrices field for VV consumers. In
+        # VP-only mode it deliberately points at VP so spatial diagnostics can
+        # still use the same path.
+        "matrices": matrices_by_scope[primary_scope],
+        "matrices_by_scope": matrices_by_scope,
     }
+    if "dgst_t_prompt_cafe" in result:
+        compact["prompt_cafe"] = float(result["dgst_t_prompt_cafe"])
+        compact["prompt_cafe_per_layer"] = _as_float32_array(
+            result["dgst_t_prompt_cafe_per_layer"]
+        )
+        for key in (
+            "dgst_t_prompt_cafe_layer",
+            "dgst_t_prompt_cafe_requested_layer",
+            "dgst_t_prompt_cafe_temperature",
+            "dgst_t_prompt_cafe_prompt_size",
+            "dgst_t_prompt_cafe_position_scope",
+            "dgst_t_prompt_cafe_definition",
+        ):
+            if key in result:
+                compact["metadata"][key] = result[key]
     target_region_top_k = int(result["dgst_t_target_region_top_k"])
     topk_slug = f"topk{target_region_top_k}"
-    for method in methods:
-        state = _target_comparison_state(method)
-        keys = {
-            "risk": f"dgst_t_{method}_risk_sqrt_{state}_per_layer",
-            "target_cosine": (
-                f"dgst_t_{method}_target_cosine_{topk_slug}_{state}_per_layer"
-            ),
-            "ev": (
-                f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
-                f"{topk_slug}_{state}_per_layer"
-            ),
-        }
-        branch_missing = [key for key in keys.values() if key not in result]
-        if branch_missing:
-            raise KeyError(f"Missing QA DGST branch fields for {method}: {branch_missing}")
-        branch = {
-            "state": state,
-            **{name: _as_float32_array(result[key]) for name, key in keys.items()},
-        }
-        if method == DIRECT_SOFTMAX_METHOD:
-            for name, key in (
-                (
-                    "target_prob_matrix",
-                    "dgst_t_hpre_softmax_prob_direct_target_prob_matrix_per_layer",
+    scoped_methods: list[str] = []
+    for scope_name, raw_prefix, compact_prefix in scope_specs:
+        for method in methods:
+            compact_method = f"{compact_prefix}{method}"
+            state = _target_comparison_state(method)
+            keys = {
+                "risk": (
+                    f"dgst_t_{raw_prefix}{method}_risk_sqrt_{state}_per_layer"
                 ),
-                (
-                    "target_dist",
-                    "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer",
+                "target_cosine": (
+                    f"dgst_t_{raw_prefix}{method}_target_cosine_"
+                    f"{topk_slug}_{state}_per_layer"
                 ),
-            ):
-                if key not in result:
-                    raise KeyError(f"Missing direct QA DGST matrix: {key}")
-                branch[name] = _as_float32_array(result[key])
-        else:
-            gate_key = f"dgst_t_{method}_gate_per_layer"
-            if gate_key not in result:
-                raise KeyError(f"Missing QA DGST gate: {gate_key}")
-            branch["gate"] = _as_float32_array(result[gate_key])
-        compact[method] = branch
+                "ev": (
+                    f"dgst_t_{raw_prefix}{method}_"
+                    "ev_target_dist_mass_x_cosine_"
+                    f"{topk_slug}_{state}_per_layer"
+                ),
+            }
+            branch_missing = [
+                key for key in keys.values() if key not in result
+            ]
+            if branch_missing:
+                raise KeyError(
+                    f"Missing QA DGST branch fields for {compact_method}: "
+                    f"{branch_missing}"
+                )
+            branch = {
+                "state": state,
+                "support_mode": scope_name,
+                **{
+                    name: _as_float32_array(result[key])
+                    for name, key in keys.items()
+                },
+            }
+            risk_prefix = f"dgst_t_{raw_prefix}{method}_risk_"
+            for key, value in result.items():
+                if not (
+                    key.startswith(risk_prefix)
+                    and key.endswith("_per_layer")
+                ):
+                    continue
+                component = key[
+                    len(f"dgst_t_{raw_prefix}{method}_")
+                    : -len("_per_layer")
+                ]
+                if component == f"risk_sqrt_{state}":
+                    component = "risk_sqrt_matched_state"
+                elif component == f"risk_cosine_{state}":
+                    component = "risk_cosine_matched_state"
+                branch[component] = _as_float32_array(value)
+            if method == DIRECT_SOFTMAX_METHOD:
+                for name, suffix in (
+                    (
+                        "target_prob_matrix",
+                        "hpre_softmax_prob_direct_target_prob_matrix_per_layer",
+                    ),
+                    (
+                        "target_dist",
+                        "hpre_softmax_prob_direct_target_dist_per_layer",
+                    ),
+                ):
+                    key = f"dgst_t_{raw_prefix}{suffix}"
+                    if key not in result:
+                        raise KeyError(
+                            f"Missing direct QA DGST matrix: {key}"
+                        )
+                    branch[name] = _as_float32_array(result[key])
+            else:
+                gate_key = f"dgst_t_{raw_prefix}{method}_gate_per_layer"
+                if gate_key not in result:
+                    raise KeyError(f"Missing QA DGST gate: {gate_key}")
+                branch["gate"] = _as_float32_array(result[gate_key])
+            compact[compact_method] = branch
+            scoped_methods.append(compact_method)
+    compact["scoped_methods"] = scoped_methods
     return compact
 
 

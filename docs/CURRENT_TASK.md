@@ -1,5 +1,11 @@
 # Current Task
 
+## 2026-07-23 QA VP-only 特征提取修复
+
+- 修复 `support_modes: [vp]` 时 QA `_compact_dgst()` 仍强制读取 VV 无前缀共享矩阵的问题。根特征 schema 升级为 `qa-prompt-last-token-v6`：VV 继续使用无前缀分支，VP 使用 `vp_*` 分支；VP-only 的主 `matrices` 指向 VP，同时 `matrices_by_scope` 明确保存全部启用作用域，双模式不再丢弃 VP。
+- QA compact 现在同时保存当前 `cost_modes` 生成的 matched/state-update risk 曲线及 Prompt CAFE 标量/逐层曲线；probe 解析器支持 `vp_` 方法、`risk_sqrt_stateupd_alpha01..09`、matched/cosine/geo risk 和直接 compact 字段。此前 VP-only 的 10 条样本会全部报缺少 `dgst_t_attention_support_per_layer`，生成 5-byte 空 `features.pkl`，随后 resume 才表现为 `feature_parts is missing`。
+- 真实 LLaVA-1.5-7B 双卡 CLEVR 10 问题严格 8/2 冒烟测试通过：generation/label/root feature/baseline feature 均为 10 条，generation/extraction failure 均为 0，baseline MetaToken/SVAR/DHCP/ProjectAway 和 2 个分片完整，manifest=`complete`。当前 VP-only YAML 解析出的 22 个 method feature 对全部 10 条样本均能构建有限矩阵；定向 QA 回归 20/20 通过。
+
 ## 2026-07-23 CLEVR-Exist 扩展为可配置 9K 严格 8:2
 
 - CLEVR 数据规模和数据集 slug 不再埋在准备代码中：两份活动 YAML 新增 `clevr_dataset_name`、`clevr_train_questions`、`clevr_val_questions`、`clevr_test_questions`，当前默认分别为 `clevr_exist_9k`、`7200/0/1800`。`scripts/prepare_qa_benchmarks.py` 同时提供同名 CLI 覆盖参数，并把实际 dataset 名传入每条 question 的 `dataset`、`key`、prepared 目录和 manifest 描述，避免 9K 内容继续伪装成 5K。

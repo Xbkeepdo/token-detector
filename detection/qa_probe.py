@@ -33,7 +33,7 @@ QA_LABEL_PROTOCOLS = (
     "answer_correctness_all",
     "object_hallucination_yes_only",
 )
-QA_DGST_METHODS = (
+QA_DGST_BASE_METHODS = (
     "hpre_raw_logit_gauss",
     "hpre_softmax_prob_gauss",
     "hmid_raw_logit_gauss",
@@ -41,8 +41,15 @@ QA_DGST_METHODS = (
     "hpre_softmax_prob_direct",
     "raw_attention",
 )
+QA_DGST_METHODS = (
+    *QA_DGST_BASE_METHODS,
+    *(f"vp_{method}" for method in QA_DGST_BASE_METHODS),
+)
 QA_DGST_COMPONENTS = (
     "risk",
+    "risk_sqrt_matched_state",
+    "risk_cosine_matched_state",
+    "risk_geo_stateupd_lu1",
     "target_cosine",
     "ev_target_dist_mass_x_cosine",
 )
@@ -275,9 +282,9 @@ def _position_single_vector(position_data: Mapping[str, object], block: str) -> 
     dgst = position_data.get("dgst")
     if not isinstance(dgst, Mapping):
         raise KeyError("Missing position DGST payload")
-    method, component = _parse_current_dgst_block(block)
     if block in dgst:
         return _concat(dgst[block])
+    method, component = _parse_current_dgst_block(block)
     method_payload = dgst.get(method)
     if isinstance(method_payload, Mapping):
         candidates = [component]
@@ -314,7 +321,9 @@ def _parse_current_dgst_block(block: str) -> tuple[str, str]:
         if not block.startswith(prefix):
             continue
         component = block[len(prefix):]
-        if component in QA_DGST_COMPONENTS:
+        if component in QA_DGST_COMPONENTS or re.fullmatch(
+            r"risk_sqrt_stateupd_alpha0[1-9]", component
+        ):
             return method, component
     raise ValueError(
         f"Unknown current QA DGST feature block {block!r}; expected one of "
