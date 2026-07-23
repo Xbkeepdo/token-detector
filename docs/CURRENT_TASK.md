@@ -1,5 +1,10 @@
 # Current Task
 
+## 2026-07-23 CLEVR 9K 严格 8:2 校验单位修复
+
+- 修复 `train_qa_probes.py` 对 CLEVR 9K 的二次划分校验：准备阶段严格抽取 7200/1800 个问题，且官方 train/val 图片命名空间完全隔离；同一图片存在多个问题，因此 6896/1733 个唯一图片不应被错误要求再次满足精确 8:2。现在 CLEVR 按问题行检查精确 8:2，同时仍检查任一图片不得跨 probe split。
+- POPE 与 AMBER 的协议没有放宽，继续按物理图片数量检查精确 8:2；新增反向回归用例，确保即使问题行恰好 8:2，只要物理图片为 3:2 仍会拒绝。
+
 ## 2026-07-23 QA VP-only 特征提取修复
 
 - 修复 `support_modes: [vp]` 时 QA `_compact_dgst()` 仍强制读取 VV 无前缀共享矩阵的问题。根特征 schema 升级为 `qa-prompt-last-token-v6`：VV 继续使用无前缀分支，VP 使用 `vp_*` 分支；VP-only 的主 `matrices` 指向 VP，同时 `matrices_by_scope` 明确保存全部启用作用域，双模式不再丢弃 VP。

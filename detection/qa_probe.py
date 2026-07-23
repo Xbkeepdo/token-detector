@@ -367,12 +367,16 @@ def build_matrix(
 
 
 def validate_image_level_splits(rows: Sequence[Mapping[str, object]]) -> dict[str, int]:
-    """Reject rows whose physical image appears in multiple probe splits.
+    """Validate the dataset-specific strict 8:2 unit and image isolation.
 
     POPE strategies share one COCO image namespace, so ``source_split`` is
     excluded from their identity. CLEVR train/val indices are separate image
     namespaces, so their official source split remains part of the identity.
-    Legacy synthetic rows without image metadata remain supported.
+    CLEVR is sampled as an exact 8:2 question subset from those disjoint
+    official pools, and repeated questions for one image mean its unique-image
+    counts need not also be exactly 8:2. POPE and AMBER retain strict physical-
+    image 8:2 validation. Legacy synthetic rows without image metadata remain
+    supported through question-row validation.
     """
 
     valid_splits = ("train", "val", "test")
@@ -380,6 +384,7 @@ def validate_image_level_splits(rows: Sequence[Mapping[str, object]]) -> dict[st
     key_owner: dict[str, str] = {}
     split_images = {split: set() for split in valid_splits}
     split_counts = {split: 0 for split in valid_splits}
+    datasets: set[str] = set()
     for row in rows:
         split = str(row.get("probe_split") or "").strip()
         if split not in split_counts:
@@ -387,6 +392,9 @@ def validate_image_level_splits(rows: Sequence[Mapping[str, object]]) -> dict[st
                 f"QA row {row.get('key')!r} has invalid probe_split {split!r}"
             )
         split_counts[split] += 1
+        dataset = str(row.get("dataset") or "").strip()
+        if dataset:
+            datasets.add(dataset)
         key = str(row.get("key") or "").strip()
         if key:
             if key in key_owner:
@@ -410,7 +418,15 @@ def validate_image_level_splits(rows: Sequence[Mapping[str, object]]) -> dict[st
     train_images = len(split_images["train"])
     test_images = len(split_images["test"])
     total_images = train_images + test_images
-    if total_images:
+    clevr_question_split = bool(datasets) and all(
+        dataset.startswith("clevr_exist_") for dataset in datasets
+    )
+    if clevr_question_split:
+        total_rows = split_counts["train"] + split_counts["test"]
+        expected_train = int(total_rows * 0.8)
+        actual_train = split_counts["train"]
+        unit = "question rows"
+    elif total_images:
         expected_train = int(total_images * 0.8)
         actual_train = train_images
         unit = "physical images"

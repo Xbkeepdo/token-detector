@@ -158,6 +158,66 @@ def test_clevr_official_source_split_is_part_of_image_identity():
     assert validate_image_level_splits(rows) == {"train": 4, "val": 0, "test": 1}
 
 
+def test_clevr_strict_82_uses_question_rows_with_repeated_images():
+    rows = []
+    for question_id, image_id in enumerate((1, 1, 2, 3, 4, 5, 6, 7)):
+        rows.append({
+            "key": f"train-{question_id}",
+            "dataset": "clevr_exist_9k",
+            "source_split": "train",
+            "image_id": image_id,
+            "probe_split": "train",
+        })
+    for question_id in range(2):
+        rows.append({
+            "key": f"test-{question_id}",
+            "dataset": "clevr_exist_9k",
+            "source_split": "val",
+            "image_id": 1,
+            "probe_split": "test",
+        })
+    # Questions are exactly 8:2. Unique physical identities are 7:1 because
+    # multiple questions can refer to one image, which must not invalidate the
+    # prepared CLEVR question protocol.
+    assert validate_image_level_splits(rows) == {
+        "train": 7,
+        "val": 0,
+        "test": 1,
+    }
+
+
+def test_pope_and_amber_still_require_physical_image_82():
+    for dataset in ("pope", "amber_discriminative"):
+        rows = []
+        train_images = (1, 1, 1, 2, 2, 2, 3, 3)
+        for question_id, image_id in enumerate(train_images):
+            rows.append({
+                "key": f"{dataset}-train-{question_id}",
+                "dataset": dataset,
+                "source_split": "random",
+                "image_id": image_id,
+                "probe_split": "train",
+            })
+        for question_id, image_id in enumerate((4, 5)):
+            rows.append({
+                "key": f"{dataset}-test-{question_id}",
+                "dataset": dataset,
+                "source_split": "random",
+                "image_id": image_id,
+                "probe_split": "test",
+            })
+        # Question rows are 8:2, but physical images are 3:2. POPE and AMBER
+        # must continue to reject this split.
+        try:
+            validate_image_level_splits(rows)
+        except ValueError as exc:
+            assert "physical images" in str(exc)
+        else:
+            raise AssertionError(
+                f"expected {dataset} physical-image ratio rejection"
+            )
+
+
 def test_amber_strict_82_is_over_images_not_variable_question_rows():
     rows = []
     for image_id in range(1, 5):
