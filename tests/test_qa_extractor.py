@@ -65,7 +65,11 @@ def _scope_result(*scopes):
         ),
     }
     for scope in scopes:
-        prefix = "" if scope == "visual" else "vp_"
+        prefix = {
+            "visual": "",
+            "visual_prompt": "vp_",
+            "visual_prompt_end": "vpend_",
+        }[scope]
         base = f"dgst_t_{prefix}{method}"
         result[f"dgst_t_{prefix}attention_support_per_layer"] = np.asarray(
             [[1.0, 2.0]], dtype=np.float32
@@ -127,3 +131,17 @@ def test_compact_dgst_keeps_vv_and_vp_branches_together():
     assert set(compact["matrices_by_scope"]) == {"vv", "vp"}
     assert compact["hpre_raw_logit_gauss"]["support_mode"] == "vv"
     assert compact["vp_hpre_raw_logit_gauss"]["support_mode"] == "vp"
+
+
+def test_compact_dgst_accepts_vpend_only_fields():
+    compact = _compact_dgst(_scope_result("visual_prompt_end"))
+    method = "vpend_hpre_raw_logit_gauss"
+    assert compact["support_modes"] == ["vpend"]
+    assert compact["scoped_methods"] == [method]
+    assert method in compact
+    assert "vp_hpre_raw_logit_gauss" not in compact
+    np.testing.assert_array_equal(
+        compact["matrices_by_scope"]["vpend"]["attention_support"],
+        [[1.0, 2.0]],
+    )
+    assert compact[method]["support_mode"] == "vpend"

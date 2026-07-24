@@ -659,45 +659,53 @@ def _register_four_gate_aliases() -> None:
             f"{method}_risk_sqrt_cosine_matched_state"
         ] = f"{method}_risk_sqrt_matched_state"
 
-    # VP uses the same hpre/hmid construction over visual+prompt support.
-    # Prefixing the training block and serialized field keeps it impossible to
-    # accidentally compare a VP curve against the backward-compatible VV key.
-    for method in methods:
-        scoped_method = f"vp_{method}"
-        state_name = "hmid" if method.startswith("hmid_") else "hpre"
-        specs = {
-            f"{scoped_method}_risk": (
-                f"dgst_t_{scoped_method}_risk_sqrt_{state_name}_per_layer"
-            ),
-            f"{scoped_method}_target_cosine": (
-                f"dgst_t_{scoped_method}_target_cosine_"
-                f"topk{{target_region_top_k}}_{state_name}_per_layer"
-            ),
-            f"{scoped_method}_ev_target_dist_mass_x_cosine": (
-                f"dgst_t_{scoped_method}_ev_target_dist_mass_x_cosine_"
-                f"topk{{target_region_top_k}}_{state_name}_per_layer"
-            ),
-            f"{scoped_method}_risk_sqrt_matched_state": (
-                f"dgst_t_{scoped_method}_risk_sqrt_{state_name}_per_layer"
-            ),
-            f"{scoped_method}_risk_geo_stateupd_lu1": (
-                f"dgst_t_{scoped_method}_risk_geo_stateupd_lu1_per_layer"
-            ),
-            f"{scoped_method}_risk_cosine_matched_state": (
-                f"dgst_t_{scoped_method}_risk_cosine_{state_name}_per_layer"
-            ),
-        }
-        for alpha_tenth in range(1, 10):
-            alpha_slug = f"0{alpha_tenth}"
-            specs[
-                f"{scoped_method}_risk_sqrt_stateupd_alpha{alpha_slug}"
-            ] = f"dgst_t_{scoped_method}_risk_sqrt_stateupd_alpha{alpha_slug}_per_layer"
-        for block, feature_key in specs.items():
-            FEATURE_ALIASES[block] = block
-            FEATURE_KEYS[block] = feature_key
-        FEATURE_ALIASES[
-            f"{scoped_method}_risk_sqrt_cosine_matched_state"
-        ] = f"{scoped_method}_risk_sqrt_matched_state"
+    # VP and VPend use the same construction over different prompt scopes.
+    # Prefixing both the training block and serialized field prevents either
+    # curve from being confused with VV or with the other prompt scope.
+    for scope_prefix in ("vp", "vpend"):
+        for method in methods:
+            scoped_method = f"{scope_prefix}_{method}"
+            state_name = "hmid" if method.startswith("hmid_") else "hpre"
+            specs = {
+                f"{scoped_method}_source_target_js": None,
+                f"{scoped_method}_source_target_union_topk_js": None,
+                f"{scoped_method}_one_minus_target_dist_mass_x_cosine": None,
+                f"{scoped_method}_risk": (
+                    f"dgst_t_{scoped_method}_risk_sqrt_{state_name}_per_layer"
+                ),
+                f"{scoped_method}_target_cosine": (
+                    f"dgst_t_{scoped_method}_target_cosine_"
+                    f"topk{{target_region_top_k}}_{state_name}_per_layer"
+                ),
+                f"{scoped_method}_ev_target_dist_mass_x_cosine": (
+                    f"dgst_t_{scoped_method}_ev_target_dist_mass_x_cosine_"
+                    f"topk{{target_region_top_k}}_{state_name}_per_layer"
+                ),
+                f"{scoped_method}_risk_sqrt_matched_state": (
+                    f"dgst_t_{scoped_method}_risk_sqrt_{state_name}_per_layer"
+                ),
+                f"{scoped_method}_risk_geo_stateupd_lu1": (
+                    f"dgst_t_{scoped_method}_risk_geo_stateupd_lu1_per_layer"
+                ),
+                f"{scoped_method}_risk_cosine_matched_state": (
+                    f"dgst_t_{scoped_method}_risk_cosine_{state_name}_per_layer"
+                ),
+            }
+            for alpha_tenth in range(1, 10):
+                alpha_slug = f"0{alpha_tenth}"
+                specs[
+                    f"{scoped_method}_risk_sqrt_stateupd_alpha{alpha_slug}"
+                ] = (
+                    f"dgst_t_{scoped_method}_risk_sqrt_stateupd_"
+                    f"alpha{alpha_slug}_per_layer"
+                )
+            for block, feature_key in specs.items():
+                FEATURE_ALIASES[block] = block
+                if feature_key is not None:
+                    FEATURE_KEYS[block] = feature_key
+            FEATURE_ALIASES[
+                f"{scoped_method}_risk_sqrt_cosine_matched_state"
+            ] = f"{scoped_method}_risk_sqrt_matched_state"
 
 
 def _register_ads_cgc_aliases() -> None:
@@ -739,6 +747,19 @@ FOUR_GATE_SOURCE_TARGET_JS_BLOCKS = {
         "hpre_softmax_prob_direct",
         "raw_attention",
     )
+    + tuple(
+        f"{scope}_{method}"
+        for scope in ("vp", "vpend")
+        for method in (
+            "hpre_raw_logit_gauss",
+            "hpre_raw_logit_relative_vll",
+            "hpre_softmax_prob_gauss",
+            "hmid_raw_logit_gauss",
+            "hmid_softmax_prob_gauss",
+            "hpre_softmax_prob_direct",
+            "raw_attention",
+        )
+    )
 }
 FOUR_GATE_RISK_BLOCKS = {}
 for _four_gate_method in (
@@ -756,6 +777,13 @@ for _four_gate_method in (
     "vp_hmid_softmax_prob_gauss",
     "vp_hpre_softmax_prob_direct",
     "vp_raw_attention",
+    "vpend_hpre_raw_logit_gauss",
+    "vpend_hpre_raw_logit_relative_vll",
+    "vpend_hpre_softmax_prob_gauss",
+    "vpend_hmid_raw_logit_gauss",
+    "vpend_hmid_softmax_prob_gauss",
+    "vpend_hpre_softmax_prob_direct",
+    "vpend_raw_attention",
 ):
     FOUR_GATE_RISK_BLOCKS[f"{_four_gate_method}_risk"] = (
         _four_gate_method,
@@ -789,6 +817,19 @@ FOUR_GATE_SOURCE_TARGET_UNION_TOPK_JS_BLOCKS = {
         "hpre_softmax_prob_direct",
         "raw_attention",
     )
+    + tuple(
+        f"{scope}_{method}"
+        for scope in ("vp", "vpend")
+        for method in (
+            "hpre_raw_logit_gauss",
+            "hpre_raw_logit_relative_vll",
+            "hpre_softmax_prob_gauss",
+            "hmid_raw_logit_gauss",
+            "hmid_softmax_prob_gauss",
+            "hpre_softmax_prob_direct",
+            "raw_attention",
+        )
+    )
 }
 FOUR_GATE_SOURCE_TARGET_UNION_TOPK_JS_CACHE_KEY = (
     "_computed_four_gate_source_target_union_topk_js"
@@ -803,6 +844,19 @@ FOUR_GATE_ONE_MINUS_TARGET_MASS_COSINE_BLOCKS = {
         "hmid_softmax_prob_gauss",
         "hpre_softmax_prob_direct",
         "raw_attention",
+    )
+    + tuple(
+        f"{scope}_{method}"
+        for scope in ("vp", "vpend")
+        for method in (
+            "hpre_raw_logit_gauss",
+            "hpre_raw_logit_relative_vll",
+            "hpre_softmax_prob_gauss",
+            "hmid_raw_logit_gauss",
+            "hmid_softmax_prob_gauss",
+            "hpre_softmax_prob_direct",
+            "raw_attention",
+        )
     )
 }
 FOUR_GATE_ONE_MINUS_TARGET_MASS_COSINE_CACHE_KEY = (
@@ -1151,7 +1205,8 @@ def _four_gate_risk_block(feat: dict, block: str) -> np.ndarray:
     elif str(cost_mode).startswith("sqrt_stateupd_alpha0"):
         key = f"dgst_t_{method}_risk_{cost_mode}_per_layer"
     elif cost_mode == "cosine_matched_state":
-        state_name = "hmid" if method.removeprefix("vp_").startswith("hmid_") else "hpre"
+        _scope_prefix, base_method = _four_gate_scope_and_method(method)
+        state_name = "hmid" if base_method.startswith("hmid_") else "hpre"
         key = f"dgst_t_{method}_risk_cosine_{state_name}_per_layer"
     else:
         key = FEATURE_KEYS[block]
@@ -1165,7 +1220,8 @@ def _four_gate_source_target_js_block(feat: dict, block: str) -> np.ndarray:
     method = FOUR_GATE_SOURCE_TARGET_JS_BLOCKS[block]
     cache = feat.setdefault(FOUR_GATE_SOURCE_TARGET_JS_CACHE_KEY, {})
     if method not in cache:
-        source_key = "dgst_t_source_dist_per_layer"
+        scope_prefix, _base_method = _four_gate_scope_and_method(method)
+        source_key = f"dgst_t_{scope_prefix}source_dist_per_layer"
         source_values = feat.get(source_key)
         if source_values is None:
             raise KeyError(f"Feature block {block!r} requires {source_key!r}.")
@@ -1200,7 +1256,8 @@ def _four_gate_source_target_union_topk_js_block(
     method = FOUR_GATE_SOURCE_TARGET_UNION_TOPK_JS_BLOCKS[block]
     cache = feat.setdefault(FOUR_GATE_SOURCE_TARGET_UNION_TOPK_JS_CACHE_KEY, {})
     if method not in cache:
-        source_key = "dgst_t_source_dist_per_layer"
+        scope_prefix, _base_method = _four_gate_scope_and_method(method)
+        source_key = f"dgst_t_{scope_prefix}source_dist_per_layer"
         source_values = feat.get(source_key)
         if source_values is None:
             raise KeyError(f"Feature block {block!r} requires {source_key!r}.")
@@ -1299,8 +1356,16 @@ def _four_gate_one_minus_target_mass_x_cosine_block(
     return np.asarray(cache[method], dtype=np.float32).reshape(-1)
 
 
+def _four_gate_scope_and_method(method: str) -> tuple[str, str]:
+    for scope_prefix in ("vpend_", "vp_"):
+        if method.startswith(scope_prefix):
+            return scope_prefix, method.removeprefix(scope_prefix)
+    return "", method
+
+
 def _four_gate_target_values(feat: dict, method: str, block: str) -> np.ndarray:
-    attention_key = "dgst_t_attention_support_per_layer"
+    scope_prefix, base_method = _four_gate_scope_and_method(method)
+    attention_key = f"dgst_t_{scope_prefix}attention_support_per_layer"
     attention_values = feat.get(attention_key)
     if attention_values is None:
         raise KeyError(f"Feature block {block!r} requires {attention_key!r}.")
@@ -1311,16 +1376,19 @@ def _four_gate_target_values(feat: dict, method: str, block: str) -> np.ndarray:
             f"matrix, got {attention.shape}."
         )
 
-    if method == "raw_attention":
+    if base_method == "raw_attention":
         return attention
-    if method == "hpre_softmax_prob_direct":
-        target_key = "dgst_t_hpre_softmax_prob_direct_target_dist_per_layer"
+    if base_method == "hpre_softmax_prob_direct":
+        target_key = (
+            f"dgst_t_{scope_prefix}hpre_softmax_prob_direct_"
+            "target_dist_per_layer"
+        )
         target_values = feat.get(target_key)
         if target_values is None:
             raise KeyError(f"Feature block {block!r} requires {target_key!r}.")
         target = np.asarray(target_values, dtype=np.float64)
     else:
-        gate_key = f"dgst_t_{method}_gate_per_layer"
+        gate_key = f"dgst_t_{scope_prefix}{base_method}_gate_per_layer"
         gate_values = feat.get(gate_key)
         if gate_values is None:
             raise KeyError(f"Feature block {block!r} requires {gate_key!r}.")

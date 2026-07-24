@@ -492,11 +492,29 @@ def _enabled_method_feature_sets(
     active = set(resolve_dgst_four_gate_methods(dgst))
     disabled = known - active
     configured_support_modes = dgst.get("support_modes")
+    support_aliases = {
+        "vv": "vv",
+        "visual": "vv",
+        "vp": "vp",
+        "visual_prompt": "vp",
+        "visual+prompt": "vp",
+        "vpend": "vpend",
+        "vp_end": "vpend",
+        "visual_prompt_end": "vpend",
+        "visual+prompt_end": "vpend",
+        "post_visual_prompt": "vpend",
+    }
     if isinstance(configured_support_modes, str):
-        support_modes = {configured_support_modes.strip().lower()}
-    elif isinstance(configured_support_modes, Sequence):
+        raw_support_modes = {configured_support_modes.strip().lower()}
         support_modes = {
+            support_aliases.get(mode, mode) for mode in raw_support_modes
+        }
+    elif isinstance(configured_support_modes, Sequence):
+        raw_support_modes = {
             str(mode).strip().lower() for mode in configured_support_modes
+        }
+        support_modes = {
+            support_aliases.get(mode, mode) for mode in raw_support_modes
         }
     else:
         support_modes = {
@@ -517,11 +535,18 @@ def _enabled_method_feature_sets(
         for component in str(value).split("+"):
             for factor in component.split("*"):
                 name = factor.strip()
-                is_vp = name.startswith("vp_")
-                base_name = name.removeprefix("vp_")
-                if is_vp and "vp" not in support_modes:
+                if name.startswith("vpend_"):
+                    support_mode = "vpend"
+                    base_name = name.removeprefix("vpend_")
+                elif name.startswith("vp_"):
+                    support_mode = "vp"
+                    base_name = name.removeprefix("vp_")
+                else:
+                    support_mode = None
+                    base_name = name
+                if support_mode is not None and support_mode not in support_modes:
                     return False
-                if not is_vp and any(
+                if support_mode is None and any(
                     base_name.startswith(f"{method}_") for method in known
                 ) and "vv" not in support_modes:
                     return False

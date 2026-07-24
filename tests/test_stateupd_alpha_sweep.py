@@ -208,31 +208,81 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
             self.assertEqual(matrix.shape, (1, expected_width))
             self.assertEqual(labels.tolist(), [1])
 
-    def test_active_yamls_add_softmax_prob_vv_vp_alpha_risk_and_mass_probes(self) -> None:
-        expected = _expected_active_feature_sets()
-        for relative_path in (
-            "configs/model_configs_unified.yaml",
-            "configs/model_configs_server_fj01.yaml",
-        ):
+    def test_active_yamls_use_authoritative_methods_and_vpend_features(self) -> None:
+        cases = {
+            "configs/model_configs_unified.yaml": {
+                "support_modes": ["vpend"],
+                "cost_modes": ["sqrt_matched_state"],
+                "features": [
+                    "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state",
+                    "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state+"
+                    "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
+                    "vpend_hpre_softmax_prob_gauss_risk",
+                    "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
+                    "vpend_hpre_softmax_prob_gauss_risk+"
+                    "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
+                    "prompt_cafe",
+                ],
+            },
+            "configs/model_configs_server_fj01.yaml": {
+                "support_modes": ["vv", "vpend"],
+                "cost_modes": ["sqrt_matched_state", *ALPHA_MODES],
+                "features": [
+                    "vpend_hpre_softmax_prob_gauss_risk",
+                    "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
+                    "vpend_hpre_softmax_prob_gauss_risk+"
+                    "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
+                ],
+            },
+        }
+        retired_dgst_keys = {
+            "branches",
+            "target_modes",
+            "save_raw_capture",
+            "source_distribution_mode",
+            "support_scope",
+            "ot_solver",
+            "target_attention_epsilon",
+            "matrix_dtype",
+            "curve_dtype",
+        }
+        retired_dataset_keys = {
+            "split_strategy",
+            "train_ratio",
+            "val_ratio",
+            "test_ratio",
+            "validation",
+        }
+        for relative_path, expected in cases.items():
             config = load_config(os.path.join(ROOT, relative_path))
             dgst = config["feature_extraction"]["dgst_t"]
             self.assertEqual(
                 resolve_dgst_four_gate_methods(dgst),
-                [SOFTMAX_METHOD, METHOD],
+                [METHOD, SOFTMAX_METHOD],
             )
-            self.assertEqual(dgst["target_modes"], ["raw_logit_gauss"])
-            self.assertEqual(dgst["support_modes"], ["vv", "vp"])
+            self.assertTrue(retired_dgst_keys.isdisjoint(dgst))
+            self.assertTrue(retired_dataset_keys.isdisjoint(config["dataset"]))
+            self.assertNotIn("pope", config)
+            self.assertNotIn(
+                "clevr_object_coverage_policy", config["qa_benchmarks"]
+            )
+            self.assertNotIn(
+                "shard_dtype",
+                config["feature_extraction"]["baseline"]["dhcp"],
+            )
+            self.assertEqual(dgst["support_modes"], expected["support_modes"])
             self.assertEqual(dgst["cost_mode"], "sqrt_matched_state")
-            self.assertEqual(
-                dgst["cost_modes"], ["sqrt_matched_state", *ALPHA_MODES]
-            )
+            self.assertEqual(dgst["cost_modes"], expected["cost_modes"])
             self.assertFalse(dgst["compute_ffn_injection_features"])
             self.assertTrue(dgst["compute_prompt_cafe"])
             self.assertEqual(float(dgst["prompt_cafe_temperature"]), 10.0)
             self.assertEqual(int(dgst["prompt_cafe_layer"]), 22)
             configured = config["training"]["feature_sets"]["method"]
-            self.assertEqual(configured, expected)
-            self.assertEqual(_enabled_method_feature_sets(config, configured), expected)
+            self.assertEqual(configured, expected["features"])
+            self.assertEqual(
+                _enabled_method_feature_sets(config, configured),
+                expected["features"],
+            )
 
             commands = build_training_commands(
                 config=config,
@@ -250,7 +300,7 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
             for command in root_commands:
                 start = command.index("--feature-sets") + 1
                 end = command.index("--device")
-                expected_command_features = list(expected)
+                expected_command_features = list(expected["features"])
                 if config["run"]["extraction_mode"] == "all":
                     expected_command_features.extend(("ads", "cgc", "ads+cgc"))
                 self.assertEqual(command[start:end], expected_command_features)

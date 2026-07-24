@@ -1,5 +1,58 @@
 # Current Task
 
+## 2026-07-24 VP softmax-Gaussian R / AE 的 STD、SEM、95% CI 曲线
+
+- 使用 `COCO4000-512-ENDAC-SOFT/features.pkl` 全部 12,686 个有效 token（Real 9,540，Hall 3,146；拒绝 0）绘制完整 32 层 label 曲线。R 精确字段为 `dgst_t_vp_hpre_softmax_prob_gauss_risk_sqrt_hpre_per_layer`；AE 精确字段为 `dgst_t_vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine_topk32_hpre_per_layer`。STD 使用样本标准差 `ddof=1`，SEM=`STD/sqrt(n)`，95% CI=`mean±1.96*SEM`。
+- 分别生成 R/AE × STD/SEM/CI95 的 6 张 PNG/PDF和一张 2×3 汇总图。95% difference CI 显示：R 在 29/32 层 Hall>Real、L2 Hall<Real、L4/L23 跨零；AE 在 27/32 层 Hall<Real、L4–L7 Hall>Real、L8 跨零。重点层 18/21/24/27/30 均为 R Hall>Real、AE Hall<Real。
+- 结果位于 `analysis/vp_softmax_prob_gauss_risk_ev_uncertainty_by_label/`，另含 128 行逐层 label 统计、64 行 Hall−Real 差异及 JSON。服务器端验证全部 n、均值、STD、SEM、CI 关系和有限值；7 张 PNG 的尺寸与像素方差均通过，未下载分析图或数据到本地。
+
+## 2026-07-24 500-token `Describe this image.` 质量分布
+
+- 全部计算与绘图在 fj01 服务器完成。按总计 500 token 抽样：Real/Hall 各 250，seed=42；每类每图最多一个 token，且两类 image ID 完全不重叠。分析 VP 第 18/21/24/27/30 层的 `Des / cribe / ▁this / ▁image / .`，信号为 raw、`normalize(raw * hpre_softmax_prob_gauss_gate)` target 和 source。
+- 五层平均 instruction 总质量：raw Real=`0.00236498`、Hall=`0.00163387`（Hall/Real=`0.6909`，rank AUC=`0.2279`，BH p=`1.91e-25`）；target Real=`0.00376442`、Hall=`0.00297925`（ratio=`0.7914`，AUC=`0.3750`，BH p=`1.33e-6`）；source Real=`0.00758666`、Hall=`0.00817812`（ratio=`1.0780`，AUC=`0.6983`，BH p=`2.57e-14`）。raw/target 的 Hall 质量显著更低，而 source 的 Hall 质量总体更高。
+- 分层方向：raw 与 target 在五层全部为 Hall<Real；source 在 18/24/27/30 层 Hall>Real，但第 21 层反向（Hall/Real=`0.8799`）。条件 token 构成的类别差异很小：raw/target 均主要落在 `▁image`，source 主要落在 `▁this`，说明主要差异来自 instruction 总质量而不是五个词片内部重排。
+- 结果位于 `outputs/llava_1_5_7b/COCO4000-512-ENDAC-SOFT/analysis/describe_this_image_mass_500tokens_vp_softmax_prob_gauss_seed42/`，包含 4 张 PNG/PDF、500 行 manifest、7500 行 token-layer-signal、37500 行逐 piece、1500 行 token 聚合、总体/逐层/逐 piece 统计、JSON 和 Markdown。服务器验证 500 个 image ID 全部唯一、组合行数完整、数值非负有限、每个条件分布和为 1；4 张 PNG 尺寸和像素方差检查通过。
+
+## 2026-07-24 image 831 在 `Describe this image.` 上的逐 token 质量
+
+- 从既有 prompt-token CSV 中严格截取 VP support `583:588` 的五个 instruction token：`Des / cribe / ▁this / ▁image / .`，比较 Real `skateboard` 与 Hall `handbag` 在第 18/21/24/27/30 层的 raw、softmax-Gaussian target、source。输出绝对质量热力图、instruction 内条件占比热力图和 instruction 总质量逐层曲线。
+- 五层平均 instruction 总质量：skateboard raw=`0.001315`、target=`0.001713`、source=`0.007123`；handbag raw=`0.001286`、target=`0.002109`、source=`0.009023`。Hall 的 target/source instruction 质量分别比 Real 高约 `23.2%/26.7%`，说明这组样本里“对指令关注更多”也不能直接作为真实性解释。
+- 条件分布上，target 的 skateboard 主要落在句末 `.`（36.45%），handbag 主要落在 `▁image`（42.75%）；source 对五个 instruction token 更均匀。7 个 PNG/PDF/CSV/JSON 产物追加保存到 `analysis/paper_heatmap_pairs_top32_softmax_prob_gauss_vpfix_auto/831/vp/prompt_mass_pair_skateboard_handbag_softmax_prob_gauss/`。验证 150 行完整组合、全部非负有限，且每个条件分布之和为 1；三张图已人工检查。
+
+## 2026-07-24 image 831 的 prompt 质量与 R / AE 逐层曲线
+
+- 对同图 Real `skateboard`（response idx 37）与 Hall `handbag`（idx 123）完整复现 image 252573 的 VP `hpre_softmax_prob_gauss` 分析。prompt 统计使用第 18/21/24/27/30 层、视觉列 `5:581`、user-instruction `583:588`；当前 wrapper 无 SYSTEM。五层平均（visual/full prompt/user）：skateboard raw=`0.139808/0.860192/0.001315`、target=`0.324627/0.675373/0.001713`、source=`0.973531/0.026469/0.007123`；handbag raw=`0.213101/0.786899/0.001286`、target=`0.396467/0.603533/0.002109`、source=`0.969860/0.030140/0.009023`。
+- R=`risk_sqrt_hpre`，AE=`target_dist_mass_x_cosine_topk32_hpre`；Real skateboard 用实线、Hall handbag 用虚线绘制全部 32 层。R 均值 skateboard=`0.526933`、handbag=`0.540952`；AE 均值 skateboard=`0.189805`、handbag=`0.169795`。
+- prompt 的 PNG/PDF、30 行 scope CSV、510 行 prompt-token CSV、JSON/Markdown 位于 `analysis/paper_heatmap_pairs_top32_softmax_prob_gauss_vpfix_auto/831/vp/prompt_mass_pair_skateboard_handbag_softmax_prob_gauss/`；R/AE 的 PNG/PDF、32 行 CSV 和 JSON 位于相邻 `risk_ae_skateboard_handbag_softmax_prob_gauss/`。所有质量守恒、连续层、有限值和线型断言均通过，主图已人工检查。
+
+## 2026-07-24 image 252573 的 R / AE 逐层曲线
+
+- 为同图 Real `cat`（response idx 6，实线）和 Hall `mouse`（idx 26，虚线）分别绘制 VP `hpre_softmax_prob_gauss` 的 32 层曲线。R=`dgst_t_vp_hpre_softmax_prob_gauss_risk_sqrt_hpre_per_layer`；AE=`dgst_t_vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine_topk32_hpre_per_layer`。
+- R 的 32 层均值：cat=`0.484504`、mouse=`0.513284`，两条曲线频繁交叉；AE 均值：cat=`0.240716`、mouse=`0.193143`，cat 在大部分中后层更高。单样本曲线仅用于说明这组 pair 的层间行为，不代表总体类别统计。
+- 两张 PNG/PDF、32 行原始 CSV 和 JSON 位于 `analysis/paper_heatmap_pairs_top32_softmax_prob_gauss_vpfix_auto/252573/vp/risk_ae_cat_mouse_softmax_prob_gauss/`。验证 32 层连续、全部值有限、线型要求正确，且两张图已人工检查。
+
+## 2026-07-24 image 252573 Real/Hall pair 的 VP prompt 质量分布
+
+- 对同图 Real `cat`（response idx 6）和 Hall `mouse`（idx 26）按同一口径分析第 18/21/24/27/30 层：raw=`dgst_t_vp_attention_support_per_layer`，target=`normalize(raw * dgst_t_vp_hpre_softmax_prob_gauss_gate_per_layer)`，source=`dgst_t_vp_source_dist_per_layer`。精确 VP support 为 593，视觉列 `5:581`，其余 17 个位置为完整模板 prompt；当前 wrapper 无 SYSTEM，user-instruction-only 为 `583:588` 的 `Describe this image.`。
+- 五层平均质量（visual/full prompt/user instruction）：Real cat 的 raw=`0.157680/0.842320/0.002463`、target=`0.337912/0.662088/0.004543`、source=`0.975497/0.024503/0.007066`；Hall mouse 的 raw=`0.118314/0.881686/0.002056`、target=`0.393972/0.606028/0.003324`、source=`0.976348/0.023652/0.006195`。
+- 结论：gate 对二者都把质量从 prompt 移向视觉；Hall mouse 的 target 平均视觉质量反而比 Real cat 更高（39.40% vs 33.79%），说明总视觉质量不能单独作为真假判据，pair 的区分仍来自空间 target/source 对齐。raw/target 的 prompt 质量主要由 BOS `<s>` 占据；source 的 prompt 绝对质量仅约 2.4%，但其中用户指令约占 cat 28.63%、mouse 26.02%。
+- PNG/PDF、逐层 CSV、逐 prompt-token CSV、JSON 和 Markdown 位于 `analysis/paper_heatmap_pairs_top32_softmax_prob_gauss_vpfix_auto/252573/vp/prompt_mass_pair_cat_mouse_softmax_prob_gauss/`。30 条 scope 记录均验证总质量为 1、视觉+prompt=1、user+template=prompt；两 token 和 VP 边界断言通过，并人工检查图像无标题/图例重叠。
+
+## 2026-07-24 ENDAC-SOFT 同图 Real/Hall pair 扩展筛选
+
+- 从 `COCO4000-512-ENDAC-SOFT` 的 12,686 条特征中重算 11,383 个可定位 token；3,954 张候选图里有 1,917 张同时包含 Real 与 Hall token，原 curated 目录只有一组 pair 并非候选不足。
+- 用 `hpre_softmax_prob_gauss` target、Top-32、第 18/21/24/27/30 层生成 10 组 VV/VP pair 面板；VP 使用已核准的精确视觉列 `5:581`，而旧 curated manifest 记录的是 `4:580`。结果位于 `analysis/paper_heatmap_pairs_top32_softmax_prob_gauss_vpfix_auto/`，包含 20 张 PNG、20 张 PDF、两张 contact sheet 和完整候选指标。
+- 人工查看后，新增候选中 `image 252573: Real cat / Hall mouse` 最直观；`image 47263: Real truck / Hall frisbee` 与 `image 540288: Real sandwich / Hall cup` 也较好。原 `image 122602: Real scissors / Hall mouse` 已在新目录以正确 VP 映射重画为 pair04。
+- 验证：后台脚本正常退出；候选评分保留 11,383 条；paired 目录严格有 20 PNG + 20 PDF；VV/VP contact sheet 均生成。未改动模型特征或训练代码。
+
+## 2026-07-24 image 164475 幻觉 `cell phone` 的 VP prompt 质量分布
+
+- 直接读取 `COCO4000-512-ENDAC-SOFT/features.pkl` 的完整 12,686 条记录，定位 image `164475`、response token index `17`、Hall 标签的 `cell phone`。分析第 18/21/24/27/30 层，raw attention 使用 `dgst_t_vp_attention_support_per_layer`，target 严格按 `normalize(raw_attention * dgst_t_vp_hpre_softmax_prob_gauss_gate_per_layer)` 重构，source 使用 `dgst_t_vp_source_dist_per_layer`。
+- 用本地 LLaVA processor 和实际 COCO 图重构出精确 VP support：593 个位置 = 576 个视觉 token（support index `5:581`）+ 17 个文本 prompt token。当前 wrapper 模板为 `USER: <image>\nDescribe this image.\nASSISTANT:`，没有字面 `SYSTEM:` 消息，因此“只删除 SYSTEM”与 full-template 完全相同；另提供有意义的 user-instruction-only 视角，只保留最短上下文 span `583:588`，即解码为 `Describe this image.` 的 5 个 token。
+- 五层平均绝对质量：raw attention 的 visual/full-prompt/user-instruction 为 `0.201582/0.798418/0.001751`；softmax-Gaussian target 为 `0.524015/0.475985/0.003167`；source 为 `0.969574/0.030426/0.010272`。raw/target 的 prompt 质量分别平均有 `98.30%/92.97%` 落在 `<s>`，而 source 的 `<s>` 占 prompt 质量仅 `4.81%`；source 虽然 prompt 总质量低，但用户指令占其 prompt 质量平均 `31.80%`。
+- PNG/PDF、逐层 scope CSV、逐 token CSV、JSON 与中文说明位于 `analysis/.../164475/vp/prompt_mass_cell_phone_softmax_prob_gauss/`。五张 PNG 已人工检查；所有三种分布均逐层归一到 1，形状均为 `[32,593]`，输出层号、token边界和数值均通过断言。
+- 首次一次性分析在用户指令span定位处失败：按扫描顺序先命中了包含前导空格/换行的 7-token span `581:588`；修正为与 wrapper 一致的“最短匹配、再按起点”规则后严格得到 5-token span `583:588`，正式产物均来自修正后的重跑。
+
 ## 2026-07-23 CLEVR 9K 严格 8:2 校验单位修复
 
 - 修复 `train_qa_probes.py` 对 CLEVR 9K 的二次划分校验：准备阶段严格抽取 7200/1800 个问题，且官方 train/val 图片命名空间完全隔离；同一图片存在多个问题，因此 6896/1733 个唯一图片不应被错误要求再次满足精确 8:2。现在 CLEVR 按问题行检查精确 8:2，同时仍检查任一图片不得跨 probe split。
@@ -1699,3 +1752,25 @@
 - Qwen3 AMBER 已用 `[256,128,64]` 三层 MLP、seeds 42/43/44 重跑两种标签协议：每套 19 项、共 114 个 seed-run。汇总中的 method 输入维度严格为 36（单项）或 72（risk+EV），两套汇总 target-cosine 项均为 0。
 - 首次错误硬编码生成的 12 个三特征结果目录未删除，已移入 `results/_obsolete_hardcoded_triple_20260719/`；活动协议目录中 target-cosine 结果目录为 0，避免误读。
 - 验证：YAML 路由单测 6/6、受影响的 QA feature-vector 纯函数测试 2/2、Python 编译和 `git diff --check` 通过。一次附加 `pytest` 命令因 vicr 环境未安装 pytest，在收集前报 `No module named pytest`；随后用项目 Python 直接执行对应纯函数测试并通过。
+
+## 2026-07-25 VPend 后置 prompt support 修正
+
+- 定位到旧 `VP` 的语义偏差：wrapper 提供的 `prompt_positions` 是全部非视觉 prompt token，旧实现直接与视觉 token 合并，因此包含 image 前面的 `<s> USER:` 等前缀；同文件的 prompt CAFE 实际一直采用 `position >= visual_end`，两者此前没有对齐。
+- 新增独立 `VPend`/`vpend` support mode：support 严格定义为全部视觉位置加上 `prompt_position >= visual_end` 的后置 prompt token；序列化统一使用 `dgst_t_vpend_*`，并额外保存 `dgst_t_vpend_support_size` 和 `dgst_t_vpend_support_positions`。旧 `VP`/`dgst_t_vp_*` 保留，仅用于兼容已有产物。
+- root extractor、QA compact schema、pipeline feature-set 过滤和 probe alias 均支持 `vpend_`；risk、target cosine、EV、JS、union-topK JS、`(1-mass)*cosine` 及所有现有 cost/alpha risk 名称可以按 VPend 前缀训练。
+- `model_configs_server_fj01.yaml` 默认改为 `support_modes: ["vv", "vpend"]`；`model_configs_unified.yaml` 默认改为 `["vpend"]`；两份配置的活动 VP feature sets 改用 `vpend_`。`experiment.mode` 同步改名为 `vpend`，`get_model_cfg` 将其解析为 `visual_prompt_end`。
+- 新回归样例显式构造 image 前 token 位置 0、视觉位置 `[1,3)`、image 后 prompt 位置 3，确认 VPend support 精确为 `[1,2,3]`，不会包含位置 0；同时验证 root/QA 序列化及 risk+EV 训练矩阵。
+- 验证：受影响 Python 文件 `py_compile` 通过；四门 DGST 全部测试加两项 VPend pipeline 定向测试共 `20/20` 通过；3 项 QA compact 纯函数测试通过；两份活动 YAML 均可加载、活动 feature sets 全部可解析；`git diff --check` 通过。
+- 失败记录：`/opt/conda/envs/td` 未安装 pytest，首次命令在收集前报 `No module named pytest`；改用 `unittest` 和直接调用 pytest 风格纯函数完成定向验证。完整 `tests.test_pipeline_config` 还出现 6 fail/4 error，均为仓库当前 pipeline-manifest 行为与旧测试预期不一致（缺少 `pipeline_manifest.json` 或未抛出旧 resume 异常），与本次 support/filter 改动无调用关系；本次新增的两项 pipeline 测试单独通过。
+
+## 2026-07-25 全模型视觉 support 审计与 YAML 清理
+
+- 逐一核对 LLaVA-1.5、LLaVA-NeXT、LLaVA-OneVision、InternVL、Qwen2.5-VL 和 Qwen3-VL 的视觉区间定位、连续性检查、视觉网格校验以及 DGST attention/hpre/hmid/source 的索引链路，未发现视觉 support 偏移或混入图像分隔符。
+- 所有 wrapper 均使用半开区间 `[visual_start, visual_end)`：LLaVA-1.5/NeXT 将单个 image placeholder 映射为展开后的连续视觉 span；InternVL 只包含连续 `<IMG_CONTEXT>`；OneVision、Qwen2.5-VL、Qwen3-VL 只包含连续 `<|image_pad|>`，并校验视觉网格 token 数。attention、hpre、hmid 与 source distribution 共用同一 `support_positions`/`index_select`。
+- 现有 LLaVA 产物的 VV support 实测为 `[32,576]`，与 24x24 视觉网格一致；旧 VP 的 593 列是 576 个视觉 token 加 17 个全部 prompt token，进一步确认此前问题仅在 prompt 范围，视觉区域本身没有取错。
+- 新增 `tests/test_visual_support_ranges.py`，覆盖六类 wrapper 的精确视觉 span、图像分隔符排除和非连续视觉 token 拒绝行为，避免后续模型适配再次引入偏一位问题。
+- 对 fj01/unified 两份 YAML 做“配置叶节点—实际读取代码”静态审计并结合运行时加载复核。每份配置从 253 个解析叶节点清理到 191 个；删除从未读取的 dtype/raw-capture 字段、严格 8:2 后失效的 train/val/test ratio 与 validation 字段、未接入当前 QA 路由的旧 `pope` 块、冗余 DGST `target_modes/branches` 及已由 compact exact 路径固定的旧 solver/source/support 参数，同时删除 wrapper 不读取的模型 metadata。注释示例不计入解析配置，仍保留作实验参考。
+- `four_gate_methods` 现在是 target 构造的唯一活动选择器；`support_modes` 是 support 选择器。两份配置仍启用 raw-logit Gaussian 与 softmax-prob Gaussian；fj01 support 为 `vv+vpend`，unified 为 `vpend`，活动训练 feature sets 均可成功解析。
+- `coco-labeling/label_coco.py` 同步移除 `_load_or_create_splits` 已被严格 8:2 覆盖且从不生效的 `train_ratio/resume` 参数，实际 image-disjoint 8:2 逻辑不变。
+- 验证：受影响定向套件 `37/37` 通过，包含全模型视觉 support、four-gate、alpha sweep、训练命令、raw-attention 与 labeling 配置；两份 YAML 可运行时加载，所有模型都解析为 `visual_prompt_end`；受影响 Python 文件编译和 `git diff --check` 通过。
+- 失败记录：第一次定向测试有 1 fail/1 error，分别是 unified 的既有 `prompt_cafe` feature-set 未写入新精确预期，以及 raw-attention 测试仍依赖已删除的 `branches` 选择器；修正测试预期并显式设置 `four_gate_methods/support_modes` 后，完整定向套件重跑通过。

@@ -164,9 +164,7 @@ def main() -> None:
     splits = _load_or_create_splits(
         output_dir=args.output_dir,
         samples=selected_samples,
-        train_ratio=float(dataset_cfg["train_ratio"]),
         seed=seed,
-        resume=args.resume,
         shared_splits_path=dataset_cfg.get("shared_split_path"),
     )
 
@@ -350,16 +348,12 @@ def _load_or_create_splits(
     *,
     output_dir: str,
     samples: list[dict],
-    train_ratio: float,
     seed: int,
-    resume: bool,
     shared_splits_path: str | os.PathLike[str] | None = None,
 ) -> dict:
-    # ``train_ratio`` and ``resume`` remain in the signature for callers of the
-    # historical helper.  The active protocol is always the leak-free outer
-    # 8:2 image split. This protocol has no validation partition, and
+    # The active protocol is always the leak-free outer 8:2 image split. This
+    # protocol has no validation partition, and
     # ``ensure_strict_82_split`` backs up any incompatible historical split.
-    del train_ratio, resume
     shared_path = None
     if shared_splits_path:
         shared_path = Path(shared_splits_path).expanduser()

@@ -85,7 +85,7 @@ class RawAttentionIntegrationTests(unittest.TestCase):
             ],
         )
 
-    def test_active_yaml_enables_raw_attention_control(self) -> None:
+    def test_active_yaml_uses_authoritative_vpend_method_list(self) -> None:
         config = load_config(os.path.join(ROOT, "configs/model_configs_unified.yaml"))
         self.assertEqual(config["run"]["prompt"], "Describe this image.")
         self.assertIn(
@@ -93,14 +93,17 @@ class RawAttentionIntegrationTests(unittest.TestCase):
             {"all", "method_only", "ads_cgc_only", "baseline_only"},
         )
         dgst = config["feature_extraction"]["dgst_t"]
-        self.assertIn("raw_attention", dgst["four_gate_methods"])
-        self.assertTrue(dgst["branches"]["raw_attention"])
-        self.assertIn("hpre_softmax_prob_direct", dgst["four_gate_methods"])
-        self.assertTrue(dgst["branches"]["hpre_softmax_prob_direct"])
+        self.assertEqual(
+            dgst["four_gate_methods"],
+            ["hpre_raw_logit_gauss", "hpre_softmax_prob_gauss"],
+        )
+        self.assertNotIn("branches", dgst)
+        self.assertNotIn("target_modes", dgst)
+        self.assertEqual(dgst["support_modes"], ["vpend"])
         method_sets = config["training"]["feature_sets"]["method"]
-        self.assertIn("raw_attention_risk", method_sets)
         self.assertIn(
-            "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine",
+            "vpend_hpre_softmax_prob_gauss_risk+"
+            "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
             method_sets,
         )
         self.assertEqual(config["training"]["trainer"], "torch_mlp")

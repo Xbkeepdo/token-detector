@@ -3997,12 +3997,12 @@ def compute_four_gate_dgst_batch_from_captures(
     ffn_injection_eps: float = EPS,
     release_layer_captures: bool = False,
 ) -> list[dict[str, Any]]:
-    """Compute compact VV features and optional VP/FAD features.
+    """Compute compact VV features and optional VP/VPend/FAD features.
 
     VV remains the unprefixed, backward-compatible branch. ``support_modes``
-    explicitly selects VV, VP, or both; when both are enabled the same
-    captures are reduced over each support set and VP is stored under
-    ``dgst_t_vp_*``.
+    explicitly selects VV, legacy VP, VPend, or any combination. Legacy VP
+    uses every non-visual prompt token. VPend instead uses only prompt tokens
+    at ``position >= visual_end`` and is stored under ``dgst_t_vpend_*``.
     ``compute_ffn_injection_features`` adds the historical layerwise FAD
     curve without re-enabling the other legacy FFN diagnostics.
     ``compute_prompt_cafe`` adds the InsLen calibration confidence: at every
@@ -4029,6 +4029,21 @@ def compute_four_gate_dgst_batch_from_captures(
             )
         )
         scopes.append(("visual_prompt", vp_positions))
+    if "vpend" in active_modes:
+        post_visual_prompt_positions = [
+            int(position)
+            for position in prompt_positions or ()
+            if int(position) >= int(visual_end)
+        ]
+        if not post_visual_prompt_positions:
+            raise ValueError(
+                "four-gate VPend extraction requires at least one prompt token "
+                "at position >= visual_end."
+            )
+        vpend_positions = sorted(
+            dict.fromkeys(visual_positions + post_visual_prompt_positions)
+        )
+        scopes.append(("visual_prompt_end", vpend_positions))
 
     scoped_results: dict[str, list[dict[str, Any]]] = {}
     for scope_name, support_positions in scopes:
@@ -4055,33 +4070,48 @@ def compute_four_gate_dgst_batch_from_captures(
     if "visual" in scoped_results:
         results = scoped_results["visual"]
     else:
-        # VP-only mode intentionally has no unprefixed per-layer values: those
-        # names are reserved for the backward-compatible VV branch.
+        # Prompt-scope-only modes intentionally have no unprefixed per-layer
+        # values: those names are reserved for the backward-compatible VV
+        # branch.
+        primary_prompt_scope = scopes[0][0]
         results = [
             {
                 key: value
-                for key, value in vp_result.items()
+                for key, value in prompt_result.items()
                 if not key.endswith("_per_layer")
             }
-            for vp_result in scoped_results["visual_prompt"]
+            for prompt_result in scoped_results[primary_prompt_scope]
         ]
     for result in results:
         result["dgst_t_four_gate_support_scopes"] = [name for name, _ in scopes]
         if "vv" in active_modes:
             result["dgst_t_vv_support_size"] = len(visual_positions)
+            result["dgst_t_vv_support_positions"] = list(visual_positions)
 
-    if "visual_prompt" in scoped_results:
-        vp_results = scoped_results["visual_prompt"]
-        if len(vp_results) != len(results):
-            raise AssertionError("VV and VP four-gate result counts differ.")
-        for result, vp_result in zip(results, vp_results):
-            result["dgst_t_profile"] = "four_gate_vv_vp_v1"
-            if "vv" not in active_modes:
-                result["dgst_t_profile"] = "four_gate_vp_v1"
-            result["dgst_t_vp_support_size"] = int(
-                vp_result["dgst_t_support_size"]
+    profile_slug = "_".join(active_modes)
+    for result in results:
+        if len(active_modes) > 1 or active_modes[0] != "vv":
+            result["dgst_t_profile"] = f"four_gate_{profile_slug}_v1"
+
+    for mode, scope_name, field_prefix in (
+        ("vp", "visual_prompt", "vp"),
+        ("vpend", "visual_prompt_end", "vpend"),
+    ):
+        if scope_name not in scoped_results:
+            continue
+        prompt_results = scoped_results[scope_name]
+        if len(prompt_results) != len(results):
+            raise AssertionError(
+                f"VV and {mode.upper()} four-gate result counts differ."
             )
-            for key, value in vp_result.items():
+        for result, prompt_result in zip(results, prompt_results):
+            result[f"dgst_t_{field_prefix}_support_size"] = int(
+                prompt_result["dgst_t_support_size"]
+            )
+            result[f"dgst_t_{field_prefix}_support_positions"] = list(
+                prompt_result["dgst_t_support_positions"]
+            )
+            for key, value in prompt_result.items():
                 if key.startswith("dgst_t_") and (
                     key.endswith("_per_layer")
                     or key
@@ -4090,7 +4120,9 @@ def compute_four_gate_dgst_batch_from_captures(
                         "dgst_t_source_dist_per_layer",
                     }
                 ):
-                    result[f"dgst_t_vp_{key[len('dgst_t_'):]}"] = value
+                    result[
+                        f"dgst_t_{field_prefix}_{key[len('dgst_t_'):]}"
+                    ] = value
 
     if compute_prompt_cafe:
         from models.dgst_capture import (
@@ -4256,8 +4288,15 @@ def _compute_four_gate_single_scope_from_captures(
     normalized_support_positions = [int(position) for position in support_positions]
     if not normalized_support_positions:
         raise ValueError("four-gate DGST requires at least one support token.")
-    if str(support_scope) not in {"visual", "visual_prompt"}:
-        raise ValueError("four-gate support_scope must be visual or visual_prompt.")
+    if str(support_scope) not in {
+        "visual",
+        "visual_prompt",
+        "visual_prompt_end",
+    }:
+        raise ValueError(
+            "four-gate support_scope must be visual, visual_prompt, or "
+            "visual_prompt_end."
+        )
     if int(target_region_top_k) <= 0:
         raise ValueError("target_region_top_k must be a positive integer.")
     methods = _normalize_four_gate_methods(enabled_methods)
@@ -4480,13 +4519,14 @@ def _compute_four_gate_single_scope_from_captures(
             "dgst_t_target_token_id": int(target_ids[target_offset]),
             "dgst_t_prediction_position": int(pred_positions[target_offset]),
             "dgst_t_four_gate_methods": list(methods),
-            "dgst_t_mad_axis": (
-                "visual_tokens"
-                if str(support_scope) == "visual"
-                else "visual_prompt_tokens"
-            ),
+            "dgst_t_mad_axis": {
+                "visual": "visual_tokens",
+                "visual_prompt": "visual_prompt_tokens",
+                "visual_prompt_end": "visual_post_prompt_tokens",
+            }[str(support_scope)],
             "dgst_t_support_scope": str(support_scope),
             "dgst_t_support_size": len(normalized_support_positions),
+            "dgst_t_support_positions": list(normalized_support_positions),
             "dgst_t_mad_scale": float(GAUSSIAN_MAD_SCALE),
             "dgst_t_mad_scale_by_method": {
                 method: (
@@ -4767,7 +4807,7 @@ def _normalize_four_gate_support_modes(
     *,
     legacy_compute_dual_scope: bool = False,
 ) -> tuple[str, ...]:
-    """Normalize the explicit VV/VP extraction switches.
+    """Normalize the explicit VV/legacy-VP/VPend extraction switches.
 
     ``compute_dual_scope`` remains a compatibility fallback for older configs;
     an explicit ``support_modes`` value always wins.
@@ -4781,6 +4821,11 @@ def _normalize_four_gate_support_modes(
         "vp": "vp",
         "visual_prompt": "vp",
         "visual+prompt": "vp",
+        "vpend": "vpend",
+        "vp_end": "vpend",
+        "visual_prompt_end": "vpend",
+        "visual+prompt_end": "vpend",
+        "post_visual_prompt": "vpend",
     }
     normalized: list[str] = []
     unknown: list[str] = []
@@ -4793,11 +4838,12 @@ def _normalize_four_gate_support_modes(
             normalized.append(mode)
     if unknown:
         raise ValueError(
-            f"Unknown four-gate support modes {unknown}; expected vv and/or vp."
+            f"Unknown four-gate support modes {unknown}; expected vv, vp, "
+            "and/or vpend."
         )
     if not normalized:
         raise ValueError("At least one four-gate support mode must be enabled.")
-    return tuple(mode for mode in ("vv", "vp") if mode in normalized)
+    return tuple(mode for mode in ("vv", "vp", "vpend") if mode in normalized)
 
 
 def _normalize_four_gate_cost_mode(value: str) -> str:

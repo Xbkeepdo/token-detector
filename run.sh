@@ -6,7 +6,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
 MODEL="${MODEL:-llava_1_5_7b}"  # llava_1_5_7b
-OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-512-VVVP}"
+OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-512-VPEND}"
 CONFIG="${CONFIG:-configs/model_configs_server_fj01.yaml}"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"

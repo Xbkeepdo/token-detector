@@ -319,6 +319,13 @@ def get_model_cfg(config: dict, model_key: str) -> dict:
             scope = "visual"
         elif mode in ("vp", "visual_prompt", "visual+prompt", "visual_prompt_only"):
             scope = "visual_prompt"
+        elif mode in (
+            "vpend",
+            "vp_end",
+            "visual_prompt_end",
+            "post_visual_prompt",
+        ):
+            scope = "visual_prompt_end"
     if scope is not None:
         cfg["dgst_t_support_scope"] = str(scope)
     run = config.get("run") or {}

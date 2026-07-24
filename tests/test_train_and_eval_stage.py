@@ -42,7 +42,7 @@ class UnifiedTrainStageTests(unittest.TestCase):
         )
         for root in roots:
             self.assertEqual(root[1], "scripts/train_torch_probe_feature_sets.py")
-            self.assertIn("raw_attention_risk", root)
+            self.assertIn("vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state", root)
             self.assertIn("ads+cgc", root)
             self.assertEqual(root[root.index("--positive-class") + 1], "real")
             self.assertEqual(root[root.index("--batch-size") + 1], "256")
@@ -73,10 +73,11 @@ class UnifiedTrainStageTests(unittest.TestCase):
         config["feature_extraction"]["dgst_t"]["four_gate_methods"] = [
             "raw_attention"
         ]
-        for method in config["feature_extraction"]["dgst_t"]["branches"]:
-            config["feature_extraction"]["dgst_t"]["branches"][method] = (
-                method == "raw_attention"
-            )
+        config["feature_extraction"]["dgst_t"]["support_modes"] = ["vv"]
+        config["training"]["feature_sets"]["method"] = [
+            "raw_attention_risk",
+            "hpre_raw_logit_gauss_risk",
+        ]
         commands = build_training_commands(
             config=config,
             model="qwen3_vl_8b",
@@ -141,6 +142,10 @@ class UnifiedTrainStageTests(unittest.TestCase):
     def test_feature_override_and_run_name_isolate_seed_outputs(self) -> None:
         config = copy.deepcopy(self.config)
         config["run"]["extraction_mode"] = "method_only"
+        config["feature_extraction"]["dgst_t"]["four_gate_methods"] = [
+            "raw_attention"
+        ]
+        config["feature_extraction"]["dgst_t"]["support_modes"] = ["vv"]
         feature_set = (
             "raw_attention_source_target_js+"
             "raw_attention_ev_target_dist_mass_x_cosine"

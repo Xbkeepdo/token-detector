@@ -1278,6 +1278,48 @@ class FourGateDGSTTests(unittest.TestCase):
         )
         self.assertEqual(vp_matrix.shape, (1, 1))
 
+        # VPend must follow the same positional definition as prompt CAFE:
+        # keep visual tokens and prompt positions >= visual_end, while
+        # excluding the image-prefix prompt token at position 0.
+        vpend_only = compute_four_gate_dgst_batch_from_captures(
+            model=model,
+            captures=[capture],
+            visual_start=1,
+            visual_end=3,
+            prompt_positions=[0, 3],
+            target_token_ids=[1],
+            prediction_positions=[4],
+            enabled_methods=["hpre_raw_logit_gauss"],
+            support_modes=["vpend"],
+        )[0]
+        self.assertEqual(
+            vpend_only["dgst_t_four_gate_support_scopes"],
+            ["visual_prompt_end"],
+        )
+        self.assertEqual(vpend_only["dgst_t_vpend_support_positions"], [1, 2, 3])
+        self.assertEqual(vpend_only["dgst_t_vpend_support_size"], 3)
+        self.assertEqual(
+            tuple(vpend_only["dgst_t_vpend_attention_support_per_layer"].shape),
+            (1, 3),
+        )
+        self.assertNotIn("dgst_t_vp_attention_support_per_layer", vpend_only)
+        vpend_record = _build_four_gate_feature_record(
+            image_id=12,
+            span={"word": "chair", "label": 1},
+            response_index=4,
+            target_token_id=1,
+            model_out=SimpleNamespace(token_id=1),
+            dgst_t=vpend_only,
+        )
+        vpend_matrix, _ = build_selected_matrix(
+            [vpend_record],
+            parse_feature_set(
+                "vpend_hpre_raw_logit_gauss_risk+"
+                "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+            ),
+        )
+        self.assertEqual(vpend_matrix.shape, (1, 2))
+
     def test_hook_and_model_response_hidden_use_same_final_norm(self) -> None:
         norm = torch.nn.LayerNorm(3)
         model = SimpleNamespace(model=SimpleNamespace(norm=norm))

@@ -913,7 +913,7 @@ def _build_feature_record(
         ):
             feat[key] = value.tolist() if hasattr(value, "tolist") else value
         elif (
-            key.startswith(("dgst_t_vv_", "dgst_t_vp_"))
+            key.startswith(("dgst_t_vv_", "dgst_t_vp_", "dgst_t_vpend_"))
             and key.endswith("_per_layer")
         ):
             feat[key] = value.tolist() if hasattr(value, "tolist") else value
@@ -1093,6 +1093,7 @@ def _build_four_gate_feature_record(
     )
     has_vv_scope = "visual" in support_scopes
     has_vp_scope = "visual_prompt" in support_scopes
+    has_vpend_scope = "visual_prompt_end" in support_scopes
     required_matrices = (
         (
             "dgst_t_attention_support_per_layer",
@@ -1162,6 +1163,44 @@ def _build_four_gate_feature_record(
         if has_vp_scope
         else ()
     )
+    vpend_method_keys = []
+    if has_vpend_scope:
+        for method in methods:
+            state_name = _target_comparison_state(method)
+            if method == direct_softmax_method:
+                vpend_method_keys.extend(
+                    [
+                        "dgst_t_vpend_hpre_softmax_prob_direct_"
+                        "target_prob_matrix_per_layer",
+                        "dgst_t_vpend_hpre_softmax_prob_direct_"
+                        "target_dist_per_layer",
+                    ]
+                )
+            else:
+                vpend_method_keys.append(
+                    f"dgst_t_vpend_{method}_gate_per_layer"
+                )
+            for cost_mode in cost_modes:
+                risk_suffix = _four_gate_risk_suffix(cost_mode, state_name)
+                vpend_method_keys.append(
+                    f"dgst_t_vpend_{method}_{risk_suffix}_per_layer"
+                )
+            vpend_method_keys.extend(
+                [
+                    f"dgst_t_vpend_{method}_target_cosine_"
+                    f"{topk_slug}_{state_name}_per_layer",
+                    f"dgst_t_vpend_{method}_ev_target_dist_mass_x_cosine_"
+                    f"{topk_slug}_{state_name}_per_layer",
+                ]
+            )
+    vpend_matrix_keys = (
+        (
+            "dgst_t_vpend_attention_support_per_layer",
+            "dgst_t_vpend_source_dist_per_layer",
+        )
+        if has_vpend_scope
+        else ()
+    )
     missing = [
         key
         for key in (
@@ -1170,6 +1209,8 @@ def _build_four_gate_feature_record(
             *method_keys,
             *vp_matrix_keys,
             *vp_method_keys,
+            *vpend_matrix_keys,
+            *vpend_method_keys,
         )
         if key not in dgst_t
     ]
@@ -1199,6 +1240,13 @@ def _build_four_gate_feature_record(
     }
     for key in required_metadata:
         feat[key] = dgst_t[key]
+    if has_vv_scope:
+        feat["dgst_t_vv_support_size"] = int(dgst_t["dgst_t_vv_support_size"])
+        if "dgst_t_vv_support_positions" in dgst_t:
+            feat["dgst_t_vv_support_positions"] = [
+                int(position)
+                for position in dgst_t["dgst_t_vv_support_positions"]
+            ]
     if "dgst_t_mad_scale_by_method" in dgst_t:
         feat["dgst_t_mad_scale_by_method"] = dict(
             dgst_t["dgst_t_mad_scale_by_method"]
@@ -1246,7 +1294,9 @@ def _build_four_gate_feature_record(
         feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
     for key in vp_matrix_keys:
         feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
-    if has_direct_softmax:
+    for key in vpend_matrix_keys:
+        feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
+    if has_direct_softmax and has_vv_scope:
         feat[
             "dgst_t_hpre_softmax_prob_direct_target_prob_matrix_per_layer"
         ] = _compact_numpy(
@@ -1287,6 +1337,26 @@ def _build_four_gate_feature_record(
                 dgst_t["dgst_t_vv_support_size"]
             )
         feat["dgst_t_vp_support_size"] = int(dgst_t["dgst_t_vp_support_size"])
+        if "dgst_t_vp_support_positions" in dgst_t:
+            feat["dgst_t_vp_support_positions"] = [
+                int(position)
+                for position in dgst_t["dgst_t_vp_support_positions"]
+            ]
+    if has_vpend_scope:
+        for key in vpend_method_keys:
+            feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
+        if has_vv_scope:
+            feat["dgst_t_vv_support_size"] = int(
+                dgst_t["dgst_t_vv_support_size"]
+            )
+        feat["dgst_t_vpend_support_size"] = int(
+            dgst_t["dgst_t_vpend_support_size"]
+        )
+        if "dgst_t_vpend_support_positions" in dgst_t:
+            feat["dgst_t_vpend_support_positions"] = [
+                int(position)
+                for position in dgst_t["dgst_t_vpend_support_positions"]
+            ]
     fad_key = "dgst_t_ffn_attn_dominance_per_layer"
     if fad_key in dgst_t:
         feat[fad_key] = _compact_numpy(dgst_t[fad_key], dtype=np.float32)

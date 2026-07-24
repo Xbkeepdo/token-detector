@@ -683,7 +683,7 @@ def find_answer_semantic_token(response_ids: list[int], tokenizer, answer: str |
 
 
 def _compact_dgst(result: dict) -> dict:
-    """Serialize every active VV/VP DGST scope without legacy aliases."""
+    """Serialize every active VV/VP/VPend DGST scope without aliases."""
 
     methods = tuple(str(value) for value in result.get("dgst_t_four_gate_methods") or ())
     if not methods:
@@ -717,8 +717,13 @@ def _compact_dgst(result: dict) -> dict:
             inferred.append("visual")
         if "dgst_t_vp_attention_support_per_layer" in result:
             inferred.append("visual_prompt")
+        if "dgst_t_vpend_attention_support_per_layer" in result:
+            inferred.append("visual_prompt_end")
         raw_scopes = tuple(inferred)
-    unknown_scopes = sorted(set(raw_scopes) - {"visual", "visual_prompt"})
+    unknown_scopes = sorted(
+        set(raw_scopes)
+        - {"visual", "visual_prompt", "visual_prompt_end"}
+    )
     if unknown_scopes:
         raise ValueError(f"Unknown QA DGST support scopes: {unknown_scopes}")
     scope_specs = []
@@ -726,8 +731,10 @@ def _compact_dgst(result: dict) -> dict:
         scope_specs.append(("vv", "", ""))
     if "visual_prompt" in raw_scopes:
         scope_specs.append(("vp", "vp_", "vp_"))
+    if "visual_prompt_end" in raw_scopes:
+        scope_specs.append(("vpend", "vpend_", "vpend_"))
     if not scope_specs:
-        raise KeyError("Missing QA DGST VV/VP support scope")
+        raise KeyError("Missing QA DGST VV/VP/VPend support scope")
 
     matrices_by_scope: dict[str, dict[str, np.ndarray]] = {}
     for scope_name, raw_prefix, _ in scope_specs:
@@ -746,7 +753,11 @@ def _compact_dgst(result: dict) -> dict:
             "source_dist": _as_float32_array(result[source_key]),
         }
 
-    primary_scope = "vv" if "vv" in matrices_by_scope else "vp"
+    primary_scope = next(
+        scope
+        for scope in ("vv", "vpend", "vp")
+        if scope in matrices_by_scope
+    )
     compact: dict = {
         "schema_version": "dgst-target-comparison-v3",
         "methods": list(methods),
@@ -761,6 +772,11 @@ def _compact_dgst(result: dict) -> dict:
         "matrices": matrices_by_scope[primary_scope],
         "matrices_by_scope": matrices_by_scope,
     }
+    for scope_name, _raw_prefix, _compact_prefix in scope_specs:
+        for suffix in ("support_size", "support_positions"):
+            key = f"dgst_t_{scope_name}_{suffix}"
+            if key in result:
+                compact["metadata"][key] = result[key]
     if "dgst_t_prompt_cafe" in result:
         compact["prompt_cafe"] = float(result["dgst_t_prompt_cafe"])
         compact["prompt_cafe_per_layer"] = _as_float32_array(

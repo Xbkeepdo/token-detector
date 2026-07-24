@@ -67,6 +67,16 @@ def _minimal_config() -> dict:
 
 
 class PipelineConfigTests(unittest.TestCase):
+    def test_vpend_experiment_mode_resolves_post_visual_prompt_scope(self) -> None:
+        config = {
+            "models": {"model_a": {"hf_name": "unused"}},
+            "experiment": {"mode": "vpend"},
+        }
+        self.assertEqual(
+            get_model_cfg(config, "model_a")["dgst_t_support_scope"],
+            "visual_prompt_end",
+        )
+
     def test_extraction_model_overrides_do_not_change_generation_config(self) -> None:
         config = {
             "models": {"model_a": {"hf_name": "unused", "image_size": 672}},
@@ -424,6 +434,33 @@ class PipelineConfigTests(unittest.TestCase):
         self.assertEqual(
             selected,
             ["hpre_raw_logit_relative_vll_risk_cosine_matched_state"],
+        )
+
+    def test_vpend_support_mode_filters_legacy_vp_and_vv_training(self) -> None:
+        config = {
+            "feature_extraction": {
+                "dgst_t": {
+                    "four_gate_methods": ["hpre_raw_logit_gauss"],
+                    "branches": {"hpre_raw_logit_gauss": True},
+                    "support_modes": ["vpend"],
+                }
+            },
+            "training": {
+                "feature_sets": {
+                    "method": [
+                        "hpre_raw_logit_gauss_risk",
+                        "vp_hpre_raw_logit_gauss_risk",
+                        "vpend_hpre_raw_logit_gauss_risk",
+                        "prompt_cafe",
+                    ],
+                    "ads_cgc": [],
+                }
+            },
+        }
+        selected = _feature_sets(config, {"extraction_mode": "method_only"})
+        self.assertEqual(
+            selected,
+            ["vpend_hpre_raw_logit_gauss_risk", "prompt_cafe"],
         )
 
     def test_resume_manifest_fingerprints_feature_configuration(self) -> None:
