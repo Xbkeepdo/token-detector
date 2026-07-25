@@ -4,8 +4,8 @@
 # `run.sh` only selects model/output/devices and invokes the three stages.
 # Prompt, extraction families, DGST branches and training behavior live here.
 # The active compact profile keeps VV as the backward-compatible branch and
-# additionally extracts VPend branches. The active comparison fixes the Gaussian
-# target and sweeps state/update mixture alpha from 0.1 through 0.9.
+# additionally extracts VPend branches. The active comparison sweeps source tau
+# and transport Top-K while reusing each target gate, cosine and EV calculation.
 
 run:
   prompt: "Describe this image."

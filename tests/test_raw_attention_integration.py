@@ -99,7 +99,7 @@ class RawAttentionIntegrationTests(unittest.TestCase):
         )
         self.assertNotIn("branches", dgst)
         self.assertNotIn("target_modes", dgst)
-        self.assertEqual(dgst["support_modes"], ["vpend"])
+        self.assertEqual(dgst["support_modes"], ["vv", "vpend"])
         method_sets = config["training"]["feature_sets"]["method"]
         self.assertIn(
             "vpend_hpre_softmax_prob_gauss_risk+"

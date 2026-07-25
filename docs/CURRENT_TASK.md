@@ -1,5 +1,12 @@
 # Current Task
 
+## 2026-07-25 unified/fj01 配置语义同步
+
+- 以 `model_configs_server_fj01.yaml` 的当前实验选择为基准同步 `model_configs_unified.yaml`：QA extraction mode=`method_only`、两个 QA label protocol、VV+VPend support、source tau=`[0.01,0.03,0.06]`、transport Top-K=`[32,64,128]`、活动 method/ADS/CGC feature sets 及全部训练参数现已一致。unified 继续保留 apulis 环境路径，fj01 继续保留 `/root/rivermind-*` 路径，不跨机器覆盖模型、数据和输出绝对路径。
+- 新增 `tests/test_config_mirror.py`，显式移除 18 个环境路径字段后比较两份 YAML 的完整解析对象；今后任何非路径配置漂移都会失败。同步更新 state-update、raw-attention 和 QA active-config 旧断言。
+- sweep 提取与 sweep 训练仍刻意分离：`extract_features.py` 只写含 `dgst_t_hparam_sweep` 的 `features.pkl`；`run.sh` 的第三阶段只执行普通 `train_and_eval.py`，不会调用 `train_source_tau_transport_topk_sweep.py`。9 个 tau×Top-K 变体、VV/VPend 两个 scope 的专用训练必须由用户单独启动，本轮没有训练。
+- 验证：配置镜像、state-update、QA config、raw-attention、train/eval stage 和 sweep wrapper plumbing 共 `24 passed`，`py_compile` 与 `git diff --check` 通过。首次把完整 `test_pipeline_config.py` 一并加入时为 `11 failed, 45 passed`：其中 1 项是本次已修正的旧 cost-mode 断言；其余 10 项均为仓库已有 pipeline manifest/resume 契约失败（未写 manifest 或未抛出旧预期异常），与本次 YAML 同步无调用关系。
+
 ## 2026-07-25 InternVL/LLaVA 改为逐目标 token 的 causal-prefix forward
 
 - 将 InternVL 与经典 LLaVA 的公开 `extract_token_features_batch()` 对齐 Qwen 协议：接口仍一次接收同一回答中的多个目标位置，但内部按目标逐个截取 `response_ids[:response_index]`，每个目标分别调用一次 `extract_token_features()`；不再用一次完整回答 forward 同时计算多个目标的 DGST。

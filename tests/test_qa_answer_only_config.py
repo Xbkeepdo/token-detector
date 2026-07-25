@@ -52,22 +52,24 @@ class QAAnswerOnlyConfigTests(unittest.TestCase):
             tuple(positions),
             qa_extraction_family_flags(config),
         )
-        expected_count = sum(
-            len(config["training"]["feature_sets"][family])
-            for family in ("method", "ads_cgc")
-        )
+        expected_count = len(config["training"]["feature_sets"]["method"])
         self.assertEqual(len(feature_sets), expected_count)
         self.assertTrue(all(name.endswith("@prompt_last_token") for name in feature_sets))
         self.assertFalse(any("_target_cosine" in name for name in feature_sets))
         self.assertIn(
-            "hmid_softmax_prob_gauss_risk+"
-            "hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine@"
+            "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state+"
+            "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine@"
             "prompt_last_token",
             feature_sets,
         )
         self.assertEqual(
             qa_extraction_family_flags(config),
-            {"mode": "all", "method": True, "ads_cgc": True, "baseline": True},
+            {
+                "mode": "method_only",
+                "method": True,
+                "ads_cgc": False,
+                "baseline": False,
+            },
         )
 
     def test_clevr_9k_defaults_are_configured(self) -> None:

@@ -209,31 +209,30 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
             self.assertEqual(labels.tolist(), [1])
 
     def test_active_yamls_use_authoritative_methods_and_vpend_features(self) -> None:
+        expected = {
+            "support_modes": ["vv", "vpend"],
+            "cost_modes": ["sqrt_matched_state"],
+            "features": [
+                "hpre_raw_logit_gauss_risk_sqrt_matched_state",
+                "hpre_raw_logit_gauss_risk_sqrt_matched_state+"
+                "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
+                "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
+                "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state",
+                "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state+"
+                "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
+                "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
+                "hpre_softmax_prob_gauss_risk",
+                "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
+                "hpre_softmax_prob_gauss_risk+"
+                "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
+                "vpend_hpre_softmax_prob_gauss_risk",
+                "vpend_hpre_softmax_prob_gauss_risk+"
+                "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
+            ],
+        }
         cases = {
-            "configs/model_configs_unified.yaml": {
-                "support_modes": ["vpend"],
-                "cost_modes": ["sqrt_matched_state"],
-                "features": [
-                    "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state",
-                    "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state+"
-                    "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
-                    "vpend_hpre_softmax_prob_gauss_risk",
-                    "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
-                    "vpend_hpre_softmax_prob_gauss_risk+"
-                    "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
-                    "prompt_cafe",
-                ],
-            },
-            "configs/model_configs_server_fj01.yaml": {
-                "support_modes": ["vv", "vpend"],
-                "cost_modes": ["sqrt_matched_state", *ALPHA_MODES],
-                "features": [
-                    "vpend_hpre_softmax_prob_gauss_risk",
-                    "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
-                    "vpend_hpre_softmax_prob_gauss_risk+"
-                    "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
-                ],
-            },
+            "configs/model_configs_unified.yaml": expected,
+            "configs/model_configs_server_fj01.yaml": expected,
         }
         retired_dgst_keys = {
             "branches",
