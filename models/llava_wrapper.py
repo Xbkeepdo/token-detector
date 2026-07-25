@@ -337,6 +337,10 @@ class LLaVAWrapper(BaseLVLMWrapper):
                         )
                     ),
                     support_modes=cfg_dgst_t.get("support_modes"),
+                    source_tau_values=cfg_dgst_t.get("source_tau_values"),
+                    transport_top_k_values=cfg_dgst_t.get(
+                        "transport_top_k_values"
+                    ),
                     compute_prompt_cafe=bool(
                         cfg_dgst_t.get("compute_prompt_cafe", False)
                     ),
@@ -630,6 +634,12 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 four_gate_methods=cfg_dgst_t.get("four_gate_methods"),
                 four_gate_cost_modes=cfg_dgst_t.get("cost_modes"),
                 four_gate_support_modes=cfg_dgst_t.get("support_modes"),
+                four_gate_source_tau_values=cfg_dgst_t.get(
+                    "source_tau_values"
+                ),
+                four_gate_transport_top_k_values=cfg_dgst_t.get(
+                    "transport_top_k_values"
+                ),
                 compute_prompt_cafe=bool(
                     cfg_dgst_t.get("compute_prompt_cafe", False)
                 ),
