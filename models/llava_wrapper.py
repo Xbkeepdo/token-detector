@@ -1,6 +1,7 @@
 """LLaVA-1.5 wrapper for generation and feature extraction."""
 
 from __future__ import annotations
+from dataclasses import replace
 from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
@@ -406,6 +407,65 @@ class LLaVAWrapper(BaseLVLMWrapper):
         prompt: Optional[str] = None,
         requirements: Optional[ExtractionRequirements] = None,
     ) -> List[ModelOutput]:
+        """Run one causal prefix forward for each requested target token."""
+        response_ids, requested_indices, targets = self.validate_causal_batch_request(
+            response_token_ids=response_token_ids,
+            response_token_indices=response_token_indices,
+            target_token_ids=target_token_ids,
+        )
+        if not requested_indices:
+            return []
+
+        per_prefix_requirements = requirements
+        if requirements is not None and requirements.response_hidden_states:
+            per_prefix_requirements = replace(
+                requirements,
+                response_hidden_states=False,
+            )
+
+        outputs: List[ModelOutput] = []
+        for response_index, target_token_id in zip(requested_indices, targets):
+            outputs.append(
+                self.extract_token_features(
+                    image=image,
+                    prefix_token_ids=response_ids[:response_index],
+                    response_token_idx=int(response_index),
+                    target_token_id=int(target_token_id),
+                    cfg_dgst_t=cfg_dgst_t,
+                    prompt=prompt,
+                    requirements=per_prefix_requirements,
+                )
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if requirements is not None and requirements.response_hidden_states:
+            shared_capture = self._extract_full_response_baseline_capture(
+                image=image,
+                response_token_ids=response_ids,
+                prompt=prompt,
+            )
+            for output in outputs:
+                output.response_hidden_states = shared_capture[
+                    "response_hidden_states"
+                ]
+                output.baseline_capture = {
+                    **(output.baseline_capture or {}),
+                    **shared_capture["statistics"],
+                }
+        return outputs
+
+    def _extract_token_features_batch_full_response_legacy(
+        self,
+        image: Image.Image,
+        response_token_ids: Sequence[int],
+        response_token_indices: Sequence[int],
+        target_token_ids: Optional[Sequence[int]] = None,
+        cfg_dgst_t: Optional[dict] = None,
+        prompt: Optional[str] = None,
+        requirements: Optional[ExtractionRequirements] = None,
+    ) -> List[ModelOutput]:
+        """Retained reference implementation; public extraction never calls it."""
         response_ids, requested_indices, targets = self.validate_causal_batch_request(
             response_token_ids=response_token_ids,
             response_token_indices=response_token_indices,
@@ -736,6 +796,68 @@ class LLaVAWrapper(BaseLVLMWrapper):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         return outputs
+
+    def _extract_full_response_baseline_capture(
+        self,
+        *,
+        image: Image.Image,
+        response_token_ids: Sequence[int],
+        prompt: Optional[str],
+    ) -> dict[str, Any]:
+        """One lightweight full-caption pass for HalLoc/MetaToken inputs."""
+        prompt_text = self._format_prompt(self.resolve_prompt(prompt))
+        prompt_inputs = self.processor(
+            text=prompt_text,
+            images=image,
+            return_tensors="pt",
+        )
+        inputs = _append_prefix_token_ids(
+            prompt_inputs,
+            prefix_token_ids=response_token_ids,
+            device=self.device,
+            dtype=torch.float16,
+        )
+        response_count = len(response_token_ids)
+        if response_count == 0:
+            return {
+                "response_hidden_states": torch.empty((0, 0)),
+                "statistics": compact_response_logit_statistics(
+                    torch.empty((0, int(self.model.config.vocab_size))),
+                    response_token_ids=[],
+                ),
+            }
+
+        with torch.no_grad():
+            out = self.model(
+                **inputs,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+        expanded_seq_len = int(out.logits.shape[1])
+        response_start = expanded_seq_len - response_count
+        response_hidden = out.hidden_states[-1][
+            0,
+            response_start : response_start + response_count,
+            :,
+        ].detach().cpu()
+        prediction_positions = torch.arange(
+            response_start - 1,
+            response_start + response_count - 1,
+            dtype=torch.long,
+            device=out.logits.device,
+        )
+        teacher_logits = out.logits[0].index_select(0, prediction_positions)
+        statistics = compact_response_logit_statistics(
+            teacher_logits,
+            response_token_ids=response_token_ids,
+        )
+        del teacher_logits, out
+        return {
+            "response_hidden_states": response_hidden,
+            "statistics": statistics,
+        }
 
     def extract_prompt_target_features(
         self,

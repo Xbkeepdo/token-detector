@@ -1,5 +1,12 @@
 # Current Task
 
+## 2026-07-25 InternVL/LLaVA 改为逐目标 token 的 causal-prefix forward
+
+- 将 InternVL 与经典 LLaVA 的公开 `extract_token_features_batch()` 对齐 Qwen 协议：接口仍一次接收同一回答中的多个目标位置，但内部按目标逐个截取 `response_ids[:response_index]`，每个目标分别调用一次 `extract_token_features()`；不再用一次完整回答 forward 同时计算多个目标的 DGST。
+- 单目标路径会使用该目标之前的真实 causal prefix，目标 token 本身只作为待预测 ID，不放入输入。启用 MetaToken/HalLoc 所需的 `response_hidden_states` 时，另做一次不安装 DGST hooks 的轻量整句共享 forward，行为与 Qwen/Qwen3/OneVision 一致；该共享 forward 只提供整句 hidden states 和 compact logit statistics，不参与目标 DGST。
+- 新增 `tests/test_sequential_token_forward_wrappers.py`，同时覆盖 InternVL/LLaVA 的三个非连续目标位置、精确 prefix、目标 ID/response index 映射，以及整句 baseline capture 只执行一次并共享给全部目标。
+- 验证：两个 wrapper 与新测试 `py_compile` 通过；`test_sequential_token_forward_wrappers + test_dgst_sweep_wrapper_plumbing + test_causal_token_positions + test_four_gate_dgst + test_prompt_cafe + test_visual_support_ranges` 为 `35 passed, 10 subtests passed`；未启动训练或正式特征提取。
+
 ## 2026-07-24 VP softmax-Gaussian R / AE 的 STD、SEM、95% CI 曲线
 
 - 使用 `COCO4000-512-ENDAC-SOFT/features.pkl` 全部 12,686 个有效 token（Real 9,540，Hall 3,146；拒绝 0）绘制完整 32 层 label 曲线。R 精确字段为 `dgst_t_vp_hpre_softmax_prob_gauss_risk_sqrt_hpre_per_layer`；AE 精确字段为 `dgst_t_vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine_topk32_hpre_per_layer`。STD 使用样本标准差 `ddof=1`，SEM=`STD/sqrt(n)`，95% CI=`mean±1.96*SEM`。
