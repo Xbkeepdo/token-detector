@@ -1366,6 +1366,28 @@ def _build_four_gate_feature_record(
                 "log((l2_norm(o_ffn)+eps)/(l2_norm(o_attn)+eps))",
             )
         )
+    if "dgst_t_hparam_sweep" in dgst_t:
+        serialized_sweep = {}
+        for variant_slug, variant in dgst_t["dgst_t_hparam_sweep"].items():
+            serialized_variant = {
+                "source_tau": float(variant["source_tau"]),
+                "transport_top_k": int(variant["transport_top_k"]),
+            }
+            for scope_name in ("vv", "vp", "vpend"):
+                if scope_name not in variant:
+                    continue
+                serialized_variant[scope_name] = {
+                    key: _compact_numpy(value, dtype=np.float32)
+                    for key, value in variant[scope_name].items()
+                }
+            serialized_sweep[str(variant_slug)] = serialized_variant
+        feat["dgst_t_hparam_sweep"] = serialized_sweep
+        feat["dgst_t_hparam_sweep_definition"] = str(
+            dgst_t.get(
+                "dgst_t_hparam_sweep_definition",
+                "cartesian_source_tau_x_transport_top_k_risk_only",
+            )
+        )
     return feat
 
 

@@ -311,6 +311,8 @@ def compute_dgst_t_batch_from_captures(
     four_gate_methods: Sequence[str] | None = None,
     four_gate_cost_modes: Sequence[str] | str | None = None,
     four_gate_support_modes: Sequence[str] | str | None = None,
+    four_gate_source_tau_values: Sequence[float] | float | None = None,
+    four_gate_transport_top_k_values: Sequence[int] | int | None = None,
     compute_prompt_cafe: bool = False,
     prompt_cafe_temperature: float = 10.0,
     prompt_cafe_layer: int = 22,
@@ -367,6 +369,8 @@ def compute_dgst_t_batch_from_captures(
             enabled_methods=four_gate_methods,
             compute_dual_scope=bool(compute_dual_scope),
             support_modes=four_gate_support_modes,
+            source_tau_values=four_gate_source_tau_values,
+            transport_top_k_values=four_gate_transport_top_k_values,
             compute_prompt_cafe=bool(compute_prompt_cafe),
             prompt_cafe_temperature=float(prompt_cafe_temperature),
             prompt_cafe_layer=int(prompt_cafe_layer),
@@ -3990,6 +3994,8 @@ def compute_four_gate_dgst_batch_from_captures(
     enabled_methods: Sequence[str] | None = None,
     compute_dual_scope: bool = False,
     support_modes: Sequence[str] | str | None = None,
+    source_tau_values: Sequence[float] | float | None = None,
+    transport_top_k_values: Sequence[int] | int | None = None,
     compute_prompt_cafe: bool = False,
     prompt_cafe_temperature: float = 10.0,
     prompt_cafe_layer: int = 22,
@@ -4009,6 +4015,9 @@ def compute_four_gate_dgst_batch_from_captures(
     layer, project each hpre instruction state through the LM head with
     temperature scaling, read the generated object token probability, and
     take the maximum over prompt positions.
+    ``source_tau_values`` and ``transport_top_k_values`` request a Cartesian
+    hyperparameter sweep. The model captures, target gates, and EV curves are
+    shared; only source distributions and OT risks are recomputed.
     """
     active_modes = _normalize_four_gate_support_modes(
         support_modes,
@@ -4064,6 +4073,8 @@ def compute_four_gate_dgst_batch_from_captures(
             cost_mode=cost_mode,
             cost_modes=cost_modes,
             enabled_methods=enabled_methods,
+            source_tau_values=source_tau_values,
+            transport_top_k_values=transport_top_k_values,
             release_layer_captures=False,
         )
 
@@ -4092,6 +4103,39 @@ def compute_four_gate_dgst_batch_from_captures(
     for result in results:
         if len(active_modes) > 1 or active_modes[0] != "vv":
             result["dgst_t_profile"] = f"four_gate_{profile_slug}_v1"
+
+    # Merge the scope-local sweep results into one compact nested payload.
+    # Keeping only risk curves avoids repeating gates, distributions, and EV,
+    # all of which are invariant to the two swept OT hyperparameters.
+    if any(
+        "_dgst_t_hparam_sweep_scope" in scope_result
+        for scope_values in scoped_results.values()
+        for scope_result in scope_values
+    ):
+        scope_labels = {
+            "visual": "vv",
+            "visual_prompt": "vp",
+            "visual_prompt_end": "vpend",
+        }
+        for target_offset, result in enumerate(results):
+            combined_sweep: dict[str, dict[str, Any]] = {}
+            for scope_name, scope_values in scoped_results.items():
+                local_sweep = scope_values[target_offset].pop(
+                    "_dgst_t_hparam_sweep_scope", {}
+                )
+                for variant_slug, variant in local_sweep.items():
+                    combined = combined_sweep.setdefault(
+                        variant_slug,
+                        {
+                            "source_tau": float(variant["source_tau"]),
+                            "transport_top_k": int(variant["transport_top_k"]),
+                        },
+                    )
+                    combined[scope_labels[scope_name]] = variant["risks"]
+            result["dgst_t_hparam_sweep"] = combined_sweep
+            result["dgst_t_hparam_sweep_definition"] = (
+                "cartesian_source_tau_x_transport_top_k_risk_only"
+            )
 
     for mode, scope_name, field_prefix in (
         ("vp", "visual_prompt", "vp"),
@@ -4263,6 +4307,8 @@ def _compute_four_gate_single_scope_from_captures(
     cost_mode: str = "sqrt_matched_state",
     cost_modes: Sequence[str] | str | None = None,
     enabled_methods: Sequence[str] | None = None,
+    source_tau_values: Sequence[float] | float | None = None,
+    transport_top_k_values: Sequence[int] | int | None = None,
     release_layer_captures: bool = False,
 ) -> list[dict[str, Any]]:
     """Compute one compact four-gate support scope from decoder captures.
@@ -4305,6 +4351,38 @@ def _compute_four_gate_single_scope_from_captures(
         cost_modes,
         primary_cost_mode=normalized_cost_mode,
     )
+    if source_tau_values is None and transport_top_k_values is None:
+        sweep_specs: tuple[tuple[str, float, int], ...] = ()
+    else:
+        raw_taus = (
+            [source_tau_values]
+            if isinstance(source_tau_values, (int, float))
+            else list(source_tau_values or [tau])
+        )
+        raw_top_ks = (
+            [transport_top_k_values]
+            if isinstance(transport_top_k_values, (int, float))
+            else list(transport_top_k_values or [transport_top_k])
+        )
+        tau_values = tuple(dict.fromkeys(float(value) for value in raw_taus))
+        top_k_values = tuple(dict.fromkeys(int(value) for value in raw_top_ks))
+        if not tau_values or any(
+            not math.isfinite(value) or value <= 0.0 for value in tau_values
+        ):
+            raise ValueError("source_tau_values must contain finite positive values.")
+        if not top_k_values or any(value <= 0 for value in top_k_values):
+            raise ValueError(
+                "transport_top_k_values must contain positive integers."
+            )
+
+        def _tau_slug(value: float) -> str:
+            return format(value, ".12g").replace("-", "m").replace(".", "p")
+
+        sweep_specs = tuple(
+            (f"tau{_tau_slug(tau_value)}_topk{top_k_value}", tau_value, top_k_value)
+            for tau_value in tau_values
+            for top_k_value in top_k_values
+        )
     output_layer = resolve_output_embedding_layer(model)
 
     records: list[dict[str, Any]] = []
@@ -4329,6 +4407,18 @@ def _compute_four_gate_single_scope_from_captures(
                 "ev": {method: [] for method in methods},
             }
         )
+
+    sweep_risk_values = {
+        variant_slug: [
+            {
+                (method, active_cost): []
+                for method in methods
+                for active_cost in normalized_cost_modes
+            }
+            for _target_id in target_ids
+        ]
+        for variant_slug, _tau_value, _top_k_value in sweep_specs
+    }
 
     for layer_index, capture in enumerate(captures):
         missing = [
@@ -4366,6 +4456,12 @@ def _compute_four_gate_single_scope_from_captures(
         ).float()
         visual_update = visual_hout - visual_hmid
         sequence_length = int(capture["h_prev"].shape[1])
+        layer_sweep_problems = {
+            (variant_slug, method, active_cost): []
+            for variant_slug, _tau_value, _top_k_value in sweep_specs
+            for method in methods
+            for active_cost in normalized_cost_modes
+        }
 
         for target_offset, prediction_position in enumerate(pred_positions):
             if prediction_position < 0 or prediction_position >= sequence_length:
@@ -4377,6 +4473,22 @@ def _compute_four_gate_single_scope_from_captures(
             source_dist = compact_capture["source_dist"][target_offset]
             prediction_hpre = compact_capture["prediction_hpre"][target_offset]
             prediction_hmid = capture["h_mid"][0, prediction_position].float()
+            if sweep_specs:
+                source_scores = F.cosine_similarity(
+                    capture["o_ffn"][0, prediction_position]
+                    .float()
+                    .unsqueeze(0),
+                    visual_hmid,
+                    dim=-1,
+                )
+                sweep_source_dist = {
+                    tau_value: _source_distribution_from_scores(
+                        source_scores,
+                        tau=tau_value,
+                        mode="softmax",
+                    )
+                    for tau_value in {spec[1] for spec in sweep_specs}
+                }
             state_views = {
                 "hpre": (prediction_hpre, visual_hpre),
                 "hmid": (prediction_hmid, visual_hmid),
@@ -4463,6 +4575,28 @@ def _compute_four_gate_single_scope_from_captures(
                         support=support,
                     )
                     record["problems"][(method, active_cost)].append(problem)
+                for variant_slug, tau_value, top_k_value in sweep_specs:
+                    variant_source_dist = sweep_source_dist[tau_value]
+                    variant_support = _topk_union_indices(
+                        variant_source_dist,
+                        target_dist,
+                        int(top_k_value),
+                    )
+                    for active_cost in normalized_cost_modes:
+                        layer_sweep_problems[
+                            (variant_slug, method, active_cost)
+                        ].append(
+                            _prepare_four_gate_cost_problem(
+                                cost_mode=active_cost,
+                                source_dist=variant_source_dist,
+                                target_dist=target_dist,
+                                matched_states=cost_states,
+                                hmid_states=visual_hmid,
+                                hout_states=visual_hout,
+                                update_states=visual_update,
+                                support=variant_support,
+                            )
+                        )
                 region = _stable_topk_indices(
                     target_dist,
                     int(target_region_top_k),
@@ -4487,6 +4621,24 @@ def _compute_four_gate_single_scope_from_captures(
                     record["gates"][method].append(gate)
                 record["cosines"][method].append(target_cosine)
                 record["ev"][method].append(evidence_value)
+
+        if layer_sweep_problems:
+            layer_sweep_risks = _solve_exact_emd_problem_series(
+                layer_sweep_problems
+            )
+            for (
+                variant_slug,
+                method,
+                active_cost,
+            ), target_values in layer_sweep_risks.items():
+                if len(target_values) != len(target_ids):
+                    raise AssertionError(
+                        "Sweep OT result count does not match target count."
+                    )
+                for target_offset, value in enumerate(target_values):
+                    sweep_risk_values[variant_slug][target_offset][
+                        (method, active_cost)
+                    ].append(float(value))
 
         del compact_capture, visual_hpre, visual_hmid, visual_hout, visual_update
         if release_layer_captures:
@@ -4613,6 +4765,31 @@ def _compute_four_gate_single_scope_from_captures(
             ] = torch.tensor(
                 record["ev"][method], dtype=torch.float32
             )
+        if sweep_specs:
+            scope_sweep = {}
+            for variant_slug, tau_value, top_k_value in sweep_specs:
+                risk_curves = {}
+                for method in methods:
+                    state_name = _target_comparison_state(method)
+                    for active_cost in normalized_cost_modes:
+                        risk_suffix = _four_gate_risk_suffix(
+                            active_cost, state_name
+                        )
+                        risk_key = (
+                            f"dgst_t_{method}_{risk_suffix}_per_layer"
+                        )
+                        risk_curves[risk_key] = torch.tensor(
+                            sweep_risk_values[variant_slug][target_offset][
+                                (method, active_cost)
+                            ],
+                            dtype=torch.float32,
+                        )
+                scope_sweep[variant_slug] = {
+                    "source_tau": float(tau_value),
+                    "transport_top_k": int(top_k_value),
+                    "risks": risk_curves,
+                }
+            result["_dgst_t_hparam_sweep_scope"] = scope_sweep
         results.append(result)
     return results
 

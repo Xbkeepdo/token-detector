@@ -205,6 +205,9 @@ feature_extraction:
 
     # Shared transport math for all four gates and both direct controls.
     tau: 0.07
+    # Reuse each decoder forward and compare the Cartesian 3 x 3 source/OT
+    # sweep. Only risk changes; target gates, cosine, and EV are shared.
+    source_tau_values: [0.01, 0.03, 0.06]
     # InsLen CAFE: max over prompt positions of the generated object-token
     # probability from hpre Logit Lens. The paper/code use scale=0.1, which is
     # equivalent to softmax(logits / temperature) with temperature=10.
@@ -219,6 +222,7 @@ feature_extraction:
     compute_ffn_injection_features: false
     ffn_injection_eps: 1.0e-12
     transport_top_k: 64
+    transport_top_k_values: [32, 64, 128]
     # Primary: C_ij = sqrt((1-cos(h_state_i,h_state_j))/2), where h_state is
     # h_prev for hpre methods. The state-update family uses
     # C_alpha=(1-alpha)*d_state+alpha*d_update for alpha=0.1,...,0.9.
@@ -299,7 +303,7 @@ training:
       # VV: fixed sqrt-matched baseline plus alpha=0.1,...,0.9 state/update risks.
       - "hpre_raw_logit_gauss_risk_sqrt_matched_state"
       - "hpre_raw_logit_gauss_risk_sqrt_matched_state+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
-      #- "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01"
       # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha02"
@@ -321,7 +325,7 @@ training:
       # # Legacy VP examples (require support_modes to include "vp").
       - "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state"
       - "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state+vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
-      #- "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       # - "vpend_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01"
       # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha02"
