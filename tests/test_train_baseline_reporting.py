@@ -191,7 +191,13 @@ class BaselineReportingTests(unittest.TestCase):
                 "response_token_idx": 0,
                 "label": label,
                 "baselines": {
-                    "metatoken": {"vector": [1.0, 2.0]},
+                    "metatoken": {
+                        "vector": [1.0, 2.0],
+                        "metatoken_feature_definition": (
+                            "original_paper_equations_1_to_12"
+                        ),
+                        "probability_difference_definition": "paper_eq_11",
+                    },
                     "svar": {"vector": [3.0, 4.0, 5.0]},
                     "projectaway": {
                         "internal_confidence": 0.8,

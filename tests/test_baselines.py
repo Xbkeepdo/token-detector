@@ -170,7 +170,8 @@ class BaselineFeatureTests(unittest.TestCase):
             self.assertEqual(item.shape[-2:], (12, 12))
 
     def test_metatoken_matches_hand_computed_terms_and_compact_stats(self):
-        ids = [0, 2, 1]
+        # The object starts with a non-top-1 token so Eq. 11 is non-zero.
+        ids = [0, 0, 1]
         logits = torch.tensor(
             [
                 [2.0, 1.0, 0.0, -1.0],
@@ -208,7 +209,17 @@ class BaselineFeatureTests(unittest.TestCase):
             float(result.vector[5]), float(target_log_probs.sum()), places=6
         )
         self.assertAlmostEqual(
-            float(result.vector[-1]), float(probs[1, ids[1]]), places=6
+            float(result.vector[6]), float(target_log_probs.sum() / 2), places=6
+        )
+        self.assertAlmostEqual(
+            float(result.vector[-1]),
+            float(log_probs[1].max() - log_probs[1, ids[1]]),
+            places=6,
+        )
+        self.assertEqual(result.names[-1], "probability_difference")
+        self.assertEqual(
+            result.as_payload()["probability_difference_definition"],
+            "paper_eq_11",
         )
 
         top2 = torch.topk(probs, 2, dim=-1).values

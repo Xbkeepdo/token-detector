@@ -22,7 +22,8 @@ class MetaTokenFeatures:
                 for name in self.names
             ),
             "feature_names": list(self.names),
-            "probability_difference_adaptation": "greedy_target_probability",
+            "metatoken_feature_definition": "original_paper_equations_1_to_12",
+            "probability_difference_definition": "paper_eq_11",
         }
 
 
@@ -37,13 +38,12 @@ def compute_metatoken_features(
     length_penalty: float = 1.0,
     attention_layer: Union[int, str] = -1,
 ) -> MetaTokenFeatures:
-    """Compute the exact ``10 + H`` MetaToken feature vector.
+    """Compute the original paper's ``10 + H`` MetaToken feature vector.
 
     ``token_logits[t]`` must be the next-token vocabulary logits that produced
-    ``response_token_ids[t]``.  ``span_end`` is inclusive.  In the greedy
-    decoding protocol used by *Beyond the Global Scores*, Eq. 11's probability
-    difference is identically zero, so its slot stores the target-token
-    probability as specified by that paper's supplement.
+    ``response_token_ids[t]``.  ``span_end`` is inclusive.  In particular, the
+    final feature is MetaToken Eq. 11's log-probability difference; it is zero
+    when greedy decoding selects the most probable token.
 
     The original feature cardinality contains heads but not layers.  Therefore
     a ``[L,H,P]`` attention tensor uses the final decoder layer by default;
@@ -83,7 +83,10 @@ def compute_metatoken_features(
 
     object_log_probability = generated_log_probs[start : end + 1].sum()
     cumulative_log_probability = generated_log_probs[: end + 1].sum()
-    generated_length = max(1, end + 1)
+    # MetaToken Eq. 6 uses the end-token position o_{j,e}, not the number of
+    # generated tokens.  The max only makes the paper's zero-indexed first-token
+    # edge case finite; it is identical to the published equation for end > 0.
+    generated_length = max(1, end)
     sequence_score = cumulative_log_probability / (
         float(generated_length) ** float(length_penalty)
     )
@@ -97,7 +100,7 @@ def compute_metatoken_features(
     top2 = torch.topk(start_probs, k=2).values
     variation_ratio = 1.0 - top2[0]
     probability_margin = variation_ratio + top2[1]
-    target_token_probability = start_probs[ids[start]]
+    probability_difference = start_log_probs.max() - start_log_probs[ids[start]]
 
     names = (
         "relative_position",
@@ -113,7 +116,7 @@ def compute_metatoken_features(
         "normalized_entropy",
         "variation_ratio",
         "probability_margin",
-        "target_token_probability",
+        "probability_difference",
     )
     values = torch.cat(
         (
@@ -131,7 +134,7 @@ def compute_metatoken_features(
                     normalized_entropy,
                     variation_ratio,
                     probability_margin,
-                    target_token_probability,
+                    probability_difference,
                 )
             ),
         )
@@ -160,11 +163,11 @@ def compute_metatoken_features_from_stats(
     length_penalty: float = 1.0,
     attention_layer: Union[int, str] = -1,
 ) -> MetaTokenFeatures:
-    """Build the same ``10+H`` vector from compact per-step statistics.
+    """Build the original paper's ``10+H`` vector from compact statistics.
 
     This avoids retaining ``[T,V]`` logits.  The six input vectors are enough
-    to exactly reconstruct every MetaToken term used by the greedy-decoding
-    adaptation in *Beyond the Global Scores*.
+    to reconstruct every MetaToken term, including Eq. 11's probability
+    difference.
     """
 
     response_length = len(response_token_ids)
@@ -209,10 +212,14 @@ def compute_metatoken_features_from_stats(
     object_log_probability = target_logprobs[start : end + 1].sum()
     cumulative_log_probability = target_logprobs[: end + 1].sum()
     sequence_score = cumulative_log_probability / (
-        float(max(1, end + 1)) ** float(length_penalty)
+        float(max(1, end)) ** float(length_penalty)
     )
     variation_ratio = 1.0 - statistics["response_top1_probs"][start]
     probability_margin = variation_ratio + statistics["response_top2_probs"][start]
+    probability_difference = (
+        torch.log(statistics["response_top1_probs"][start])
+        - target_logprobs[start]
+    )
     names = (
         "relative_position",
         "absolute_occurrence",
@@ -227,7 +234,7 @@ def compute_metatoken_features_from_stats(
         "normalized_entropy",
         "variation_ratio",
         "probability_margin",
-        "target_token_probability",
+        "probability_difference",
     )
     values = torch.cat(
         (
@@ -245,7 +252,7 @@ def compute_metatoken_features_from_stats(
                     statistics["response_normalized_entropies"][start],
                     variation_ratio,
                     probability_margin,
-                    statistics["response_target_probs"][start],
+                    probability_difference,
                 )
             ).cpu(),
         )

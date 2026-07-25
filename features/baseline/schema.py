@@ -120,7 +120,19 @@ def get_baseline_payload(record: Mapping[str, Any], name: str) -> Mapping[str, A
 def baseline_vector(record: Mapping[str, Any], name: str) -> np.ndarray:
     """Return the canonical dense vector for MetaToken or SVAR records."""
 
-    payload = get_baseline_payload(record, name)
+    normalized = str(name).strip().lower()
+    payload = get_baseline_payload(record, normalized)
+    if normalized == "metatoken":
+        definition = payload.get("metatoken_feature_definition")
+        probability_definition = payload.get("probability_difference_definition")
+        if (
+            definition != "original_paper_equations_1_to_12"
+            or probability_definition != "paper_eq_11"
+        ):
+            raise ValueError(
+                "MetaToken payload predates the original-paper feature definition; "
+                "re-extract baseline/features.pkl before training"
+            )
     if "vector" not in payload:
         raise KeyError(f"Baseline {name!r} does not contain a dense 'vector'")
     vector = np.asarray(payload["vector"], dtype=np.float32).reshape(-1)
