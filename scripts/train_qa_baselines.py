@@ -48,6 +48,7 @@ from utils.config_utils import (  # noqa: E402
     load_config,
     qa_extraction_family_flags,
 )
+from utils.qa_paths import resolve_qa_output_name, resolve_qa_paths  # noqa: E402
 
 
 DEFAULT_SEEDS = (43, 44, 45)
@@ -72,6 +73,11 @@ def parse_args() -> argparse.Namespace:
         "--config", default="configs/model_configs_unified.yaml"
     )
     parser.add_argument("--output-root")
+    parser.add_argument("--output", dest="output_name")
+    parser.add_argument(
+        "--experiment", dest="output_name", help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--label-protocol",
@@ -117,10 +123,14 @@ def main() -> None:
             "QA baseline training requires training.threshold_selection=train_f1"
         )
     label_protocol = normalize_qa_label_protocol(args.label_protocol)
-    output_root = args.output_root or (config.get("qa_benchmarks") or {}).get("output_root")
+    qa_cfg = config.get("qa_benchmarks") or {}
+    output_root = args.output_root or qa_cfg.get("output_root")
     if not output_root:
         raise ValueError("QA output root is required by CLI or YAML")
-    run_dir = Path(output_root) / args.model / args.dataset
+    output_name = resolve_qa_output_name(args.output_name, qa_cfg)
+    run_dir = resolve_qa_paths(
+        output_root, args.model, output_name, args.dataset
+    ).benchmark_dir
     baseline_dir = run_dir / "baseline" / label_protocol
     feature_path = baseline_dir / "features.pkl"
     manifest_path = baseline_dir / MANIFEST_NAME

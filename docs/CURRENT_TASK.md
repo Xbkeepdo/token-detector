@@ -1797,3 +1797,14 @@
 - `coco-labeling/label_coco.py` 同步移除 `_load_or_create_splits` 已被严格 8:2 覆盖且从不生效的 `train_ratio/resume` 参数，实际 image-disjoint 8:2 逻辑不变。
 - 验证：受影响定向套件 `37/37` 通过，包含全模型视觉 support、four-gate、alpha sweep、训练命令、raw-attention 与 labeling 配置；两份 YAML 可运行时加载，所有模型都解析为 `visual_prompt_end`；受影响 Python 文件编译和 `git diff --check` 通过。
 - 失败记录：第一次定向测试有 1 fail/1 error，分别是 unified 的既有 `prompt_cafe` feature-set 未写入新精确预期，以及 raw-attention 测试仍依赖已删除的 `branches` 选择器；修正测试预期并显式设置 `four_gate_methods/support_modes` 后，完整定向套件重跑通过。
+
+## 2026-07-26 QA 命名 output 目录与 generation 复用
+
+- `run_qa.sh` 新增 `OUTPUT`，默认值为 `default`；流水线、方法 probe、baseline 训练和对比汇总均显式接收同一个 `--output`，避免不同阶段各自拼接输出路径。旧 `--experiment` 参数仅作为兼容别名保留。
+- 新目录规范为 `qa_benchmarks/{model}/{output}/{benchmark}/`。benchmark 子目录只保存 `labels.jsonl`、`features.pkl`、baseline 与训练结果；可复用 generation 位于命名 output 目录，命名为 `{benchmark}_generations.jsonl`，失败记录命名为 `{benchmark}_generation_failures.jsonl`。
+- 新增 `utils/qa_paths.py` 作为唯一目录解析入口，并拒绝空 output 名、`.`/`..` 和包含路径分隔符的 output 名，防止意外跨目录写入。独立 baseline 抽取、固定 MLP 实验、train-threshold 复评、artifact 校验和 Sinkhorn 子集工具同步接入；只读工具仍可自动读取旧 benchmark 目录内的 `generations.jsonl`。
+- `features/qa_extractor.py` 的生成、标注与提取入口支持显式 generation 路径；单卡和多卡流水线均写入同一个 output 级文件，多卡 worker 的临时分片仍留在对应 benchmark 的 `.qa_parallel/` 下。
+- 三个 benchmark 放入同一 output 时，output 目录直接包含 `pope_generations.jsonl`、`clevr_exist_9k_generations.jsonl` 和 `amber_discriminative_generations.jsonl`；修改特征参数建立新 output 时，只需在 output 目录层复制所需 generation 文件，不再进入三个 benchmark 子目录逐个复制。
+- 验证：受影响 Python 文件 `py_compile` 与 `bash -n run_qa.sh` 通过；新增路径测试 `4/4` 通过；QA extractor/parallel/fixed-MLP/summary 相关 `11/11`、answer-only/baseline/benchmark/probe 相关 `19/19` 通过。
+- 失败记录：`/opt/conda/envs/td` 未安装 pytest，首次命令在测试收集前报 `No module named pytest`；新增测试改用标准库 `unittest` 后通过，未额外修改训练环境依赖。
+- 全仓 `unittest discover` 共运行 227 项，结果为 212 通过、10 fail、5 error。失败项集中在此前已记录的旧 pipeline-manifest/stage-resume 预期（14 项）及既有 `test_method_and_ads_cgc_can_share_one_record` 缺少 `dgst_t_vv_support_size`（1 项）；本次直接受影响的 QA 定向套件均通过，未在本次目录重构中改动这些无关模块。

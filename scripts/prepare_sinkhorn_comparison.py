@@ -14,14 +14,17 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.qa_benchmark import atomic_write_json, atomic_write_jsonl, load_jsonl
+from utils.qa_paths import generations_path_for_benchmark_dir, locate_qa_generations
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exact-run-dir", required=True)
+    parser.add_argument("--exact-generations")
     parser.add_argument("--questions", required=True)
     parser.add_argument("--prepared-root", required=True)
     parser.add_argument("--destination-run-dir", required=True)
+    parser.add_argument("--destination-generations")
     parser.add_argument("--per-class", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -49,8 +52,9 @@ def main():
     keys = {row["key"] for row in selected}
 
     questions = [row for row in load_jsonl(args.questions) if row["key"] in keys]
+    exact_generations = locate_qa_generations(exact_root, args.exact_generations)
     generations = [
-        row for row in load_jsonl(exact_root / "generations.jsonl") if row["key"] in keys
+        row for row in load_jsonl(exact_generations) if row["key"] in keys
     ]
     labels = [row for row in load_jsonl(exact_root / "labels.jsonl") if row["key"] in keys]
     expected = args.per_class * 2
@@ -66,7 +70,11 @@ def main():
     with open(exact_root / "image_splits.json", encoding="utf-8") as handle:
         import json
         atomic_write_json(prepared / "image_splits.json", json.load(handle))
-    atomic_write_jsonl(destination / "generations.jsonl", generations)
+    destination_generations = Path(
+        args.destination_generations
+        or generations_path_for_benchmark_dir(destination)
+    )
+    atomic_write_jsonl(destination_generations, generations)
     atomic_write_jsonl(destination / "labels.jsonl", labels)
     with open(destination / "exact_features.pkl.tmp", "wb") as handle:
         pickle.dump(selected, handle, protocol=pickle.HIGHEST_PROTOCOL)

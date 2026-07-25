@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
         "--config", default="configs/model_configs_unified.yaml"
     )
     parser.add_argument("--output-root")
+    parser.add_argument("--output", dest="output_name")
+    parser.add_argument(
+        "--experiment", dest="output_name", help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--probe-summary")
     parser.add_argument("--baseline-summary")
     parser.add_argument("--feature-summary")
@@ -102,6 +107,7 @@ def resolve_output_root(
 def main() -> None:
     args = parse_args()
     from utils.config_utils import load_config, qa_extraction_family_flags
+    from utils.qa_paths import resolve_qa_output_name, resolve_qa_paths
 
     config = load_config(args.config)
     family_flags = qa_extraction_family_flags(config)
@@ -113,7 +119,11 @@ def main() -> None:
         )
         return
     output_root = resolve_output_root(config, args.output_root)
-    run_dir = Path(output_root) / args.model / args.dataset
+    qa_cfg = config.get("qa_benchmarks") or {}
+    output_name = resolve_qa_output_name(args.output_name, qa_cfg)
+    run_dir = resolve_qa_paths(
+        output_root, args.model, output_name, args.dataset
+    ).benchmark_dir
     probe_path = (
         Path(args.probe_summary)
         if args.probe_summary

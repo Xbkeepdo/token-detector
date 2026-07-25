@@ -251,7 +251,6 @@ class LLaVAWrapper(BaseLVLMWrapper):
                     token_position=expanded_seq_len - 1,
                     visual_start=img_start,
                     visual_end=img_end,
-                    prompt_positions=prompt_positions_override,
                 )
             elif layer_outputs is not None:
                 token_hidden_states, patch_hidden_states = hidden_states_from_layer_outputs(
@@ -978,7 +977,13 @@ class LLaVAWrapper(BaseLVLMWrapper):
             )
         ).strip().lower()
         if mode in {"full", "all", "template"}:
-            return None
+            return resolve_prompt_positions(
+                full_input_ids=full_input_ids,
+                prompt_tokenized_length=prompt_tokenized_length,
+                image_token_id=image_token_id,
+                visual_start=visual_start,
+                visual_end=visual_end,
+            )
         if mode not in {"user_text", "user", "semantic"}:
             raise ValueError(
                 "dgst_t_prompt_support_mode must be 'full' or 'user_text', "

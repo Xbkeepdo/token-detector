@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from models.dgst_capture import merged_position_for_tokenized_position
+from models.dgst_capture import (
+    merged_position_for_tokenized_position,
+    resolve_prompt_positions,
+)
 
 
 def resolve_prompt_support_positions(
@@ -18,7 +21,7 @@ def resolve_prompt_support_positions(
     cfg_dgst_t: dict | None,
     model_name: str,
 ) -> list[int] | None:
-    """Return prompt support override positions, or None for full prompt."""
+    """Return decoder-side prompt support positions for the selected scope."""
     if cfg_dgst_t is None:
         return None
     mode = str(
@@ -28,7 +31,13 @@ def resolve_prompt_support_positions(
         )
     ).strip().lower()
     if mode in {"full", "all", "template"}:
-        return None
+        return resolve_prompt_positions(
+            full_input_ids=full_input_ids,
+            prompt_tokenized_length=prompt_tokenized_length,
+            image_token_id=image_token_id,
+            visual_start=visual_start,
+            visual_end=visual_end,
+        )
     if mode not in {"user_text", "user", "semantic"}:
         raise ValueError(
             "dgst_t_prompt_support_mode must be 'full' or 'user_text', "

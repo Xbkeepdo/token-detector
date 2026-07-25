@@ -10,6 +10,7 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     exit 2
 fi
 MODEL="${MODEL:-qwen3_vl_8b}"
+OUTPUT="${OUTPUT:-default}"               # qa_benchmarks/<model>/<output>/
 DATASET="${DATASET:-pope}"                 # pope | clevr_exist_9k | amber_discriminative
 CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
@@ -43,6 +44,7 @@ fi
 # Step 2: Generate, label, and jointly extract every YAML-selected family.
 "$PYTHON_BIN" scripts/qa_pipeline.py \
     --model "$MODEL" \
+    --output "$OUTPUT" \
     --dataset "$DATASET" \
     --config "$CONFIG" \
     --device "$DEVICE" \
@@ -55,6 +57,7 @@ fi
 # Step 3: Train DGST and ADS+CGC probes for both labels at the selected position.
 "$PYTHON_BIN" scripts/train_qa_probes.py \
     --model "$MODEL" \
+    --output "$OUTPUT" \
     --dataset "$DATASET" \
     --config "$CONFIG" \
     --device "$DEVICE"
@@ -63,6 +66,7 @@ fi
 for protocol in $BASELINE_LABEL_PROTOCOLS; do
     "$PYTHON_BIN" scripts/train_qa_baselines.py \
         --model "$MODEL" \
+        --output "$OUTPUT" \
         --dataset "$DATASET" \
         --config "$CONFIG" \
         --device "$DEVICE" \
@@ -74,6 +78,7 @@ if [[ -f scripts/summarize_qa_comparison.py ]]; then
     for protocol in $BASELINE_LABEL_PROTOCOLS; do
         "$PYTHON_BIN" scripts/summarize_qa_comparison.py \
             --model "$MODEL" \
+            --output "$OUTPUT" \
             --dataset "$DATASET" \
             --label-protocol "$protocol" \
             --config "$CONFIG"

@@ -71,6 +71,7 @@ from utils.config_utils import (
     load_config,
     qa_extraction_family_flags,
 )
+from utils.qa_paths import resolve_qa_output_name, resolve_qa_paths
 
 
 def parse_args():
@@ -89,6 +90,20 @@ def parse_args():
     parser.add_argument("--config", default="configs/model_configs_unified.yaml")
     parser.add_argument("--prepared-root")
     parser.add_argument("--output-root")
+    parser.add_argument(
+        "--output",
+        dest="output_name",
+        help=(
+            "Named output directory below <output-root>/<model>. Generations are "
+            "stored once in this directory and benchmark artifacts below it."
+        ),
+    )
+    parser.add_argument(
+        "--experiment",
+        dest="output_name",
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--stage", choices=("generate", "label", "extract", "all"), default="all")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--device", default="cuda")
@@ -285,6 +300,8 @@ def _run_parallel_generation(
     model_cfg: dict,
     questions: list[dict],
     output_dir: str,
+    generations_path: Path,
+    generation_failures_path: Path,
     devices: tuple[str, ...],
     checkpoint_every: int,
 ) -> None:
@@ -293,7 +310,7 @@ def _run_parallel_generation(
     expected = {str(question["key"]): question for question in questions}
     main_rows = {
         str(row.get("key")): row
-        for row in load_jsonl(Path(output_dir) / "generations.jsonl")
+        for row in load_jsonl(generations_path)
     }
     jobs = []
     for worker_id, (device, partition) in enumerate(zip(devices, partitions)):
@@ -336,7 +353,7 @@ def _run_parallel_generation(
     _run_spawn_workers(_generation_worker, jobs, "generation")
 
     merged: dict[str, dict] = {}
-    main_path = Path(output_dir) / "generations.jsonl"
+    main_path = generations_path
     for row in load_jsonl(main_path):
         key = str(row.get("key"))
         question = expected.get(key)
@@ -346,7 +363,7 @@ def _run_parallel_generation(
             merged[key] = row
     failure_rows: dict[str, dict] = {
         str(row.get("key")): row
-        for row in load_jsonl(Path(output_dir) / "generation_failures.jsonl")
+        for row in load_jsonl(generation_failures_path)
     }
     for worker_id, partition in enumerate(partitions):
         worker_dir = root / f"worker-{worker_id:03d}"
@@ -370,7 +387,7 @@ def _run_parallel_generation(
         [merged[str(question["key"])] for question in questions if str(question["key"]) in merged],
     )
     atomic_write_jsonl(
-        Path(output_dir) / "generation_failures.jsonl",
+        generation_failures_path,
         [failure_rows[key] for key in sorted(failure_rows)],
     )
 
@@ -381,6 +398,7 @@ def _run_parallel_extraction(
     model_cfg: dict,
     questions: list[dict],
     output_dir: str,
+    generations_path: Path,
     devices: tuple[str, ...],
     dgst_cfg: dict,
     ads_cfg: dict,
@@ -397,7 +415,7 @@ def _run_parallel_extraction(
     root = _parallel_worker_root(output_dir, "features", len(devices))
     generations = {
         str(row["key"]): row
-        for row in load_jsonl(Path(output_dir) / "generations.jsonl")
+        for row in load_jsonl(generations_path)
     }
     labels = {
         str(row["key"]): row
@@ -887,46 +905,49 @@ def main():
         raise ValueError(
             "prepared/output roots must be provided by CLI or qa_benchmarks YAML"
         )
+    output_name = resolve_qa_output_name(args.output_name, qa_cfg)
+    qa_paths = resolve_qa_paths(output_root, args.model, output_name, args.dataset)
     questions_path = os.path.join(prepared_root, args.dataset, "questions.jsonl")
     questions = load_jsonl(questions_path)
     if args.limit is not None:
         questions = questions[: args.limit]
-    output_dir = os.path.join(output_root, args.model, args.dataset)
+    output_dir = str(qa_paths.benchmark_dir)
+    generations_path = qa_paths.generations_path
+    generation_failures_path = qa_paths.generation_failures_path
+    qa_paths.output_dir.mkdir(parents=True, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
     splits_path = os.path.join(prepared_root, args.dataset, "image_splits.json")
     with open(splits_path, encoding="utf-8") as handle:
         atomic_write_json(os.path.join(output_dir, "image_splits.json"), json.load(handle))
 
     if not args.resume:
-        stage_files = {
-            "generate": (
-                "generations.jsonl",
-                "generation_failures.jsonl",
-                ".qa_parallel/generation",
-            ),
-            "label": ("labels.jsonl",),
+        generation_files = (generations_path, generation_failures_path)
+        benchmark_files = {
+            "generate": (Path(output_dir) / ".qa_parallel/generation",),
+            "label": (Path(output_dir) / "labels.jsonl",),
             "extract": (
-                "features.pkl",
-                "features.parts",
-                "extraction_failures.jsonl",
-                "qa_feature_summary.json",
-                ".qa_parallel/features",
-                *( ("baseline",) if baseline_enabled else () ),
+                Path(output_dir) / "features.pkl",
+                Path(output_dir) / "features.parts",
+                Path(output_dir) / "extraction_failures.jsonl",
+                Path(output_dir) / "qa_feature_summary.json",
+                Path(output_dir) / ".qa_parallel/features",
+                *( (Path(output_dir) / "baseline",) if baseline_enabled else () ),
             ),
             "all": (
-                "generations.jsonl",
-                "generation_failures.jsonl",
-                "labels.jsonl",
-                "features.pkl",
-                "features.parts",
-                "extraction_failures.jsonl",
-                "qa_feature_summary.json",
-                ".qa_parallel/generation",
-                ".qa_parallel/features",
-                *( ("baseline",) if baseline_enabled else () ),
+                Path(output_dir) / "labels.jsonl",
+                Path(output_dir) / "features.pkl",
+                Path(output_dir) / "features.parts",
+                Path(output_dir) / "extraction_failures.jsonl",
+                Path(output_dir) / "qa_feature_summary.json",
+                Path(output_dir) / ".qa_parallel/generation",
+                Path(output_dir) / ".qa_parallel/features",
+                *( (Path(output_dir) / "baseline",) if baseline_enabled else () ),
             ),
         }[args.stage]
-        existing = [name for name in stage_files if os.path.exists(os.path.join(output_dir, name))]
+        checked = benchmark_files + (
+            generation_files if args.stage in {"generate", "all"} else ()
+        )
+        existing = [str(path) for path in checked if path.exists()]
         if existing:
             raise FileExistsError(
                 f"--no-resume refuses to overwrite {existing}; use a new output root"
@@ -935,7 +956,7 @@ def main():
     expected_keys = {str(row["key"]) for row in questions}
     generation_rows = {
         str(row.get("key")): row
-        for row in load_jsonl(os.path.join(output_dir, "generations.jsonl"))
+        for row in load_jsonl(generations_path)
     }
     label_rows = {
         str(row.get("key")): row
@@ -996,6 +1017,8 @@ def main():
                 model_cfg=model_cfg,
                 questions=questions,
                 output_dir=output_dir,
+                generations_path=generations_path,
+                generation_failures_path=generation_failures_path,
                 devices=generation_devices,
                 checkpoint_every=args.checkpoint_every,
             )
@@ -1006,10 +1029,12 @@ def main():
                 questions,
                 output_dir,
                 args.checkpoint_every,
+                generations_path=generations_path,
+                generation_failures_path=generation_failures_path,
             )
     generation_rows = {
         str(row.get("key")): row
-        for row in load_jsonl(os.path.join(output_dir, "generations.jsonl"))
+        for row in load_jsonl(generations_path)
     }
     if not _generations_complete(generation_rows, questions, args.model):
         invalid = [
@@ -1026,14 +1051,19 @@ def main():
             "Resume generation before labeling or extraction."
         )
     if args.stage in ("label", "all"):
-        label_generations(questions, output_dir, args.checkpoint_every)
+        label_generations(
+            questions,
+            output_dir,
+            args.checkpoint_every,
+            generations_path=generations_path,
+        )
     if args.stage in ("extract", "all"):
         # Generation and labeling may have changed earlier in this same run.
         # Re-evaluate feature provenance after both stages before deciding to
         # resume, otherwise stale embedded labels could be silently retained.
         generation_rows = {
             str(row.get("key")): row
-            for row in load_jsonl(os.path.join(output_dir, "generations.jsonl"))
+            for row in load_jsonl(generations_path)
         }
         label_rows = {
             str(row.get("key")): row
@@ -1062,7 +1092,7 @@ def main():
                 model_cfg=model_cfg,
                 questions=questions,
                 questions_path=Path(questions_path),
-                generations_path=Path(output_dir) / "generations.jsonl",
+                generations_path=generations_path,
                 labels_path=Path(output_dir) / "labels.jsonl",
                 run_dir=Path(output_dir),
                 label_protocols=baseline_label_protocols,
@@ -1090,6 +1120,7 @@ def main():
                 model_cfg=model_cfg,
                 questions=questions,
                 output_dir=output_dir,
+                generations_path=generations_path,
                 devices=feature_devices,
                 dgst_cfg=dgst_cfg,
                 ads_cfg=ads_cfg,
@@ -1129,6 +1160,7 @@ def main():
                     method_enabled=bool(method_enabled and not feature_complete),
                     ads_cgc_enabled=bool(ads_cgc_enabled and not feature_complete),
                     baseline_consumers=consumers,
+                    generations_path=generations_path,
                 )
             if feature_complete and root_enabled:
                 with open(os.path.join(output_dir, "features.pkl"), "rb") as handle:
@@ -1195,7 +1227,10 @@ def main():
             },
         )
     release_single_wrapper()
-    print(f"[qa_pipeline] Complete: {args.model}/{args.dataset}/{args.stage}")
+    print(
+        "[qa_pipeline] Complete: "
+        f"{args.model}/{output_name}/{args.dataset}/{args.stage}"
+    )
 
 
 def _generations_complete(

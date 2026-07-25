@@ -49,6 +49,7 @@ from features.qa_extractor import qa_prompt  # noqa: E402
 from models import build_model  # noqa: E402
 from utils.config_utils import get_model_cfg, load_config  # noqa: E402
 from utils.generation_provenance import stable_sha256  # noqa: E402
+from utils.qa_paths import resolve_qa_output_name, resolve_qa_paths  # noqa: E402
 
 
 MANIFEST_NAME = "qa_baseline_manifest.json"
@@ -75,6 +76,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prepared-root")
     parser.add_argument("--output-root")
+    parser.add_argument("--output", dest="output_name")
+    parser.add_argument(
+        "--experiment", dest="output_name", help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--feature-devices",
@@ -244,10 +250,12 @@ def main() -> None:
     if not prepared_root or not output_root:
         raise ValueError("QA prepared/output roots are required by CLI or YAML")
     prepared_dir = Path(prepared_root) / args.dataset
-    run_dir = Path(output_root) / args.model / args.dataset
+    output_name = resolve_qa_output_name(args.output_name, qa_cfg)
+    qa_paths = resolve_qa_paths(output_root, args.model, output_name, args.dataset)
+    run_dir = qa_paths.benchmark_dir
     baseline_dir = run_dir / "baseline" / label_protocol
     questions_path = prepared_dir / "questions.jsonl"
-    generations_path = run_dir / "generations.jsonl"
+    generations_path = qa_paths.generations_path
     labels_path = run_dir / "labels.jsonl"
     questions = load_jsonl(questions_path)
     if args.limit is not None:

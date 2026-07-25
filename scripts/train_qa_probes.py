@@ -26,6 +26,7 @@ from detection.qa_probe import (
 from data.qa_benchmark import load_jsonl
 from features.qa_extractor import qa_label_fingerprint
 from utils.config_utils import load_config, qa_extraction_family_flags
+from utils.qa_paths import resolve_qa_output_name, resolve_qa_paths
 
 
 def parse_args():
@@ -43,6 +44,11 @@ def parse_args():
     )
     parser.add_argument("--config", default="configs/model_configs_unified.yaml")
     parser.add_argument("--output-root")
+    parser.add_argument("--output", dest="output_name")
+    parser.add_argument(
+        "--experiment", dest="output_name", help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--feature-sets", nargs="+")
     parser.add_argument("--label-protocols", nargs="+", choices=QA_LABEL_PROTOCOLS)
     parser.add_argument("--positions", nargs="+", choices=QA_POSITIONS)
@@ -133,7 +139,10 @@ def main():
     )
     if not output_root:
         raise ValueError("QA output_root is missing from CLI and qa_benchmarks config")
-    run_root = Path(output_root) / args.model / args.dataset
+    output_name = resolve_qa_output_name(args.output_name, qa_benchmark_cfg)
+    run_root = resolve_qa_paths(
+        output_root, args.model, output_name, args.dataset
+    ).benchmark_dir
     training_input_fingerprint, training_provenance = (
         _qa_training_input_fingerprint(
             run_root,

@@ -15,16 +15,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.qa_benchmark import load_jsonl
 from features.dgst_t import COST_VARIANT_RISK_KEYS
+from utils.qa_paths import locate_qa_generations
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True)
+    parser.add_argument(
+        "--generations-path",
+        help="Override the experiment-level <benchmark>_generations.jsonl path.",
+    )
     parser.add_argument("--expected", type=int)
     parser.add_argument("--require-object-cgc", action="store_true")
     args = parser.parse_args()
     root = Path(args.run_dir)
-    generations = load_jsonl(root / "generations.jsonl")
+    generations = load_jsonl(locate_qa_generations(root, args.generations_path))
     labels = load_jsonl(root / "labels.jsonl")
     with open(root / "features.pkl", "rb") as handle:
         features = pickle.load(handle)

@@ -110,11 +110,20 @@ def generate_questions(
     questions: list[dict],
     output_dir: str,
     checkpoint_every: int = 10,
+    *,
+    generations_path: str | Path | None = None,
+    generation_failures_path: str | Path | None = None,
 ) -> list[dict]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    store = JSONLCheckpointStore(str(output / "generations.jsonl"), checkpoint_every)
-    failures = JSONLCheckpointStore(str(output / "generation_failures.jsonl"), 1)
+    generation_file = Path(generations_path or output / "generations.jsonl")
+    failure_file = Path(
+        generation_failures_path or output / "generation_failures.jsonl"
+    )
+    generation_file.parent.mkdir(parents=True, exist_ok=True)
+    failure_file.parent.mkdir(parents=True, exist_ok=True)
+    store = JSONLCheckpointStore(str(generation_file), checkpoint_every)
+    failures = JSONLCheckpointStore(str(failure_file), 1)
     for question in tqdm(questions, desc="Generate yes/no"):
         key = question["key"]
         prompt = qa_prompt(model_key, question["question"])
@@ -169,9 +178,12 @@ def label_generations(
     questions: list[dict],
     output_dir: str,
     checkpoint_every: int = 100,
+    *,
+    generations_path: str | Path | None = None,
 ) -> list[dict]:
     output = Path(output_dir)
-    generations = {row["key"]: row for row in load_jsonl(output / "generations.jsonl")}
+    generation_file = Path(generations_path or output / "generations.jsonl")
+    generations = {row["key"]: row for row in load_jsonl(generation_file)}
     store = JSONLCheckpointStore(str(output / "labels.jsonl"), checkpoint_every)
     for question in questions:
         generation = generations.get(question["key"])
@@ -228,6 +240,7 @@ def extract_questions(
     method_enabled: bool = True,
     ads_cgc_enabled: bool = True,
     baseline_consumers: Mapping[str, Mapping[str, Any]] | None = None,
+    generations_path: str | Path | None = None,
 ) -> list[dict]:
     """Extract every enabled QA family at the configured VQA positions.
 
@@ -267,7 +280,8 @@ def extract_questions(
                 f"QA baseline consumer {protocol!r} requires adapter and store"
             )
     output = Path(output_dir)
-    generations = {row["key"]: row for row in load_jsonl(output / "generations.jsonl")}
+    generation_file = Path(generations_path or output / "generations.jsonl")
+    generations = {row["key"]: row for row in load_jsonl(generation_file)}
     labels = {row["key"]: row for row in load_jsonl(output / "labels.jsonl")}
     shards = AtomicFeatureShards(output_dir, shard_size) if root_enabled else None
     failures = JSONLCheckpointStore(str(output / "extraction_failures.jsonl"), 1)

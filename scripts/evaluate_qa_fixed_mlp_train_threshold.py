@@ -47,6 +47,7 @@ from scripts.train_qa_fixed_mlp_experiment import (  # noqa: E402
 )
 from scripts.train_qa_probes import _validate_training_artifacts  # noqa: E402
 from utils.config_utils import load_config  # noqa: E402
+from utils.qa_paths import resolve_qa_output_name, resolve_qa_paths  # noqa: E402
 
 
 EVALUATION_NAME = "mlp_bn_relu_trainloss_es_train_real_f1_threshold"
@@ -60,6 +61,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--config", default="configs/model_configs_unified.yaml")
     parser.add_argument("--output-root")
+    parser.add_argument("--output", dest="output_name")
+    parser.add_argument(
+        "--experiment", dest="output_name", help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--label-protocol",
         choices=("answer_correctness_all", "object_hallucination_yes_only"),
@@ -77,7 +83,10 @@ def main() -> None:
     output_root = args.output_root or qa_cfg.get("output_root")
     if not output_root:
         raise ValueError("QA output root is required by CLI or YAML")
-    run_root = Path(output_root) / args.model / args.dataset
+    output_name = resolve_qa_output_name(args.output_name, qa_cfg)
+    run_root = resolve_qa_paths(
+        output_root, args.model, output_name, args.dataset
+    ).benchmark_dir
     baseline_root = run_root / "baseline" / args.label_protocol
     paths = {
         "root_features": run_root / "features.pkl",

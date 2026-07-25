@@ -264,7 +264,6 @@ class InternVLWrapper(BaseLVLMWrapper):
                     token_position=seq_len - 1,
                     visual_start=img_start,
                     visual_end=img_end,
-                    prompt_positions=prompt_positions_override,
                 )
             elif layer_outputs is not None:
                 token_hidden_states, patch_hidden_states = hidden_states_from_layer_outputs(
