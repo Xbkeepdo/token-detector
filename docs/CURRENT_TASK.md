@@ -1,5 +1,14 @@
 # Current Task
 
+## 2026-07-26 VQA 问题物体 token 与 prompt 末 token 对比
+
+- 再次以 `model_configs_server_fj01.yaml` 的当前实验选择为基准同步 `model_configs_unified.yaml`，只保留两台机器各自的数据、模型与输出绝对路径。同步后的 COCO extraction mode 为 `all`，baseline 提取/训练只启用 MetaToken，source tau 网格为 `[0.02, 0.03, 0.04, 0.05, 0.06]`，transport Top-K 网格为 `[16, 32, 64, 128]`。
+- 两份活动 YAML 的 VQA `position_protocols` 现同时启用 `prompt_last_token` 和 `question_object_pre_token`。前者取完整 prompt 最后一行并预测第一个回答 token；后者在完整多模态上下文中定位问题物体的第一个真实 contextual sub-token `j`，严格截断到 `j` 之前并用预测行 `j-1` 提取同一套 DGST 特征。训练脚本按 `@position` 分别训练与汇总，因此形成同方法、同数据划分下的直接位置消融。
+- POPE 使用官方问题中的精确物体 surface/span；CLEVR 使用末端 `exist` program 消费的 entity head 并显式统计覆盖率。AMBER 的 existence/attribute/relation 问题没有统一的唯一物体 span，本轮不引入可能污染对比的启发式定位：这些行继续保留 `prompt_last_token`，对象位置状态为 `unavailable`。
+- QA feature schema 升级为 `qa-position-comparison-v7`，防止旧的 prompt-last-only shard 被静默续跑。新增回归测试核验活动 YAML 会为每个方法生成两个位置的 feature set，并核验 object 分支实际传入 `cat` 的原始字符 span、保存 contextual target token ID 和 `j-1` prediction position；显式只选 prompt-last 的旧路径仍保证不会额外执行 object forward。
+- 本轮只修改配置、说明与测试，不启动 VQA 特征提取或训练。
+- 验证：QA/config/object-position/report 相关测试为 `51 passed, 6 subtests passed`；sweep/state-update/raw-attention/wrapper 相关测试为 `12 passed, 4 subtests passed`；`py_compile` 与 `git diff --check` 通过。提交后尝试推送 `hope-best` 失败，原因是 fj01 的 HTTPS GitHub remote 没有可用用户名/凭据；本地分支仍比 `origin/hope-best` 超前 4 个提交。
+
 ## 2026-07-25 unified/fj01 配置语义同步
 
 - 以 `model_configs_server_fj01.yaml` 的当前实验选择为基准同步 `model_configs_unified.yaml`：QA extraction mode=`method_only`、两个 QA label protocol、VV+VPend support、source tau=`[0.01,0.03,0.06]`、transport Top-K=`[32,64,128]`、活动 method/ADS/CGC feature sets 及全部训练参数现已一致。unified 继续保留 apulis 环境路径，fj01 继续保留 `/root/rivermind-*` 路径，不跨机器覆盖模型、数据和输出绝对路径。

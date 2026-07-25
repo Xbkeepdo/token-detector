@@ -5,6 +5,7 @@ import pickle
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -34,10 +35,13 @@ from utils.config_utils import load_config, qa_extraction_family_flags
 
 
 class QAAnswerOnlyConfigTests(unittest.TestCase):
-    def test_active_yaml_runs_only_prompt_last_position_by_default(self) -> None:
+    def test_active_yaml_compares_prompt_last_and_question_object_positions(self) -> None:
         config = load_config(str(ROOT / "configs/model_configs_unified.yaml"))
         positions = config["qa_benchmarks"]["position_protocols"]
-        self.assertEqual(positions, ["prompt_last_token"])
+        self.assertEqual(
+            positions,
+            ["prompt_last_token", "question_object_pre_token"],
+        )
         self.assertEqual(config["models"]["qwen3_vl_8b"]["max_new_tokens"], 512)
         self.assertEqual(_qa_model_cfg(config, "qwen3_vl_8b")["max_new_tokens"], 8)
         self.assertNotIn("max_pixels", _qa_model_cfg(config, "qwen3_vl_8b", "pope"))
@@ -52,16 +56,21 @@ class QAAnswerOnlyConfigTests(unittest.TestCase):
             tuple(positions),
             qa_extraction_family_flags(config),
         )
-        expected_count = len(config["training"]["feature_sets"]["method"])
+        method_count = len(config["training"]["feature_sets"]["method"])
+        expected_count = method_count * len(positions)
         self.assertEqual(len(feature_sets), expected_count)
-        self.assertTrue(all(name.endswith("@prompt_last_token") for name in feature_sets))
+        for position in positions:
+            self.assertEqual(
+                sum(name.endswith(f"@{position}") for name in feature_sets),
+                method_count,
+            )
         self.assertFalse(any("_target_cosine" in name for name in feature_sets))
-        self.assertIn(
+        feature_prefix = (
             "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state+"
             "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine@"
-            "prompt_last_token",
-            feature_sets,
         )
+        for position in positions:
+            self.assertIn(f"{feature_prefix}{position}", feature_sets)
         self.assertEqual(
             qa_extraction_family_flags(config),
             {
@@ -202,6 +211,132 @@ class QAAnswerOnlyConfigTests(unittest.TestCase):
             )
             self.assertEqual(wrapper.request["response_token_indices"], [0])
             self.assertEqual(wrapper.request["target_token_ids"], [99])
+
+    def test_question_object_position_extracts_first_contextual_subtoken(self) -> None:
+        class TinyTokenizer:
+            @staticmethod
+            def encode(text, add_special_tokens=False):
+                return [7] if str(text).strip().lower() == "yes" else []
+
+            @staticmethod
+            def decode(token_ids, skip_special_tokens=True):
+                return "yes" if 7 in token_ids else ""
+
+        class Wrapper:
+            tokenizer = TinyTokenizer()
+
+            def __init__(self) -> None:
+                self.answer_calls = 0
+                self.object_calls = 0
+
+            def extract_token_features_batch(self, **kwargs):
+                self.answer_calls += 1
+                self.answer_request = kwargs
+                return [object()]
+
+            def extract_prompt_target_features(self, **kwargs):
+                self.object_calls += 1
+                self.object_request = kwargs
+                return SimpleNamespace(
+                    baseline_capture={
+                        "prompt_target_alignment": {
+                            "target_token_id": 314,
+                            "target_tokenized_position": 11,
+                            "target_expanded_position": 587,
+                            "prediction_position": 586,
+                            "tokenized_span": (11, 12),
+                        }
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "image.png"
+            Image.new("RGB", (2, 2), color="white").save(image_path)
+            question = {
+                "key": "pope::random::1",
+                "dataset": "pope",
+                "source_split": "random",
+                "question_id": 1,
+                "image_id": 1,
+                "probe_split": "train",
+                "question_family_index": None,
+                "question": "Is there a cat in the image?",
+                "image_path": str(image_path),
+                "object_span_status": "found",
+                "object_span_protocol": "pope_official_query_surface_v1",
+                "object_surface": "cat",
+                "object_char_start": 11,
+                "object_char_end": 14,
+            }
+            prompt = qa_prompt("qwen3_vl_8b", question["question"])
+            atomic_write_jsonl(
+                root / "generations.jsonl",
+                [{
+                    "key": question["key"],
+                    "prompt": prompt,
+                    "response_token_ids": [99, 7],
+                    "answer_token_index": 1,
+                    "answer_token_id": 7,
+                    "generated_text": "Well yes",
+                    "prediction": "yes",
+                    "generation_protocol": "raw_question_yes_no_v1",
+                }],
+            )
+            atomic_write_jsonl(
+                root / "labels.jsonl",
+                [{
+                    "key": question["key"],
+                    "label": 1,
+                    "class_name": "real",
+                    "error_type": "correct_yes",
+                    "prediction": "yes",
+                    "object_hallucination_yes_only_label": 1,
+                }],
+            )
+            wrapper = Wrapper()
+
+            def fake_position_record(**kwargs):
+                return {"target": kwargs["target_metadata"]}
+
+            with patch(
+                "features.qa_extractor._build_position_record",
+                side_effect=fake_position_record,
+            ):
+                rows = extract_questions(
+                    wrapper,
+                    "qwen3_vl_8b",
+                    [question],
+                    str(root),
+                    {"ot_solver": "emd"},
+                    {},
+                    {},
+                    shard_size=1,
+                    position_protocols=(
+                        "prompt_last_token",
+                        "question_object_pre_token",
+                    ),
+                    extraction_fingerprint="test-extraction",
+                )
+
+            self.assertEqual(wrapper.answer_calls, 1)
+            self.assertEqual(wrapper.object_calls, 1)
+            self.assertEqual(
+                set(rows[0]["positions"]),
+                {"prompt_last_token", "question_object_pre_token"},
+            )
+            request = wrapper.object_request["request"]
+            self.assertEqual(request.target_text, "cat")
+            self.assertEqual(request.target_char_start, 11)
+            self.assertEqual(request.target_char_end, 14)
+            target = rows[0]["positions"]["question_object_pre_token"]["target"]
+            self.assertEqual(
+                target["protocol"],
+                "question_object_contextual_first_subtoken_v1",
+            )
+            self.assertEqual(target["target_token_id"], 314)
+            self.assertEqual(target["prediction_position"], 586)
+            self.assertEqual(rows[0]["question_object_position"]["status"], "extracted")
 
     def test_joint_and_baseline_only_modes_share_one_forward(self) -> None:
         class TinyTokenizer:

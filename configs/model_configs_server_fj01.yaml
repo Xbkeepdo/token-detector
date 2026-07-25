@@ -9,7 +9,7 @@
 
 run:
   prompt: "Describe this image."
-  extraction_mode: "method_only"                   # all | method_only | ads_cgc_only | baseline_only
+  extraction_mode: "all"                   # all | method_only | ads_cgc_only | baseline_only
 
 experiment:
   mode: "vpend"                         # Visual plus post-image prompt support.
@@ -55,10 +55,12 @@ qa_benchmarks:
   dataset_model_overrides:
     amber_discriminative:
       max_pixels: 200704
-  # Use the prompt's final causal row (it predicts response_token_ids[0]).
-  # Add "question_object_pre_token" later for the optional object-position ablation.
+  # Compare the prompt's final causal row against the row immediately before
+  # the queried object's first contextual sub-token. Exact object spans are
+  # available for POPE/CLEVR; datasets without one retain prompt-last only.
   position_protocols:
     - "prompt_last_token"
+    - "question_object_pre_token"
   label_protocols:
    # - "object_hallucination_yes_only"
     - "answer_correctness_all"
@@ -147,7 +149,7 @@ feature_extraction:
   baseline:
     enabled: true
     output_subdir: "baseline"
-    methods: ["metatoken", "svar", "dhcp", "projectaway"]         # Optional: "halloc"
+    methods: ["metatoken"]         # Optional: "halloc", "svar", "dhcp", "projectaway"
     seed: 42
     metatoken:
       classifiers: ["lr", "gb"]             # LR(lbfgs), GB(100 estimators).
@@ -205,9 +207,9 @@ feature_extraction:
 
     # Shared transport math for all four gates and both direct controls.
     tau: 0.07
-    # Reuse each decoder forward and compare the Cartesian 3 x 3 source/OT
+    # Reuse each decoder forward and compare the Cartesian source-tau x Top-K
     # sweep. Only risk changes; target gates, cosine, and EV are shared.
-    source_tau_values: [0.01, 0.03, 0.06]
+    source_tau_values: [0.02, 0.03, 0.04, 0.05, 0.06]
     # InsLen CAFE: max over prompt positions of the generated object-token
     # probability from hpre Logit Lens. The paper/code use scale=0.1, which is
     # equivalent to softmax(logits / temperature) with temperature=10.
@@ -222,7 +224,7 @@ feature_extraction:
     compute_ffn_injection_features: false
     ffn_injection_eps: 1.0e-12
     transport_top_k: 64
-    transport_top_k_values: [32, 64, 128]
+    transport_top_k_values: [16, 32, 64, 128]
     # Primary: C_ij = sqrt((1-cos(h_state_i,h_state_j))/2), where h_state is
     # h_prev for hpre methods. The state-update family uses
     # C_alpha=(1-alpha)*d_state+alpha*d_update for alpha=0.1,...,0.9.
@@ -269,7 +271,7 @@ training:
     # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
     # Run both heads on the same split/seeds and emit a side-by-side report.
     trainers: ["native_paper", "shared_torch_mlp"]
-    methods: ["metatoken", "svar", "dhcp", "projectaway"]
+    methods: ["metatoken"]  #, "svar", "dhcp", "projectaway"
     positive_class: "real"                  # real | hallucination; train F1 selects its threshold.
     seeds: [43, 44, 45]                     # Use [43] for a quick single-seed run.
     write_summary: true                     # Per-seed MD + aggregate mean/std MD.

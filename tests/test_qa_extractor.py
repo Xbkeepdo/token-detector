@@ -98,7 +98,7 @@ def _scope_result(*scopes):
 def test_compact_dgst_accepts_vp_only_fields():
     compact = _compact_dgst(_scope_result("visual_prompt"))
     method = "vp_hpre_raw_logit_gauss"
-    assert QA_FEATURE_SCHEMA_VERSION == "qa-prompt-last-token-v6"
+    assert QA_FEATURE_SCHEMA_VERSION == "qa-position-comparison-v7"
     assert compact["support_modes"] == ["vp"]
     assert compact["scoped_methods"] == [method]
     assert method in compact

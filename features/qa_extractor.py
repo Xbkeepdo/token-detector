@@ -33,7 +33,7 @@ from features.extractor import (
 from models.base_wrapper import PromptTargetRequest
 
 
-QA_FEATURE_SCHEMA_VERSION = "qa-prompt-last-token-v6"
+QA_FEATURE_SCHEMA_VERSION = "qa-position-comparison-v7"
 _IMAGE_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
 DIRECT_SOFTMAX_METHOD = "hpre_softmax_prob_direct"
 
@@ -229,18 +229,19 @@ def extract_questions(
     ads_cgc_enabled: bool = True,
     baseline_consumers: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict]:
-    """Extract every enabled QA family from one shared prompt-last forward.
+    """Extract every enabled QA family at the configured VQA positions.
 
     ``prompt_last_token`` is the final causal state in the complete prompt and
     therefore predicts ``response_token_ids[0]``.  It deliberately does not
     move when a model emits a preamble before its semantic yes/no answer.  The
-    optional ``question_object_pre_token`` ablation predicts the first
-    contextual sub-token of the queried object word in the question.  The
-    default QA YAML enables only ``prompt_last_token`` so no object forward is
-    run in the first VQA experiment. ``baseline_consumers`` maps each active
-    label protocol to an adapter/store pair. Their requirements are merged
-    with DGST/ADS+CGC before the wrapper call, so enabling baselines does not
-    trigger a second LVLM forward.
+    ``question_object_pre_token`` branch predicts the first contextual
+    sub-token of the queried object word in the question. The active QA YAML
+    enables both positions for a direct comparison whenever the prepared row
+    has an exact object span; rows without one retain only the prompt-last
+    position. ``baseline_consumers`` maps each active label protocol to an
+    adapter/store pair. Their requirements are merged with DGST/ADS+CGC before
+    the prompt-last wrapper call, so enabling baselines does not trigger a
+    second prompt-last LVLM forward.
     """
 
     active_positions = tuple(dict.fromkeys(str(value) for value in position_protocols))

@@ -145,22 +145,23 @@ BASELINE_LABEL_PROTOCOLS="object_hallucination_yes_only answer_correctness_all" 
 MODEL=qwen3_vl_8b bash run_pope.sh
 ```
 
-The first VQA experiment uses only `prompt_last_token`. Extraction fixes the
+The active VQA experiment compares `prompt_last_token` with
+`question_object_pre_token`. For `prompt_last_token`, extraction fixes the
 response target index to `0`, so the strict prefix contains no generated
 response tokens and the selected causal row is exactly the final token of the
 complete prompt. That row predicts `response_token_ids[0]` and does not move if
-a model later emits a preamble before its semantic yes/no answer. This is the
-default `position_protocols` value in the QA YAML, so no second object-position
-forward is run. Generation still saves and validates the actual semantic
-yes/no token for labeling, but that semantic location does not choose the
-feature row.
+a model later emits a preamble before its semantic yes/no answer. Generation
+still saves and validates the actual semantic yes/no token for labeling, but
+that semantic location does not choose the feature row.
 
-The implementation retains `question_object_pre_token` as an optional later
-ablation. Enabling it in YAML locates the queried object surface in the complete
-contextualized question; if its first actual sub-token is `j`, the strict prefix
-ends before `j` and the final causal row predicts that contextual token. POPE
-provides exact object spans, while CLEVR uses the entity head consumed by the
-terminal `exist` program and reports coverage explicitly.
+For `question_object_pre_token`, extraction locates the queried object surface
+in the complete contextualized question. If its first actual sub-token is `j`,
+the strict prefix ends before `j` and the final causal row predicts that
+contextual token. The target token ID is the actual first contextual sub-token,
+not a separately tokenized approximation. POPE provides exact object spans,
+while CLEVR uses the entity head consumed by the terminal `exist` program and
+reports coverage explicitly. Each method feature set is trained and summarized
+separately at both available positions.
 The two reporting protocols remain separate: `object_hallucination_yes_only`
 measures false-positive object hallucination, while `answer_correctness_all`
 measures general yes/no answer errors. Both use `0=hallucination/error, 1=real`,
@@ -171,8 +172,9 @@ AMBER uses all 14,216 official discriminative Yes/No questions over 1004
 images (existence, attribute, and relation). The deterministic seed-42 outer
 split is defined over physical images (803 train / 201 test); question counts
 need not be exactly 80/20 because AMBER has a variable number of questions per
-image. Its active feature position is the same `prompt_last_token` used by
-POPE and CLEVR.
+image. AMBER does not expose one canonical queried-object span across all of its
+existence, attribute, and relation questions, so its rows retain
+`prompt_last_token` and report the object position as unavailable.
 
 Some official AMBER source images are as large as 54 MP. The unified YAML
 therefore applies `max_pixels: 200704` only to `amber_discriminative`, using
