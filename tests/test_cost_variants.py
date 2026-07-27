@@ -22,6 +22,8 @@ from features.dgst_t import (
     _cosine_distance_matrix,
     _relative_vll_evidence_signal,
     _sinkhorn_linear_cost_batch,
+    _solve_exact_emd_problem_series,
+    _solve_transport_problem,
     _topk_union_indices,
     _transport_risk_on_support,
 )
@@ -209,6 +211,61 @@ class CostVariantTests(unittest.TestCase):
         self.assertEqual(list(serial), list(parallel))
         for key in serial:
             self.assertAlmostEqual(serial[key], parallel[key], places=12)
+
+    def test_exact_emd_parallelism_flattens_individual_problems(self) -> None:
+        class ImmediateFuture:
+            def __init__(self, value):
+                self.value = value
+
+            def result(self):
+                return self.value
+
+        class RecordingExecutor:
+            def __init__(self):
+                self.calls = []
+
+            def submit(self, function, *args):
+                self.calls.append((function, args))
+                return ImmediateFuture(function(*args))
+
+        executor = RecordingExecutor()
+        problems = {
+            "risk_a": [3.0, None, 1.0],
+            "risk_b": [2.0, 4.0],
+        }
+        with patch.dict(os.environ, {"DGST_COST_VARIANT_EMD_WORKERS": "16"}), patch(
+            "features.dgst_t._get_emd_thread_pool",
+            return_value=executor,
+        ) as get_pool, patch(
+            "features.dgst_t._solve_transport_problem",
+            side_effect=lambda problem, solver: float(problem),
+        ):
+            result = _solve_exact_emd_problem_series(problems)
+
+        get_pool.assert_called_once_with(16)
+        self.assertEqual(len(executor.calls), 4)
+        self.assertEqual(result, {
+            "risk_a": [3.0, 0.0, 1.0],
+            "risk_b": [2.0, 4.0],
+        })
+
+    def test_numpy_emd_fast_path_matches_tensor_solver(self) -> None:
+        source = np.asarray([0.6, 0.3, 0.1], dtype=np.float32)
+        target = np.asarray([0.1, 0.2, 0.7], dtype=np.float32)
+        cost = np.asarray(
+            [[0.0, 0.5, 1.0], [0.5, 0.0, 0.5], [1.0, 0.5, 0.0]],
+            dtype=np.float32,
+        )
+        numpy_risk = _solve_transport_problem((source, target, cost), "emd")
+        tensor_risk = _solve_transport_problem(
+            (
+                torch.from_numpy(source),
+                torch.from_numpy(target),
+                torch.from_numpy(cost),
+            ),
+            "emd",
+        )
+        self.assertAlmostEqual(numpy_risk, tensor_risk, places=12)
 
     def test_sinkhorn_returns_valid_but_regularized_transport_cost(self) -> None:
         source = torch.tensor([[0.5, 0.5]])

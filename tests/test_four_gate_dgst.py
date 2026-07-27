@@ -44,6 +44,34 @@ from train_feature_sets import build_selected_matrix, parse_feature_set
 
 
 class FourGateDGSTTests(unittest.TestCase):
+    def assert_nested_exact(self, left, right, path="root") -> None:
+        if torch.is_tensor(left) or torch.is_tensor(right):
+            self.assertTrue(
+                torch.is_tensor(left) and torch.is_tensor(right),
+                msg=f"tensor type mismatch at {path}",
+            )
+            self.assertTrue(
+                torch.equal(left, right),
+                msg=f"tensor mismatch at {path}",
+            )
+            return
+        if isinstance(left, dict) or isinstance(right, dict):
+            self.assertIsInstance(left, dict, msg=f"dict mismatch at {path}")
+            self.assertIsInstance(right, dict, msg=f"dict mismatch at {path}")
+            self.assertEqual(set(left), set(right), msg=f"keys differ at {path}")
+            for key in left:
+                self.assert_nested_exact(left[key], right[key], f"{path}.{key}")
+            return
+        if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+            self.assertIsInstance(left, type(right), msg=f"sequence mismatch at {path}")
+            self.assertEqual(len(left), len(right), msg=f"length differs at {path}")
+            for index, (left_value, right_value) in enumerate(zip(left, right)):
+                self.assert_nested_exact(
+                    left_value, right_value, f"{path}[{index}]"
+                )
+            return
+        self.assertEqual(left, right, msg=f"value mismatch at {path}")
+
     def test_chunked_eager_attention_matches_full_formula(self) -> None:
         torch.manual_seed(7)
         query = torch.randn(1, 4, 5, 3, dtype=torch.float32)
@@ -637,6 +665,61 @@ class FourGateDGSTTests(unittest.TestCase):
             )
             self.assertEqual(matrix.shape, (1, 2))
             self.assertEqual(labels.tolist(), [1])
+
+    def test_four_gate_preparation_cache_is_exactly_output_preserving(self) -> None:
+        torch.manual_seed(123)
+        patches = 12
+        sequence = patches + 2
+        layer = self._output_layer()
+        h_prev = torch.randn(1, sequence, 2, dtype=torch.float32)
+        o_attn = 0.1 * torch.randn_like(h_prev)
+        o_ffn = 0.2 * torch.randn_like(h_prev)
+        attention = torch.rand(1, 2, sequence, sequence, dtype=torch.float32)
+        capture = {
+            "h_prev": h_prev,
+            "h_mid": h_prev + o_attn,
+            "o_attn": o_attn,
+            "o_ffn": o_ffn,
+            "attn_weights": attention,
+        }
+        kwargs = {
+            "model": SimpleNamespace(get_output_embeddings=lambda: layer),
+            "captures": [capture],
+            "visual_start": 0,
+            "visual_end": patches,
+            "prompt_positions": [patches],
+            "target_token_ids": [1],
+            "prediction_positions": [patches + 1],
+            "enabled_methods": [
+                "hpre_raw_logit_gauss",
+                "hpre_softmax_prob_gauss",
+            ],
+            "support_modes": ["vv"],
+            "cost_modes": [
+                "sqrt_matched_state",
+                "cosine_matched_state",
+                "geo_stateupd_lu1",
+            ],
+            "compute_capped_topmass_085": True,
+            "capped_topmass_alphas": [0.7, 0.8, 0.9],
+            "capped_topmass_min_k": 3,
+            "capped_topmass_max_k": 6,
+            "source_tau_values": [0.03, 0.04],
+            "transport_top_k_values": [4],
+        }
+        common_env = {"DGST_COST_VARIANT_EMD_WORKERS": "1"}
+        with mock.patch.dict(
+            os.environ,
+            {**common_env, "DGST_FOUR_GATE_PREP_CACHE": "0"},
+        ):
+            uncached = compute_four_gate_dgst_batch_from_captures(**kwargs)
+        with mock.patch.dict(
+            os.environ,
+            {**common_env, "DGST_FOUR_GATE_PREP_CACHE": "1"},
+        ):
+            cached = compute_four_gate_dgst_batch_from_captures(**kwargs)
+
+        self.assert_nested_exact(uncached, cached)
 
     def test_geo_stateupd_lu1_uses_hmid_and_ffn_update_distances(self) -> None:
         layer = self._output_layer()

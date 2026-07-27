@@ -127,6 +127,8 @@ COST_VARIANT_RISK_KEYS = (
 
 _EMD_PROCESS_POOL: ProcessPoolExecutor | None = None
 _EMD_PROCESS_POOL_WORKERS: int | None = None
+_EMD_THREAD_POOL: ThreadPoolExecutor | None = None
+_EMD_THREAD_POOL_WORKERS: int | None = None
 
 
 def compute_dgst_t(
@@ -4484,6 +4486,7 @@ def _compute_four_gate_single_scope_from_captures(
         )
     )
     output_layer = resolve_output_embedding_layer(model)
+    preparation_cache_enabled = _four_gate_preparation_cache_enabled()
 
     records: list[dict[str, Any]] = []
     for _target_id in target_ids:
@@ -4601,6 +4604,9 @@ def _compute_four_gate_single_scope_from_captures(
             if compute_capped_topmass_085
             else {}
         )
+        preparation_cache = _FourGatePreparationCache(
+            enabled=preparation_cache_enabled
+        )
 
         for target_offset, prediction_position in enumerate(pred_positions):
             if prediction_position < 0 or prediction_position >= sequence_length:
@@ -4610,6 +4616,12 @@ def _compute_four_gate_single_scope_from_captures(
                 )
             attention_support = compact_capture["attention_support"][target_offset]
             source_dist = compact_capture["source_dist"][target_offset]
+            source_cache_key = (
+                "source",
+                int(target_offset),
+                "base",
+                float(tau),
+            )
             prediction_hpre = compact_capture["prediction_hpre"][target_offset]
             prediction_hmid = capture["h_mid"][0, prediction_position].float()
             if sweep_specs:
@@ -4627,6 +4639,15 @@ def _compute_four_gate_single_scope_from_captures(
                         mode="softmax",
                     )
                     for tau_value in {spec[1] for spec in sweep_specs}
+                }
+                sweep_source_cache_keys = {
+                    tau_value: (
+                        "source",
+                        int(target_offset),
+                        "sweep",
+                        float(tau_value),
+                    )
+                    for tau_value in sweep_source_dist
                 }
             state_views = {
                 "hpre": (prediction_hpre, visual_hpre),
@@ -4655,6 +4676,11 @@ def _compute_four_gate_single_scope_from_captures(
             record["source"].append(source_dist)
             for method in methods:
                 state_name = _target_comparison_state(method)
+                target_cache_key = (
+                    "target",
+                    int(target_offset),
+                    str(method),
+                )
                 _prediction_state, cost_states = state_views[state_name]
                 cosine_map = cosine_maps[state_name]
                 if method == RAW_ATTENTION_METHOD:
@@ -4697,15 +4723,20 @@ def _compute_four_gate_single_scope_from_captures(
                             epsilon=float(mad_epsilon),
                         ).detach()
                     target_dist = _renormalize(attention_support * gate).detach()
-                support = _topk_union_indices(
-                    source_dist,
-                    target_dist,
-                    int(transport_top_k),
+                support = preparation_cache.topk_union(
+                    source_key=source_cache_key,
+                    source=source_dist,
+                    target_key=target_cache_key,
+                    target=target_dist,
+                    top_k=int(transport_top_k),
                 )
                 for active_cost in normalized_cost_modes:
-                    problem = _prepare_four_gate_cost_problem(
+                    problem = preparation_cache.prepare_problem(
                         cost_mode=active_cost,
+                        cost_state_key=state_name,
+                        source_key=source_cache_key,
                         source_dist=source_dist,
+                        target_key=target_cache_key,
                         target_dist=target_dist,
                         matched_states=cost_states,
                         hmid_states=visual_hmid,
@@ -4716,10 +4747,12 @@ def _compute_four_gate_single_scope_from_captures(
                     record["problems"][(method, active_cost)].append(problem)
                 if compute_capped_topmass_085:
                     for alpha_slug, alpha_value in capped_alpha_specs:
-                        capped_support = _capped_topmass_union_indices(
-                            source_dist,
-                            target_dist,
-                            alpha_value,
+                        capped_support = preparation_cache.capped_union(
+                            source_key=source_cache_key,
+                            source=source_dist,
+                            target_key=target_cache_key,
+                            target=target_dist,
+                            alpha=alpha_value,
                             min_k=int(capped_topmass_min_k),
                             max_k=int(capped_topmass_max_k),
                         )
@@ -4727,9 +4760,12 @@ def _compute_four_gate_single_scope_from_captures(
                             record["capped_problems"][
                                 (alpha_slug, method, active_cost)
                             ].append(
-                                _prepare_four_gate_cost_problem(
+                                preparation_cache.prepare_problem(
                                     cost_mode=active_cost,
+                                    cost_state_key=state_name,
+                                    source_key=source_cache_key,
                                     source_dist=source_dist,
+                                    target_key=target_cache_key,
                                     target_dist=target_dist,
                                     matched_states=cost_states,
                                     hmid_states=visual_hmid,
@@ -4740,18 +4776,24 @@ def _compute_four_gate_single_scope_from_captures(
                             )
                 for variant_slug, tau_value, top_k_value in sweep_specs:
                     variant_source_dist = sweep_source_dist[tau_value]
-                    variant_support = _topk_union_indices(
-                        variant_source_dist,
-                        target_dist,
-                        int(top_k_value),
+                    variant_source_key = sweep_source_cache_keys[tau_value]
+                    variant_support = preparation_cache.topk_union(
+                        source_key=variant_source_key,
+                        source=variant_source_dist,
+                        target_key=target_cache_key,
+                        target=target_dist,
+                        top_k=int(top_k_value),
                     )
                     for active_cost in normalized_cost_modes:
                         layer_sweep_problems[
                             (variant_slug, method, active_cost)
                         ].append(
-                            _prepare_four_gate_cost_problem(
+                            preparation_cache.prepare_problem(
                                 cost_mode=active_cost,
+                                cost_state_key=state_name,
+                                source_key=variant_source_key,
                                 source_dist=variant_source_dist,
+                                target_key=target_cache_key,
                                 target_dist=target_dist,
                                 matched_states=cost_states,
                                 hmid_states=visual_hmid,
@@ -4763,11 +4805,14 @@ def _compute_four_gate_single_scope_from_captures(
                 if compute_capped_topmass_085:
                     for tau_slug, tau_value in sweep_tau_specs:
                         variant_source_dist = sweep_source_dist[tau_value]
+                        variant_source_key = sweep_source_cache_keys[tau_value]
                         for alpha_slug, alpha_value in capped_alpha_specs:
-                            variant_capped_support = _capped_topmass_union_indices(
-                                variant_source_dist,
-                                target_dist,
-                                alpha_value,
+                            variant_capped_support = preparation_cache.capped_union(
+                                source_key=variant_source_key,
+                                source=variant_source_dist,
+                                target_key=target_cache_key,
+                                target=target_dist,
+                                alpha=alpha_value,
                                 min_k=int(capped_topmass_min_k),
                                 max_k=int(capped_topmass_max_k),
                             )
@@ -4780,9 +4825,12 @@ def _compute_four_gate_single_scope_from_captures(
                                         active_cost,
                                     )
                                 ].append(
-                                    _prepare_four_gate_cost_problem(
+                                    preparation_cache.prepare_problem(
                                         cost_mode=active_cost,
+                                        cost_state_key=state_name,
+                                        source_key=variant_source_key,
                                         source_dist=variant_source_dist,
+                                        target_key=target_cache_key,
                                         target_dist=target_dist,
                                         matched_states=cost_states,
                                         hmid_states=visual_hmid,
@@ -4791,9 +4839,10 @@ def _compute_four_gate_single_scope_from_captures(
                                         support=variant_capped_support,
                                     )
                                 )
-                region = _stable_topk_indices(
-                    target_dist,
-                    int(target_region_top_k),
+                region = preparation_cache.stable_topk(
+                    distribution_key=target_cache_key,
+                    values=target_dist,
+                    top_k=int(target_region_top_k),
                 )
                 if region.numel() == 0:
                     target_cosine = 0.0
@@ -4817,9 +4866,10 @@ def _compute_four_gate_single_scope_from_captures(
                 record["ev"][method].append(evidence_value)
                 if compute_capped_topmass_085:
                     for alpha_slug, alpha_value in capped_alpha_specs:
-                        capped_region = _capped_topmass_indices(
-                            target_dist,
-                            alpha_value,
+                        capped_region = preparation_cache.capped_indices(
+                            distribution_key=target_cache_key,
+                            values=target_dist,
+                            alpha=alpha_value,
                             min_k=int(capped_topmass_min_k),
                             max_k=int(capped_topmass_max_k),
                         )
@@ -5413,6 +5463,274 @@ def _four_gate_risk_suffix(cost_mode: str, state_name: str) -> str:
     return f"risk_sqrt_{state_name}"
 
 
+def _four_gate_preparation_cache_enabled() -> bool:
+    """Return whether exact four-gate preparation memoization is enabled."""
+    raw = os.environ.get("DGST_FOUR_GATE_PREP_CACHE", "1").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "DGST_FOUR_GATE_PREP_CACHE must be one of "
+        "1/0, true/false, yes/no, or on/off."
+    )
+
+
+class _FourGatePreparationCache:
+    """Per-layer memoization that preserves every exact-EMD problem.
+
+    The cache only reuses deterministic preparation results.  Every distinct
+    source/target marginal still receives its own POT exact-EMD solve.  Cost
+    matrices are cached by the exact sorted union-support tuple, rather than
+    slicing a larger precomputed matrix, so the floating-point computation is
+    identical to the historical subset-first path.
+    """
+
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._transport_topk_indices: dict[tuple[Any, int], torch.Tensor] = {}
+        self._stable_topk_indices: dict[tuple[Any, int], torch.Tensor] = {}
+        self._capped_indices: dict[
+            tuple[Any, float, int, int], torch.Tensor
+        ] = {}
+        self._topk_unions: dict[tuple[Any, Any, int], torch.Tensor] = {}
+        self._capped_unions: dict[
+            tuple[Any, Any, float, int, int], torch.Tensor
+        ] = {}
+        self._local_marginals: dict[
+            tuple[Any, tuple[int, ...]], Any
+        ] = {}
+        self._cost_matrices: dict[
+            tuple[str, str, tuple[int, ...]], Any
+        ] = {}
+
+    @staticmethod
+    def _support_key(support: torch.Tensor) -> tuple[int, ...]:
+        return tuple(int(index) for index in support.detach().cpu().tolist())
+
+    def _transport_indices(
+        self,
+        distribution_key: Any,
+        values: torch.Tensor,
+        top_k: int,
+    ) -> torch.Tensor:
+        cache_key = (distribution_key, int(top_k))
+        cached = self._transport_topk_indices.get(cache_key)
+        if cached is None:
+            k = min(max(int(top_k // 2), 1), int(values.numel()))
+            cached = torch.topk(values, k=k).indices
+            self._transport_topk_indices[cache_key] = cached
+        return cached
+
+    def topk_union(
+        self,
+        *,
+        source_key: Any,
+        source: torch.Tensor,
+        target_key: Any,
+        target: torch.Tensor,
+        top_k: int,
+    ) -> torch.Tensor:
+        if not self.enabled:
+            return _topk_union_indices(source, target, top_k)
+        cache_key = (source_key, target_key, int(top_k))
+        cached = self._topk_unions.get(cache_key)
+        if cached is None:
+            source_indices = self._transport_indices(source_key, source, top_k)
+            target_indices = self._transport_indices(target_key, target, top_k)
+            cached = torch.unique(
+                torch.cat([source_indices, target_indices], dim=0), sorted=True
+            )
+            self._topk_unions[cache_key] = cached
+        return cached
+
+    def stable_topk(
+        self,
+        *,
+        distribution_key: Any,
+        values: torch.Tensor,
+        top_k: int,
+    ) -> torch.Tensor:
+        if not self.enabled:
+            return _stable_topk_indices(values, top_k)
+        cache_key = (distribution_key, int(top_k))
+        cached = self._stable_topk_indices.get(cache_key)
+        if cached is None:
+            cached = _stable_topk_indices(values, top_k)
+            self._stable_topk_indices[cache_key] = cached
+        return cached
+
+    def capped_indices(
+        self,
+        *,
+        distribution_key: Any,
+        values: torch.Tensor,
+        alpha: float,
+        min_k: int,
+        max_k: int,
+    ) -> torch.Tensor:
+        if not self.enabled:
+            return _capped_topmass_indices(
+                values, alpha, min_k=min_k, max_k=max_k
+            )
+        cache_key = (
+            distribution_key,
+            float(alpha),
+            int(min_k),
+            int(max_k),
+        )
+        cached = self._capped_indices.get(cache_key)
+        if cached is None:
+            cached = _capped_topmass_indices(
+                values, alpha, min_k=min_k, max_k=max_k
+            )
+            self._capped_indices[cache_key] = cached
+        return cached
+
+    def capped_union(
+        self,
+        *,
+        source_key: Any,
+        source: torch.Tensor,
+        target_key: Any,
+        target: torch.Tensor,
+        alpha: float,
+        min_k: int,
+        max_k: int,
+    ) -> torch.Tensor:
+        if not self.enabled:
+            return _capped_topmass_union_indices(
+                source,
+                target,
+                alpha,
+                min_k=min_k,
+                max_k=max_k,
+            )
+        cache_key = (
+            source_key,
+            target_key,
+            float(alpha),
+            int(min_k),
+            int(max_k),
+        )
+        cached = self._capped_unions.get(cache_key)
+        if cached is None:
+            source_indices = self.capped_indices(
+                distribution_key=source_key,
+                values=source,
+                alpha=alpha,
+                min_k=min_k,
+                max_k=max_k,
+            )
+            target_indices = self.capped_indices(
+                distribution_key=target_key,
+                values=target,
+                alpha=alpha,
+                min_k=min_k,
+                max_k=max_k,
+            )
+            cached = torch.unique(
+                torch.cat([source_indices, target_indices], dim=0), sorted=True
+            )
+            self._capped_unions[cache_key] = cached
+        return cached
+
+    def _local_marginal(
+        self,
+        *,
+        distribution_key: Any,
+        values: torch.Tensor,
+        support: torch.Tensor,
+        support_key: tuple[int, ...],
+    ):
+        cache_key = (distribution_key, support_key)
+        cached = self._local_marginals.get(cache_key)
+        if cached is None:
+            cached = (
+                _renormalize(values.index_select(0, support))
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+                .copy()
+            )
+            self._local_marginals[cache_key] = cached
+        return cached
+
+    def prepare_problem(
+        self,
+        *,
+        cost_mode: str,
+        cost_state_key: str,
+        source_key: Any,
+        source_dist: torch.Tensor,
+        target_key: Any,
+        target_dist: torch.Tensor,
+        matched_states: torch.Tensor,
+        hmid_states: torch.Tensor,
+        hout_states: torch.Tensor,
+        update_states: torch.Tensor,
+        support: torch.Tensor,
+    ):
+        if not self.enabled:
+            return _prepare_four_gate_cost_problem(
+                cost_mode=cost_mode,
+                source_dist=source_dist,
+                target_dist=target_dist,
+                matched_states=matched_states,
+                hmid_states=hmid_states,
+                hout_states=hout_states,
+                update_states=update_states,
+                support=support,
+            )
+        if support.numel() == 0:
+            return None
+        support_key = self._support_key(support)
+        normalized_cost = _normalize_four_gate_cost_mode(cost_mode)
+        effective_state_key = (
+            "hmid_plus_update"
+            if normalized_cost == "geo_stateupd_lu1"
+            else str(cost_state_key)
+        )
+        cost_key = (normalized_cost, effective_state_key, support_key)
+        cost = self._cost_matrices.get(cost_key)
+        if cost is None:
+            uncached = _prepare_four_gate_cost_problem(
+                cost_mode=normalized_cost,
+                source_dist=source_dist,
+                target_dist=target_dist,
+                matched_states=matched_states,
+                hmid_states=hmid_states,
+                hout_states=hout_states,
+                update_states=update_states,
+                support=support,
+            )
+            if uncached is None:
+                return None
+            local_source, local_target, cost = uncached
+            self._local_marginals.setdefault(
+                (source_key, support_key), local_source
+            )
+            self._local_marginals.setdefault(
+                (target_key, support_key), local_target
+            )
+            self._cost_matrices[cost_key] = cost
+            return local_source, local_target, cost
+        local_source = self._local_marginal(
+            distribution_key=source_key,
+            values=source_dist,
+            support=support,
+            support_key=support_key,
+        )
+        local_target = self._local_marginal(
+            distribution_key=target_key,
+            values=target_dist,
+            support=support,
+            support_key=support_key,
+        )
+        return local_source, local_target, cost
+
+
 def _prepare_four_gate_cost_problem(
     *,
     cost_mode: str,
@@ -5496,19 +5814,49 @@ def _target_comparison_state(method: str) -> str:
 def _solve_exact_emd_problem_series(
     problem_series: dict[str, list[Any]],
 ) -> dict[str, list[float]]:
-    """Solve the active-profile risks with POT EMD, ignoring solver overrides."""
-    workers = _cost_variant_emd_workers(len(problem_series))
-    if workers == 1:
-        return {
-            name: [_solve_transport_problem(problem, "emd") for problem in problems]
-            for name, problems in problem_series.items()
-        }
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dgst-four-gate-emd") as executor:
-        futures = {
-            name: executor.submit(_solve_transport_problem_batch, problems, "emd")
-            for name, problems in problem_series.items()
-        }
-        return {name: futures[name].result() for name in problem_series}
+    """Solve independent exact EMD problems concurrently and preserve order.
+
+    A series normally contains one problem per decoder layer or target token.
+    Submitting a whole series as one future limited parallelism to the number
+    of feature names (often only two), while every EMD inside that future was
+    still serial. Flatten the individual problems instead so the configured
+    workers can stay busy across methods, layers, targets, and sweep variants.
+    """
+    output = {
+        name: [0.0] * len(problems)
+        for name, problems in problem_series.items()
+    }
+    jobs = [
+        (name, problem_index, problem)
+        for name, problems in problem_series.items()
+        for problem_index, problem in enumerate(problems)
+        if problem is not None
+    ]
+    if not jobs:
+        return output
+
+    requested_workers = _requested_cost_variant_emd_workers()
+    active_workers = min(int(requested_workers), len(jobs))
+    if active_workers == 1:
+        for name, problem_index, problem in jobs:
+            output[name][problem_index] = _solve_transport_problem(problem, "emd")
+        return output
+
+    # Keep one pool alive for the extraction process. ThreadPoolExecutor starts
+    # threads lazily, so a large configured maximum does not create idle
+    # threads for small problem batches.
+    executor = _get_emd_thread_pool(requested_workers)
+    futures = [
+        (
+            name,
+            problem_index,
+            executor.submit(_solve_transport_problem, problem, "emd"),
+        )
+        for name, problem_index, problem in jobs
+    ]
+    for name, problem_index, future in futures:
+        output[name][problem_index] = future.result()
+    return output
 
 
 @torch.no_grad()
@@ -5822,13 +6170,15 @@ def _solve_cost_variant_problem_series(
     effective_solver = _effective_ot_solver(ot_solver)
     if effective_solver == "sinkhorn":
         return _solve_sinkhorn_problem_series(problem_series)
+    backend = os.environ.get("DGST_COST_VARIANT_EMD_BACKEND", "thread").strip().lower()
+    if backend == "thread" and effective_solver == "emd":
+        return _solve_exact_emd_problem_series(problem_series)
     workers = _cost_variant_emd_workers(len(problem_series))
     if workers == 1:
         return {
             name: [_solve_transport_problem(problem, effective_solver) for problem in problems]
             for name, problems in problem_series.items()
         }
-    backend = os.environ.get("DGST_COST_VARIANT_EMD_BACKEND", "thread").strip().lower()
     if backend == "process":
         executor = _get_emd_process_pool(workers)
         futures = {
@@ -5857,6 +6207,27 @@ def _solve_cost_variant_problem_series(
         return {name: futures[name].result() for name in problem_series}
 
 
+def _get_emd_thread_pool(workers: int) -> ThreadPoolExecutor:
+    global _EMD_THREAD_POOL, _EMD_THREAD_POOL_WORKERS
+    requested = int(workers)
+    if _EMD_THREAD_POOL is None:
+        _EMD_THREAD_POOL = ThreadPoolExecutor(
+            max_workers=requested,
+            thread_name_prefix="dgst-emd",
+        )
+        _EMD_THREAD_POOL_WORKERS = requested
+    elif _EMD_THREAD_POOL_WORKERS != requested:
+        # The environment is fixed in production, but allowing a clean resize
+        # keeps tests and interactive experiments predictable.
+        _EMD_THREAD_POOL.shutdown(wait=True)
+        _EMD_THREAD_POOL = ThreadPoolExecutor(
+            max_workers=requested,
+            thread_name_prefix="dgst-emd",
+        )
+        _EMD_THREAD_POOL_WORKERS = requested
+    return _EMD_THREAD_POOL
+
+
 def _get_emd_process_pool(workers: int) -> ProcessPoolExecutor:
     global _EMD_PROCESS_POOL, _EMD_PROCESS_POOL_WORKERS
     if _EMD_PROCESS_POOL is None:
@@ -5882,7 +6253,7 @@ def _initialize_emd_worker() -> None:
     torch.set_num_threads(1)
 
 
-def _cost_variant_emd_workers(problem_count: int) -> int:
+def _requested_cost_variant_emd_workers() -> int:
     raw = os.environ.get("DGST_COST_VARIANT_EMD_WORKERS", "1")
     try:
         requested = int(raw)
@@ -5892,7 +6263,11 @@ def _cost_variant_emd_workers(problem_count: int) -> int:
         ) from exc
     if requested < 1:
         raise ValueError("DGST_COST_VARIANT_EMD_WORKERS must be >= 1.")
-    return min(int(problem_count), requested)
+    return requested
+
+
+def _cost_variant_emd_workers(problem_count: int) -> int:
+    return min(int(problem_count), _requested_cost_variant_emd_workers())
 
 
 def _effective_ot_solver(configured_solver: str) -> str:
@@ -6021,6 +6396,12 @@ def _solve_transport_problem(problem, ot_solver: str) -> float:
         return 0.0
     local_source, local_target, distance = problem
     if not torch.is_tensor(local_source):
+        if str(ot_solver).strip().lower() == "emd":
+            return _wasserstein_1_exact_numpy_risk(
+                local_source,
+                local_target,
+                distance,
+            )
         local_source = torch.from_numpy(local_source)
         local_target = torch.from_numpy(local_target)
         distance = torch.from_numpy(distance)
@@ -6775,6 +7156,66 @@ def _baseline_excess_score(
     return float(score)
 
 
+def _wasserstein_1_exact_numpy_risk(
+    source,
+    target,
+    cost,
+) -> float:
+    """Return exact POT EMD risk without NumPy↔Torch round trips.
+
+    Four-gate extraction prepares CPU NumPy problems before dispatching them
+    to worker threads. The generic tensor solver converted each problem back
+    to Torch, immediately converted it to NumPy again, then materialized the
+    transport plan as a Torch tensor only to reduce it to one scalar. Keeping
+    that scalar-only path in NumPy reduces GIL-heavy wrapper work while using
+    the same POT network-simplex solver and the same linprog fallback.
+    """
+    import numpy as np
+
+    source_np = _as_probability_numpy_array(source)
+    target_np = _as_probability_numpy_array(target)
+    source_np, target_np = _balance_ot_marginals(source_np, target_np)
+    cost_np = np.array(cost, dtype=np.float64, copy=True)
+    cost_np = np.nan_to_num(
+        cost_np,
+        nan=1e6,
+        posinf=1e6,
+        neginf=1e6,
+    )
+    np.maximum(cost_np, 0.0, out=cost_np)
+    expected_shape = (int(source_np.shape[0]), int(target_np.shape[0]))
+    if cost_np.shape != expected_shape:
+        raise ValueError(
+            "OT cost shape must match source/target lengths, got "
+            f"{cost_np.shape} for {expected_shape[0]}x{expected_shape[1]}."
+        )
+
+    try:
+        import ot
+    except Exception as exc:
+        raise ImportError("DGST-T exact EMD solver requires POT.") from exc
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        plan = np.asarray(ot.emd(source_np, target_np, cost_np), dtype=np.float64)
+    warning_text = " ".join(str(item.message).lower() for item in caught)
+    if (
+        "infeasible" not in warning_text
+        and "simplex" not in warning_text
+        and plan.shape == cost_np.shape
+        and np.isfinite(plan).all()
+    ):
+        return float(np.sum(plan * cost_np, dtype=np.float64))
+
+    # Preserve the historical robust fallback for marginal/numerical failures.
+    risk, _plan = _wasserstein_1_exact(
+        torch.from_numpy(source_np),
+        torch.from_numpy(target_np),
+        torch.from_numpy(cost_np),
+        solver="linprog",
+    )
+    return float(risk)
+
+
 def _wasserstein_1_exact(
     source: torch.Tensor,
     target: torch.Tensor,
@@ -6866,9 +7307,13 @@ def _wasserstein_1_exact(
 
 
 def _as_probability_numpy(values: torch.Tensor):
+    return _as_probability_numpy_array(values.detach().cpu().double().numpy())
+
+
+def _as_probability_numpy_array(values):
     import numpy as np
 
-    arr = values.detach().cpu().double().numpy().astype(np.float64, copy=True)
+    arr = np.array(values, dtype=np.float64, copy=True)
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     arr[arr < 0.0] = 0.0
     total = float(arr.sum())

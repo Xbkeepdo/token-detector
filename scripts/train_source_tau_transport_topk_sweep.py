@@ -121,6 +121,43 @@ def configured_capped_topmass_alphas(config_root: dict) -> tuple[float, ...]:
     return values
 
 
+def configured_sweep_grid(
+    config_root: dict,
+) -> tuple[tuple[float, ...], tuple[int, ...]]:
+    """Resolve the sweep grid exactly as four-gate extraction does.
+
+    Extraction enables the sweep when either list-valued setting is present.
+    A missing/empty side falls back to its scalar primary value.  Training must
+    mirror that behavior or it can reject a feature grid that was validly
+    extracted, such as source_tau_values=[...] with transport_top_k=64 and
+    transport_top_k_values=null.
+    """
+    dgst_cfg = ((config_root.get("feature_extraction") or {}).get("dgst_t") or {})
+    raw_taus = dgst_cfg.get("source_tau_values")
+    raw_top_ks = dgst_cfg.get("transport_top_k_values")
+    if raw_taus is None and raw_top_ks is None:
+        return (), ()
+    if isinstance(raw_taus, (int, float)):
+        raw_taus = [raw_taus]
+    else:
+        raw_taus = list(raw_taus or [dgst_cfg.get("tau", 0.07)])
+    if isinstance(raw_top_ks, (int, float)):
+        raw_top_ks = [raw_top_ks]
+    else:
+        raw_top_ks = list(
+            raw_top_ks or [dgst_cfg.get("transport_top_k", 64)]
+        )
+    tau_values = tuple(dict.fromkeys(float(value) for value in raw_taus))
+    top_k_values = tuple(dict.fromkeys(int(value) for value in raw_top_ks))
+    if not tau_values or any(
+        not np.isfinite(value) or value <= 0.0 for value in tau_values
+    ):
+        raise ValueError("source_tau_values must resolve to finite positive values")
+    if not top_k_values or any(value <= 0 for value in top_k_values):
+        raise ValueError("transport_top_k_values must resolve to positive integers")
+    return tau_values, top_k_values
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", required=True)
@@ -926,16 +963,14 @@ def main() -> None:
             raise FileExistsError(f"Refusing to overwrite non-empty {result_dir}")
 
     torch_cfg = ((config_root.get("training") or {}).get("torch_probe") or {})
-    dgst_cfg = ((config_root.get("feature_extraction") or {}).get("dgst_t") or {})
     capped_topmass_alphas = configured_capped_topmass_alphas(config_root)
-    tau_values = [float(x) for x in (dgst_cfg.get("source_tau_values") or [])]
-    top_k_values = [
-        int(x) for x in (dgst_cfg.get("transport_top_k_values") or [])
-    ]
+    tau_values, top_k_values = configured_sweep_grid(config_root)
     if not tau_values or not top_k_values:
         raise ValueError(
-            "YAML must define feature_extraction.dgst_t.source_tau_values "
-            "and transport_top_k_values"
+            "YAML must enable a sweep with at least one of "
+            "feature_extraction.dgst_t.source_tau_values or "
+            "transport_top_k_values; the missing side falls back to tau or "
+            "transport_top_k"
         )
 
     def tau_slug(value: float) -> str:

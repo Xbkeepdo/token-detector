@@ -5,14 +5,20 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-MODEL="${MODEL:-llava_1_5_7b}"  # llava_1_5_7b  qwen3_vl_8b
-OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO-4000-ALLMENTION-SWEEP}"  # outputs/<model>/<output>/
-CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"
+MODEL="${MODEL:-qwen2_5_vl_7b}"  # llava_1_5_7b  qwen2_5_vl_7b
+OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-512-CAPPEDSWEEP}"
+CONFIG="${CONFIG:-configs/model_configs_server_fj01.yaml}"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 DEVICE="${DEVICE:-cuda:0}"
 GENERATION_DEVICES="${GENERATION_DEVICES:-cuda:0 cuda:1}"
 FEATURE_DEVICES="${FEATURE_DEVICES:-cuda:0 cuda:1}"
+export DGST_COST_VARIANT_EMD_WORKERS="${DGST_COST_VARIANT_EMD_WORKERS:-16}"
+export DGST_FOUR_GATE_PREP_CACHE="${DGST_FOUR_GATE_PREP_CACHE:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+
 CHAIR_CACHE="${CHAIR_CACHE:-outputs/chair_cache/coco_val2014_chair.pkl}"
 NLTK_DATA="${NLTK_DATA:-$HOME/userdata/nltk_data}"
 REUSE_GENERATIONS_FROM="${REUSE_GENERATIONS_FROM:-}"

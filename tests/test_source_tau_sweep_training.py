@@ -16,6 +16,7 @@ from scripts.train_source_tau_transport_topk_sweep import (
     DEFAULT_RUN_NAMES,
     build_matrices,
     configured_capped_topmass_alphas,
+    configured_sweep_grid,
     configured_training_methods,
     configured_training_risk_modes,
     configured_training_scopes,
@@ -26,6 +27,38 @@ from utils.config_utils import load_config
 
 
 class SourceTauSweepTrainingTests(unittest.TestCase):
+    def test_sweep_grid_falls_back_to_scalar_top_k_like_extraction(self) -> None:
+        config = {
+            "feature_extraction": {
+                "dgst_t": {
+                    "tau": 0.07,
+                    "source_tau_values": [0.03, 0.04, 0.05, 0.06],
+                    "transport_top_k": 64,
+                    "transport_top_k_values": None,
+                }
+            }
+        }
+        self.assertEqual(
+            configured_sweep_grid(config),
+            ((0.03, 0.04, 0.05, 0.06), (64,)),
+        )
+
+    def test_sweep_grid_falls_back_to_scalar_tau_like_extraction(self) -> None:
+        config = {
+            "feature_extraction": {
+                "dgst_t": {
+                    "tau": 0.07,
+                    "source_tau_values": None,
+                    "transport_top_k": 64,
+                    "transport_top_k_values": [32, 64],
+                }
+            }
+        }
+        self.assertEqual(
+            configured_sweep_grid(config),
+            ((0.07,), (32, 64)),
+        )
+
     def test_cli_defaults_to_the_full_risk_curve(self) -> None:
         argv = [
             "train_source_tau_transport_topk_sweep.py",

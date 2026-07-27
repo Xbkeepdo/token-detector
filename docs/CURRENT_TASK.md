@@ -1,5 +1,13 @@
 # Current Task
 
+## 2026-07-27 four-gate exact-EMD 前处理缓存与 COCO500 capped 子集
+
+- compact four-gate 新增默认开启的 `DGST_FOUR_GATE_PREP_CACHE=1`。缓存严格限制在单层内部，只复用 source/target transport Top-K、capped Top-Mass indices/union、target region、union-support 上重新归一化后的 marginal，以及同一 `(cost_mode, matched_state, exact_union_support_indices)` 的 cost matrix；每个不同 source/target distribution 仍分别调用 POT exact EMD，不复用 transport plan，也不从大 support 的解推导小 support。
+- 为避免完整矩阵切片可能引入不同 GEMM kernel 的末位浮点差异，cost 采用“第一次按历史 subset-first 路径计算、后续相同 support 原样复用”，而不是预计算整个视觉区域的矩阵。因此 feature 定义、support、renormalization 和 exact solver 均未改变；可用 `DGST_FOUR_GATE_PREP_CACHE=0` 随时切回旧路径做 A/B。
+- 新增缓存开关前后端到端嵌套输出逐值比较，覆盖两个 target 方法、三个 cost、两个 source tau 和三个 capped alpha，所有 tensor、risk、cosine、EV、support 与 sweep payload 完全相等。four-gate/cost/sweep 组合回归 44 项通过；唯一额外失败仍是旧测试要求活动 YAML 启用 VPEND，而用户当前 unified 配置明确为 VV-only，与缓存无关。`py_compile`、两份 shell `bash -n`、新 YAML 解析及 `git diff --check` 通过。
+- 等价合成负载（576 visual support、VV+VPEND、两方法、4 tau、5 alpha、单 cost）中，每层 cost 构造由 120 次降为 20 次；预热后的 exact-EMD 输出完全相同，中位耗时由 `0.3671s` 降为 `0.1310s`，该单层准备/求解负载约 `2.80x`。正式模型端到端仍需用 COCO500 实测，不能把该合成倍率直接外推到整条 pipeline。
+- 从 `COCO4000-512-CAPPEDSWEEP` 按 seed 42、原 train/test 和是否含幻觉 mention 分层抽取 500 张物理图，保存为 `outputs/qwen2_5_vl_7b/COCO500-capped`，严格 400/0/100 split；500 份 generation/label/ground truth 完全对齐，未复制旧 feature。新增 `configs/model_configs_server_fj01_coco500_capped.yaml` 和 `run_coco500_capped.sh`，专用入口跳过 generation/labeling，先验证既有 500 captions 再执行 extraction、training 与 sweep，避免普通 `run.sh` 按 4000 图配置扩充或拒绝该子集。
+
 ## 2026-07-27 capped Top-Mass alpha 超参验证
 
 - 将 compact four-gate 路径中原先固定的 `capped_topmass_085` 扩展为 YAML 可配置的多 alpha 实验。两份活动配置均新增 `feature_extraction.dgst_t.capped_topmass_alphas: [0.7, 0.75, 0.8, 0.85, 0.9]`；字段名分别使用 `capped_topmass_070/075/080/085/090`。旧开关 `compute_capped_topmass_085`、旧标量 `capped_topmass_085_alpha` 和所有 0.85 字段继续保留，因此已有 0.85 缓存与旧训练入口仍可读取。
