@@ -44,6 +44,9 @@ def _dgst_result(layers: int = 2, patches: int = 6) -> dict:
     value = {
         "dgst_t_profile": "four_gate_vv_v1",
         "dgst_t_four_gate_methods": list(FOUR_GATE_METHODS),
+        "dgst_t_four_gate_support_scopes": ["visual"],
+        "dgst_t_vv_support_size": patches,
+        "dgst_t_vv_support_positions": list(range(patches)),
         "dgst_t_mad_axis": "visual_tokens",
         "dgst_t_mad_scale": 1.4826,
         "dgst_t_softmax_axis": "vocabulary",

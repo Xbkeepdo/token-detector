@@ -1,5 +1,47 @@
 # Current Task
 
+## 2026-07-26 sweep 全层默认与 run.sh 自动训练开关
+
+- Sweep 训练新增 `risk_modes` 选择，支持 `fixed_topk` 与 `capped_topmass_085`；两份活动 YAML 当前都配置为同时训练两类（总开关仍为 `false`）。fixed 模式沿用 source tau × transport Top-K 笛卡尔网格；capped 模式以自适应 source/target top-mass union 取代固定 Top-K，因此只按 source tau 训练一次，不会把同一 tau 下不同 Top-K 的等价 capped 曲线重复训练。
+- capped sweep 不是复用主参数 `tau=0.07` 的 capped risk：特征提取现在会对每个 sweep source tau 重新构建 source distribution、重新选 capped union support 并求 exact EMD，同时复用与 source tau/transport Top-K 无关的 branch-specific capped EV。嵌套 sweep payload 同时保存 fixed risk 与对应 tau 的 capped risk；训练读取 capped risk + capped EV，仍默认全层拼接。旧 `features.pkl` 的 `dgst_t_hparam_sweep` 只有 fixed risk，选择 capped 前必须用新代码重提特征。
+- `scripts/train_source_tau_transport_topk_sweep.py` 的默认 risk slice 从固定层 `[20,29)` 改为 `[0, 实际曲线长度)`；未传 `--layer-end` 时会按模型自动使用全部 decoder 层，并检查同一次训练中的 risk 曲线层数严格一致。EV 仍使用对应方法的全层曲线，因此 Qwen3 的默认组合为 36 层 risk + 36 层 EV，32 层模型为 32+32；仍可显式传 `--layer-start/--layer-end` 做旧式子区间实验。
+- 两份活动 YAML 在 `training.source_tau_transport_topk_sweep` 新增训练开关和方法列表，当前均为 `enabled: false`，方法为 raw-logit Gaussian 与 softmax-prob Gaussian。打开开关时，`run.sh` 会在普通 `train_and_eval.py` 完成后调用 sweep 脚本；关闭时该入口只打印 skip 并立即退出，不加载大 `features.pkl`。自动训练按 YAML 当前 `support_modes` 选择 VV/VPEND scope，并把两类方法分别写入既有的 `...full_hpre_risk_plus_full_ev` 与 `...full_hpre_softmax_prob_gauss_risk_plus_full_ev` 目录。
+- 要实际启用，除了把训练开关设为 `true`，还必须给 `feature_extraction.dgst_t.source_tau_values` 与 `transport_top_k_values` 配置非空网格并重新提取含 `dgst_t_hparam_sweep` 的特征；缺少网格时会在加载大特征前明确报错。本轮保持两份 YAML 的网格为 `null`、开关为 `false`，没有启动正式 GPU 提取或 sweep 训练。
+- 验证：新增 full-layer 拼接、fixed/capped 选择、capped Top-K 去重、CLI 默认值、YAML 开关/方法、scope 推导、缺失网格前置报错和 `run.sh` 阶段顺序回归 6/6；capped sweep 的 source-tau 重算、手算 EMD、VV/VPEND 序列化定向测试通过，既有 sweep wrapper plumbing 3/3。禁用开关的真实 CLI no-op、相关 Python `py_compile`、`bash -n run.sh`、两份 YAML 运行时解析及 `git diff --check` 均通过。第一次尝试 pytest 因项目环境未安装 pytest 而无法启动；改用标准库 unittest 后通过。扩展合跑旧 `test_train_and_eval_stage + test_stateupd_alpha_sweep` 为 12/14，其中 2 个失败仍是旧断言要求 unified 必须启用 VPEND，而用户当前 unified 明确为 `support_modes=["vv"]`，与本轮开关/全层逻辑无关；另一次定向 unittest 首次因输入了不存在的测试方法名而报 loader error，改用实际方法名后通过。
+
+## 2026-07-26 LLaVA/InternVL 恢复完整 caption batch-forward
+
+- 经典 `LLaVAWrapper` 与 `InternVLWrapper` 的公开 `extract_token_features_batch()` 已从“每个目标对象 token 单独做一次 causal-prefix forward”恢复为“一张图、完整 teacher-forced caption 只做一次 forward”，随后从同一次 decoder 输出中读取所有请求的 `j-1` prediction rows，并把全部 target IDs/positions 一次交给 DGST batch 计算。Qwen、Qwen3、LLaVA-OneVision 与独立 prompt-target API 未改。
+- 因果语义仍成立：完整 caption 虽一次送入模型，但 decoder causal mask 保证第 `j-1` 行不能看到目标 token `j` 或未来 token；变化只是共享此前重复计算的图像、prompt 和历史 response prefix。MetaToken/HalLoc 需要的完整 response hidden/logit statistics 也直接复用这一次 forward，不再额外执行共享 baseline forward。
+- 原来保留但不调用的 full-response reference implementation已成为正式 batch 实现；删除两个 wrapper 不再需要的 `dataclasses.replace`。测试改为断言公共 batch API 只委托一次 full-response 实现、绝不调用 single-target forward。
+- 验证：LLaVA/InternVL batch 路由、causal positions、prompt-target、extraction modes、four-gate/capped、sweep plumbing、prompt CAFE 与视觉 support 相关组合 53/53 通过；两个 wrapper 与测试 `py_compile`、`git diff --check` 通过。本轮未启动正式 GPU 特征抽取。
+
+## 2026-07-26 compact four-gate 接入 capped-topmass 0.85
+
+- 仓库原有 `capped_topmass_085` 只在 legacy DGST 路径生效；当前活动的 `target_gate_mode=four_gate` 会提前进入 compact 快路径，旧的 capped 参数此前不会被消费，当前 `COCO4000-512-TC/features.pkl` 因而没有任何 capped 字段。本轮把该逻辑正式接入 compact VV/VP/VPEND，并保持未显式开启时不新增计算。
+- 当前定义为：source 与 branch-specific target distribution 分别按概率降序取达到累计质量 `0.85` 的最小 K，再把每侧 K 截断到 `[32,64]`；capped risk 在两侧索引并集上做同一 exact EMD，capped target-cosine 与 capped EV 在 target-only capped 区域上计算。输出同时记录 alpha/min-K/max-K 和定义 provenance。
+- Qwen/Qwen3/LLaVA/InternVL/OneVision 以及 prompt-target 共用路径均已透传开关；compact serializer 和训练 alias 支持 capped risk、target-cosine、EV，包括所有已有 cost 与 VV/VP/VPEND 前缀。
+- 两份活动 YAML 均启用 `compute_capped_topmass_085=true`、alpha=`0.85`、min-K=`32`、max-K=`64`，并各新增四个 `capped risk + capped target-cosine` 训练项：VV/VPEND × raw-logit/softmax-prob。训练 dry-run 为 3 seeds × 15 个当前 method feature sets，四个 capped 组合均被保留。
+- 新增合成回归精确核验 capped region、union support、EMD risk、cosine、VV/VPEND 序列化和两块 36 层向量的 72 维训练拼接；同步补齐 extraction-mode 旧 fixture 缺失的 VV scope 元数据。four-gate/state-update/sweep plumbing/prompt-target/QA/extraction/raw-attention 相关组合 46/46 通过；单独的 config-mirror 测试仍因用户保留的 unified/fj01 extraction/baseline/QA 选择差异失败。
+- 现有 TC 的 11,751 条 first-canonical 特征不能直接训练 capped，因为它们没有对应字段；需要重新抽取。为避免在关闭 manifest 后把旧/新 schema 混入同一缓存，正式尝试应使用新的输出目录并只复用 generation，再生成 all-mentions labeling/features。
+
+## 2026-07-26 Qwen3 risk + raw target-cosine 三 seed 训练
+
+- 复用 `outputs/qwen3_vl_8b/COCO4000-512-TC/features.pkl`，新增训练 VV/VPEND × raw-logit/softmax-prob 四组 `risk + raw target_cosine`；每组输入为 36 层 risk 与 36 层 cosine 拼接，共 72 维。协议沿用严格图片级 8:2、seeds `43/44/45` 和当前三层 Torch MLP，同时报告固定 0.5 与 train Real-F1 阈值。
+- train Real-F1 阈值下，四组的 `AUROC / Hall-F1 / Hall-AUPR` 分别为：VV-softmax `0.8482±0.0037 / 0.5609±0.0223 / 0.6220±0.0132`；VPEND-raw `0.8474±0.0106 / 0.5615±0.0246 / 0.6232±0.0112`；VV-raw `0.8434±0.0022 / 0.5554±0.0174 / 0.6290±0.0053`；VPEND-softmax `0.8417±0.0082 / 0.5320±0.0104 / 0.5942±0.0127`。
+- 与同一缓存、split、head 的 risk-only 相比，加入 raw cosine 后四组 AUROC 均提升 `+0.0186` 至 `+0.0242`，Hall-F1 提升 `+0.0428` 至 `+0.0735`，Hall-AUPR 提升 `+0.0296` 至 `+0.0477`；但仍全面弱于已有 `risk + EV`，后者把 cosine 乘上 target-distribution mass，四组 AUROC 还高 `+0.0219` 至 `+0.0313`。说明 cosine 有独立信号，但 target mass 加权是组合效果的重要组成。
+- 汇总位于 `results/qwen3_vl_8b_risk_plus_target_cosine_3seed_summary.{md,csv,json}`；3 seeds × 4 feature sets 的 12 个 checkpoint/config/history 及逐 seed JSON/Markdown 均完整，聚合项全部为有限值。
+- 重要口径：当前 TC artifact 仍是 11,751 条旧 `first-canonical` labeling/features；活动 YAML 虽已改成 `all_mentions`，但尚未重新标注和补提特征。因此本轮结果只与同一旧缓存上的 risk-only/risk+EV 公平可比，不能当作未来 32,631 条 all-mentions 重提后的最终结果。
+
+## 2026-07-26 all-mentions、关闭 manifest 与停止 sweep
+
+- 两份活动 YAML 的 COCO `labeling.sample_unit` 改为 `all_mentions`；schema-v2 labeling 现在会把 caption 中每次有效 COCO 对象出现都写入 `object_token_spans`，不再只保留每个 canonical object 的第一次出现。训练报告中的 label protocol 同步改为动态记录实际 sample unit。
+- 新增 `run.validate_manifests` 总开关并在两份活动 YAML 设为 `false`。关闭时 COCO generation/labeling/features、协调器复用路径及 QA baseline 提取/训练均不读取、不校验、也不写 provenance manifest；generation/label/features 的字段完整性、实际 response token ID、一致 caption、样本 cohort 与严格 split 检查仍保留。
+- `source_tau_values` 与 `transport_top_k_values` 均设为 `null`，普通特征抽取不再生成 tau×Top-K sweep 变体；主参数 `tau=0.07`、`transport_top_k=64` 不变。
+- 已删除 `outputs/qwen3_vl_8b/COCO4000-512-TC` 内 4 个现有 sidecar：根 generation/labeling/features manifest 和 baseline/features manifest；generation、labeling、features、split、模型结果均未删除。
+- TC 当前 `labeling.json` 仍是旧 first-canonical 数据，根与 baseline 特征各 11,751 条。只读审计其已保存的 `all_object_token_spans` 得到 32,631 个可提取且无重复的 all-mentions 目标，3,713 张图片需要补充特征。下一次 `run.sh` resume 会复用完整 generation，检测 sample-unit 不同后重建 all-mentions labeling；特征 resume 已从“按图片是否出现”加强为“按目标 token 键是否完整”，会重处理这 3,713 张图片并在合并时去重旧记录，而不会错误跳过整张图。
+- 验证：新增/直接相关回归 18/18 通过，相关 Python 文件 `py_compile`、两份 YAML 解析、`bash -n run.sh run_qa.sh` 与 `git diff --check` 通过。扩展组合的 3 个 stage-resume 失败仍是仓库此前已有的旧 manifest 拒绝契约断言；活动 QA/config 扩展组合另有 2 个失败，来自用户已保留的 unified/fj01 非路径配置差异及当前 unified baseline-only 使旧测试期待的 22 个 method feature sets 为空，未覆盖这些配置。
+
 ## 2026-07-26 VQA 问题物体 token 与 prompt 末 token 对比
 
 - 再次以 `model_configs_server_fj01.yaml` 的当前实验选择为基准同步 `model_configs_unified.yaml`，只保留两台机器各自的数据、模型与输出绝对路径。同步后的 COCO extraction mode 为 `all`，baseline 提取/训练只启用 MetaToken，source tau 网格为 `[0.02, 0.03, 0.04, 0.05, 0.06]`，transport Top-K 网格为 `[16, 32, 64, 128]`。
@@ -13,7 +55,7 @@
 
 - 以 `model_configs_server_fj01.yaml` 的当前实验选择为基准同步 `model_configs_unified.yaml`：QA extraction mode=`method_only`、两个 QA label protocol、VV+VPend support、source tau=`[0.01,0.03,0.06]`、transport Top-K=`[32,64,128]`、活动 method/ADS/CGC feature sets 及全部训练参数现已一致。unified 继续保留 apulis 环境路径，fj01 继续保留 `/root/rivermind-*` 路径，不跨机器覆盖模型、数据和输出绝对路径。
 - 新增 `tests/test_config_mirror.py`，显式移除 18 个环境路径字段后比较两份 YAML 的完整解析对象；今后任何非路径配置漂移都会失败。同步更新 state-update、raw-attention 和 QA active-config 旧断言。
-- sweep 提取与 sweep 训练仍刻意分离：`extract_features.py` 只写含 `dgst_t_hparam_sweep` 的 `features.pkl`；`run.sh` 的第三阶段只执行普通 `train_and_eval.py`，不会调用 `train_source_tau_transport_topk_sweep.py`。9 个 tau×Top-K 变体、VV/VPend 两个 scope 的专用训练必须由用户单独启动，本轮没有训练。
+- 当时 sweep 提取与 sweep 训练仍刻意分离：`extract_features.py` 只写含 `dgst_t_hparam_sweep` 的 `features.pkl`；该行为现已被文档顶部 2026-07-26 的 YAML 自动训练开关取代，开关关闭时仍保持分离。
 - 验证：配置镜像、state-update、QA config、raw-attention、train/eval stage 和 sweep wrapper plumbing 共 `24 passed`，`py_compile` 与 `git diff --check` 通过。首次把完整 `test_pipeline_config.py` 一并加入时为 `11 failed, 45 passed`：其中 1 项是本次已修正的旧 cost-mode 断言；其余 10 项均为仓库已有 pipeline manifest/resume 契约失败（未写 manifest 或未抛出旧预期异常），与本次 YAML 同步无调用关系。
 
 ## 2026-07-25 InternVL/LLaVA 改为逐目标 token 的 causal-prefix forward
@@ -22,6 +64,16 @@
 - 单目标路径会使用该目标之前的真实 causal prefix，目标 token 本身只作为待预测 ID，不放入输入。启用 MetaToken/HalLoc 所需的 `response_hidden_states` 时，另做一次不安装 DGST hooks 的轻量整句共享 forward，行为与 Qwen/Qwen3/OneVision 一致；该共享 forward 只提供整句 hidden states 和 compact logit statistics，不参与目标 DGST。
 - 新增 `tests/test_sequential_token_forward_wrappers.py`，同时覆盖 InternVL/LLaVA 的三个非连续目标位置、精确 prefix、目标 ID/response index 映射，以及整句 baseline capture 只执行一次并共享给全部目标。
 - 验证：两个 wrapper 与新测试 `py_compile` 通过；`test_sequential_token_forward_wrappers + test_dgst_sweep_wrapper_plumbing + test_causal_token_positions + test_four_gate_dgst + test_prompt_cafe + test_visual_support_ranges` 为 `35 passed, 10 subtests passed`；未启动训练或正式特征提取。
+## 2026-07-25 Qwen3 旧 all-mentions 特征复用当前共享 MLP
+
+- 复用 `outputs/qwen3_vl_8b/COCO4000-512/baseline/features.pkl` 的 32,628 条历史 token 特征，不重新生成 caption、label 或特征。该缓存属于旧 `all mentions + prefix token count locator` 协议，不满足当前 `schema_version=2 / first canonical + exact offsets` 的受控训练入口；因此没有关闭正式入口的 schema 防护，而是把本次兼容实验明确隔离到 `baseline/legacy_all_mentions_current_mlp/`，结果不能冒充新协议受控实验。
+- image split 复用当前 `COCO4000-512-ENDAC/image_splits.json` 的严格 3200/0/800；其 train 与历史 train 完全相同，test 为历史 val+test 并集。旧缓存中实际有有效 token 特征的图片为 3158/0/790，对应 token 样本 26098/0/6530，train/test 标签计数分别为 real/hall=`23476/2622` 和 `5863/667`。
+- 使用当前 YAML 共享 MLP 完成 MetaToken、SVAR、ProjectAway × seeds `43/44/45`：输入维度 `42/448/37`，网络 `128→64→32`、BatchNorm-ReLU-Dropout 0.3、`drop_last=true`、Adam `lr=1e-3`、weight decay `1e-5`、batch 256、最多 100 epochs、train-loss scheduler/early stopping、minimum-train-loss checkpoint；固定 0.5 与 train Real-F1 阈值均有报告。
+- train Real-F1 阈值下的 Test mean±population-std：MetaToken Accuracy/Real-F1/Hall-F1/AUROC=`0.9002±0.0002/0.9469±0.0001/0.1705±0.0073/0.8627±0.0011`；SVAR=`0.9325±0.0011/0.9626±0.0005/0.6537±0.0144/0.9265±0.0022`；ProjectAway=`0.8980±0.0000/0.9463±0.0000/0.0040±0.0014/0.6010±0.0060`。固定 0.5 下 Hall-F1 分别为 `0.0933±0.0570/0.6585±0.0077/0.0000±0.0000`；类别不平衡下 Accuracy/Real-F1 会掩盖 MetaToken/ProjectAway 几乎不召回幻觉样本的问题，当前最强仍是 SVAR。
+- 三 seed 汇总为 `baseline/legacy_all_mentions_current_mlp/results/shared_torch_mlp/qwen3_vl_8b_legacy_all_mentions_baselines_shared_torch_mlp_3seed_summary.md`；逐 seed JSON、9 个 checkpoint/config/history 均已保存。核验 3 个结果 seed/方法/协议/样本数一致，9/9 checkpoint 配置与当前 YAML 相符，聚合结果全部为有限值；本轮未修改用户已有的 dirty `configs/model_configs_unified.yaml`。
+- 为与上述 baseline 做真正同模型、同样本、同 split、同 head 的比较，又复用根 `features.pkl` 将历史报告的全部 23 组自有特征按相同严格 8:2、seeds `43/44/45` 和当前共享 MLP 重训，共 69 个 checkpoint。三 seed 均完整覆盖 23/23 feature sets；汇总位于 `results/legacy_all_mentions_current_mlp/qwen3_vl_8b_legacy_own_features_current_mlp_3seed_summary.{md,csv,json}`，直接比较报告为 `qwen3_vl_8b_legacy_own_vs_baselines_current_mlp_3seed_comparison.md`。
+- 当前 parser 对 `hmid_*` 要求真正的 `*_hmid_per_layer`，但该历史缓存的 `hmid_*` risk/cosine/EV 实际以 `*_hpre_per_layer` 保存；第一次三路运行因此在完成前 8 组后同时明确报缺字段。兼容续跑只在内存中把 6 个历史 hpre key 映射到 parser 所需 key，数组数值不变，并把完整映射写入各 hmid 结果 provenance；没有修改正式 alias 或放宽当前 schema 保护。
+- 23 组自有特征中 CGC 全面最强。train Real-F1 阈值下，CGC Accuracy/Real-F1/Hall-F1/AUROC/Hall-AUPR=`0.9294±0.0013/0.9611±0.0007/0.6123±0.0191/0.9276±0.0008/0.6817±0.0057`；旧 hmid raw risk+cosine+EV 排第二，为 `0.9233±0.0010/0.9575±0.0006/0.6033±0.0027/0.9258±0.0019/0.6586±0.0031`。同协议 SVAR 的 Hall-F1/Hall-AUPR 高 CGC `0.0415/0.0251`，Accuracy 高 `0.0032`，CGC 的 AUROC 仅高 `0.0011`；因此旧缓存上 SVAR 的少数类识别更强，两者排序能力近似。
 
 ## 2026-07-24 VP softmax-Gaussian R / AE 的 STD、SEM、95% CI 曲线
 

@@ -40,7 +40,7 @@ _DGST_TARGET_MODE_ALIASES = {
     "raw_logit_gauss": "raw_logit_gauss",
     "hpre_raw_logit_gauss": "raw_logit_gauss",
 }
-VALID_LABEL_SAMPLE_UNITS = {"first_canonical_mention"}
+VALID_LABEL_SAMPLE_UNITS = {"first_canonical_mention", "all_mentions"}
 VALID_LABEL_LOCATORS = {"exact_response_offsets"}
 VALID_ALIGNMENT_FAILURE_POLICIES = {"error", "skip"}
 PIPELINE_STAGES = (
@@ -134,6 +134,7 @@ _RUN_DEFAULTS = {
     "prompt": "Describe this image.",
     "resume": True,
     "adopt_legacy_artifacts": False,
+    "validate_manifests": True,
     "extraction_mode": "all",
     "stages": {
         "generation": True,
@@ -257,6 +258,22 @@ def resolve_run_config(
 
     _validate_run_config(run, config)
     return run
+
+
+def manifest_validation_enabled(config: Mapping[str, Any]) -> bool:
+    """Return whether artifact provenance manifests should block reuse.
+
+    When disabled, pipeline stages neither read nor write provenance manifest
+    sidecars. Structural artifact and split validation remains active.
+    """
+
+    raw_run = config.get("run") or {}
+    if not isinstance(raw_run, Mapping):
+        raise ValueError("run must be a YAML mapping")
+    return _parse_bool(
+        raw_run.get("validate_manifests", True),
+        name="run.validate_manifests",
+    )
 
 
 def extraction_mode_flags(mode: str) -> dict[str, bool]:
@@ -491,6 +508,10 @@ def _validate_run_config(run: dict, config: dict) -> None:
     run["adopt_legacy_artifacts"] = _parse_bool(
         run.get("adopt_legacy_artifacts", False),
         name="run.adopt_legacy_artifacts",
+    )
+    run["validate_manifests"] = _parse_bool(
+        run.get("validate_manifests", True),
+        name="run.validate_manifests",
     )
 
     positive_class = str(run.get("positive_class", "real")).strip().lower()

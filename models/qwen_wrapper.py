@@ -715,6 +715,9 @@ def _compute_dgst_result_from_captures(
         capped_topmass_max_k=int(cfg.get("capped_topmass_085_max_k", 64)),
         compute_topmass_085=bool(cfg.get("compute_topmass_085", True)),
         compute_capped_topmass_085=bool(cfg.get("compute_capped_topmass_085", True)),
+        four_gate_compute_capped_topmass_085=bool(
+            cfg.get("compute_capped_topmass_085", False)
+        ),
         target_gate_mode=cfg.get("target_gate_mode", "four_gate"),
         relative_vll_mad_epsilon=float(cfg.get("relative_vll_mad_epsilon", 1e-6)),
         relative_vll_logit_source=cfg.get("relative_vll_logit_source", "h_mid"),

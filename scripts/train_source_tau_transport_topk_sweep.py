@@ -10,6 +10,7 @@ import os
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -29,32 +30,198 @@ from utils.io_utils import load_json, load_pkl
 from utils.split_utils import validate_strict_82_split
 
 
-SCOPE_BLOCKS = {
-    "vv": {
-        "ev": "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
+FEATURE_METHODS = {
+    "hpre_raw_logit_gauss": {
+        "label": "hpre raw-logit Gaussian",
+        # Preserve the historical feature names for existing raw-logit runs.
+        "feature_suffix": "hpre_risk_plus_ev",
     },
-    "vpend": {
-        "ev": "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
+    "hpre_softmax_prob_gauss": {
+        "label": "hpre softmax-prob Gaussian",
+        "feature_suffix": "hpre_softmax_prob_gauss_risk_plus_ev",
     },
 }
-SWEEP_RISK_KEY = (
-    "dgst_t_hpre_raw_logit_gauss_risk_sqrt_hpre_per_layer"
-)
+RISK_MODES = ("fixed_topk", "capped_topmass_085")
+
+DEFAULT_RUN_NAMES = {
+    "hpre_raw_logit_gauss": (
+        "source_tau_x_transport_topk_full_hpre_risk_plus_full_ev"
+    ),
+    "hpre_softmax_prob_gauss": (
+        "source_tau_x_transport_topk_full_hpre_softmax_prob_gauss_"
+        "risk_plus_full_ev"
+    ),
+}
+
+
+def feature_method_spec(method: str) -> dict:
+    base = FEATURE_METHODS[method]
+    return {
+        **base,
+        "risk_key": f"dgst_t_{method}_risk_sqrt_hpre_per_layer",
+        "capped_risk_key": (
+            f"dgst_t_{method}_risk_sqrt_hpre_"
+            "capped_topmass_085_per_layer"
+        ),
+        "scope_blocks": {
+            "vv": {
+                "ev": f"{method}_ev_target_dist_mass_x_cosine",
+                "capped_ev": (
+                    f"{method}_ev_target_dist_mass_x_cosine_"
+                    "capped_topmass_085"
+                ),
+            },
+            "vpend": {
+                "ev": f"vpend_{method}_ev_target_dist_mass_x_cosine",
+                "capped_ev": (
+                    f"vpend_{method}_ev_target_dist_mass_x_cosine_"
+                    "capped_topmass_085"
+                ),
+            },
+        },
+    }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--layer-start", type=int, default=20)
-    parser.add_argument("--layer-end", type=int, default=29)
+    parser.add_argument(
+        "--layer-start",
+        type=int,
+        default=0,
+        help="Risk layer start (inclusive); defaults to the first layer.",
+    )
+    parser.add_argument(
+        "--layer-end",
+        type=int,
+        default=None,
+        help=(
+            "Risk layer end (exclusive); defaults to the full curve length "
+            "for the selected model."
+        ),
+    )
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument(
+        "--feature-method",
+        choices=sorted(FEATURE_METHODS),
+        default=None,
+        help=(
+            "Swept risk and matching full-layer EV feature family; manual "
+            "runs default to hpre_raw_logit_gauss."
+        ),
+    )
+    parser.add_argument(
+        "--risk-modes",
+        nargs="+",
+        choices=RISK_MODES,
+        default=None,
+        help=(
+            "Risk support selections; manual runs default to fixed_topk. "
+            "Automatic runs read risk_modes from YAML."
+        ),
+    )
+    parser.add_argument(
         "--run-name",
-        default="source_tau_x_transport_topk_hpre_risk_plus_ev",
+        default=None,
+        help="Result directory name; defaults to a full-layer method-specific name.",
+    )
+    parser.add_argument(
+        "--if-enabled",
+        action="store_true",
+        help=(
+            "Obey training.source_tau_transport_topk_sweep.enabled and train "
+            "all YAML-configured feature methods. Intended for run.sh."
+        ),
     )
     return parser.parse_args()
+
+
+def configured_training_methods(config_root: dict) -> list[str]:
+    training = config_root.get("training") or {}
+    sweep_cfg = training.get("source_tau_transport_topk_sweep") or {}
+    if not isinstance(sweep_cfg, dict):
+        raise ValueError(
+            "training.source_tau_transport_topk_sweep must be a mapping"
+        )
+    enabled = sweep_cfg.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "training.source_tau_transport_topk_sweep.enabled must be a boolean"
+        )
+    if not enabled:
+        return []
+    raw_methods = sweep_cfg.get("feature_methods")
+    if raw_methods is None:
+        raw_methods = ["hpre_raw_logit_gauss"]
+    elif isinstance(raw_methods, str):
+        raw_methods = [raw_methods]
+    elif not isinstance(raw_methods, (list, tuple)):
+        raise ValueError(
+            "training.source_tau_transport_topk_sweep.feature_methods must "
+            "be a string or list"
+        )
+    methods = list(dict.fromkeys(str(method) for method in raw_methods))
+    if not methods:
+        raise ValueError(
+            "Enabled source-tau/Top-K sweep training needs at least one "
+            "feature method"
+        )
+    unknown = sorted(set(methods) - set(FEATURE_METHODS))
+    if unknown:
+        raise ValueError(
+            f"Unsupported sweep feature methods {unknown}; expected a subset "
+            f"of {sorted(FEATURE_METHODS)}"
+        )
+    return methods
+
+
+def configured_training_scopes(config_root: dict) -> tuple[str, ...]:
+    dgst_cfg = ((config_root.get("feature_extraction") or {}).get("dgst_t") or {})
+    raw_scopes = dgst_cfg.get("support_modes", ["vv"])
+    if isinstance(raw_scopes, str):
+        raw_scopes = [raw_scopes]
+    scopes = [str(scope).strip().lower() for scope in raw_scopes]
+    selected = [scope for scope in ("vv", "vpend") if scope in scopes]
+    if not selected:
+        raise ValueError(
+            "Automatic sweep training requires support_modes to include vv "
+            "and/or vpend"
+        )
+    return tuple(selected)
+
+
+def configured_training_risk_modes(config_root: dict) -> tuple[str, ...]:
+    training = config_root.get("training") or {}
+    sweep_cfg = training.get("source_tau_transport_topk_sweep") or {}
+    raw_modes = sweep_cfg.get("risk_modes", ["fixed_topk"])
+    if isinstance(raw_modes, str):
+        raw_modes = [raw_modes]
+    elif not isinstance(raw_modes, (list, tuple)):
+        raise ValueError(
+            "training.source_tau_transport_topk_sweep.risk_modes must be a "
+            "string or list"
+        )
+    modes = tuple(dict.fromkeys(str(mode) for mode in raw_modes))
+    if not modes:
+        raise ValueError("Enabled sweep training needs at least one risk mode")
+    unknown = sorted(set(modes) - set(RISK_MODES))
+    if unknown:
+        raise ValueError(
+            f"Unsupported sweep risk modes {unknown}; expected a subset of "
+            f"{list(RISK_MODES)}"
+        )
+    if "capped_topmass_085" in modes:
+        dgst_cfg = (
+            (config_root.get("feature_extraction") or {}).get("dgst_t") or {}
+        )
+        if not bool(dgst_cfg.get("compute_capped_topmass_085", False)):
+            raise ValueError(
+                "capped_topmass_085 sweep training requires "
+                "feature_extraction.dgst_t.compute_capped_topmass_085=true"
+            )
+    return modes
 
 
 def probe_config_from_yaml(config_path: str, seed: int) -> TorchProbeConfig:
@@ -86,17 +253,56 @@ def build_matrices(
     rows: list[dict],
     expected_variants: dict[str, tuple[float, int]],
     layer_start: int,
-    layer_end: int,
+    layer_end: int | None,
+    feature_method: str = "hpre_raw_logit_gauss",
+    scopes: Sequence[str] = ("vv", "vpend"),
+    risk_modes: Sequence[str] = ("fixed_topk",),
 ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, dict]:
-    values = {
-        f"{scope}_{variant_slug}_hpre_risk_plus_ev": []
-        for scope in SCOPE_BLOCKS
-        for variant_slug in expected_variants
+    spec = feature_method_spec(feature_method)
+    unknown_scopes = sorted(set(scopes) - set(spec["scope_blocks"]))
+    if unknown_scopes:
+        raise ValueError(f"Unsupported sweep scopes: {unknown_scopes}")
+    scope_blocks = {
+        scope: spec["scope_blocks"][scope]
+        for scope in dict.fromkeys(scopes)
     }
+    selected_risk_modes = tuple(dict.fromkeys(str(mode) for mode in risk_modes))
+    unknown_risk_modes = sorted(set(selected_risk_modes) - set(RISK_MODES))
+    if not selected_risk_modes or unknown_risk_modes:
+        raise ValueError(
+            f"Invalid sweep risk modes {list(risk_modes)}; expected a non-empty "
+            f"subset of {list(RISK_MODES)}"
+        )
+    risk_key = spec["risk_key"]
+    capped_risk_key = spec["capped_risk_key"]
+    feature_suffix = spec["feature_suffix"]
+    tau_variant_groups: dict[float, list[str]] = {}
+    for variant_slug, (source_tau, _top_k) in expected_variants.items():
+        tau_variant_groups.setdefault(float(source_tau), []).append(variant_slug)
+    values = {}
+    if "fixed_topk" in selected_risk_modes:
+        values.update(
+            {
+                f"{scope}_{variant_slug}_{feature_suffix}": []
+                for scope in scope_blocks
+                for variant_slug in expected_variants
+            }
+        )
+    if "capped_topmass_085" in selected_risk_modes:
+        values.update(
+            {
+                f"{scope}_tau{format(source_tau, '.12g').replace('-', 'm').replace('.', 'p')}_"
+                f"capped_topmass_085_{feature_suffix}": []
+                for scope in scope_blocks
+                for source_tau in tau_variant_groups
+            }
+        )
     labels = []
     image_ids = []
     risk_dims = set()
     ev_dims = set()
+    resolved_layer_end = layer_end
+    use_full_risk_curve = layer_end is None
     for index, row in enumerate(rows):
         label = row.get("label")
         if label not in (0, 1):
@@ -109,10 +315,22 @@ def build_matrices(
                 f"Sweep variants differ at row {index}: "
                 f"{sorted(row_sweep)} != {sorted(expected_variants)}"
             )
-        for scope, blocks in SCOPE_BLOCKS.items():
-            ev = feature_block(row, blocks["ev"]).astype(np.float32, copy=False)
-            if ev.ndim != 1 or not np.all(np.isfinite(ev)):
-                raise ValueError(f"Invalid {scope} EV curve at row {index}")
+        for scope, blocks in scope_blocks.items():
+            ev_by_mode = {}
+            for risk_mode, block_name in (
+                ("fixed_topk", "ev"),
+                ("capped_topmass_085", "capped_ev"),
+            ):
+                if risk_mode not in selected_risk_modes:
+                    continue
+                ev = feature_block(row, blocks[block_name]).astype(
+                    np.float32, copy=False
+                )
+                if ev.ndim != 1 or not np.all(np.isfinite(ev)):
+                    raise ValueError(
+                        f"Invalid {scope}/{risk_mode} EV curve at row {index}"
+                    )
+                ev_by_mode[risk_mode] = ev
             for variant_slug, expected in expected_variants.items():
                 variant = row_sweep[variant_slug]
                 actual = (
@@ -124,13 +342,16 @@ def build_matrices(
                         f"Variant metadata mismatch at row {index}: "
                         f"{variant_slug}={actual}, expected {expected}"
                     )
+                if "fixed_topk" not in selected_risk_modes:
+                    continue
+                ev = ev_by_mode["fixed_topk"]
                 try:
                     risk = np.asarray(
-                        variant[scope][SWEEP_RISK_KEY], dtype=np.float32
+                        variant[scope][risk_key], dtype=np.float32
                     )
                 except KeyError as exc:
                     raise KeyError(
-                        f"Missing {scope}/{variant_slug}/{SWEEP_RISK_KEY} "
+                        f"Missing {scope}/{variant_slug}/{risk_key} "
                         f"at row {index}"
                     ) from exc
                 if risk.ndim != 1 or not np.all(np.isfinite(risk)):
@@ -142,28 +363,103 @@ def build_matrices(
                         f"{scope}/{variant_slug} risk/EV shape mismatch: "
                         f"{risk.shape} != {ev.shape}"
                     )
+                if resolved_layer_end is None:
+                    resolved_layer_end = int(risk.size)
+                elif use_full_risk_curve and risk.size != resolved_layer_end:
+                    raise ValueError(
+                        "Full-layer sweep training requires one consistent "
+                        f"risk dimension, got {resolved_layer_end} and {risk.size}"
+                    )
                 if (
                     layer_start < 0
-                    or layer_end > risk.size
-                    or layer_end <= layer_start
+                    or resolved_layer_end > risk.size
+                    or resolved_layer_end <= layer_start
                 ):
                     raise ValueError(
-                        f"Requested risk slice [{layer_start},{layer_end}) "
+                        f"Requested risk slice [{layer_start},{resolved_layer_end}) "
                         f"outside curve length {risk.size}"
                     )
                 risk_dims.add(int(risk.size))
                 ev_dims.add(int(ev.size))
                 values[
-                    f"{scope}_{variant_slug}_hpre_risk_plus_ev"
+                    f"{scope}_{variant_slug}_{feature_suffix}"
                 ].append(
-                    np.concatenate([risk[layer_start:layer_end], ev]).astype(
+                    np.concatenate([risk[layer_start:resolved_layer_end], ev]).astype(
                         np.float32
                     )
                 )
+            if "capped_topmass_085" in selected_risk_modes:
+                ev = ev_by_mode["capped_topmass_085"]
+                for source_tau, variant_slugs in tau_variant_groups.items():
+                    representative_slug = variant_slugs[0]
+                    try:
+                        risk = np.asarray(
+                            row_sweep[representative_slug][scope][capped_risk_key],
+                            dtype=np.float32,
+                        )
+                    except KeyError as exc:
+                        raise KeyError(
+                            f"Missing {scope}/{representative_slug}/"
+                            f"{capped_risk_key} at row {index}; re-extract sweep "
+                            "features with capped support enabled"
+                        ) from exc
+                    if risk.ndim != 1 or not np.all(np.isfinite(risk)):
+                        raise ValueError(
+                            f"Invalid {scope}/tau={source_tau} capped risk at "
+                            f"row {index}"
+                        )
+                    if risk.shape != ev.shape:
+                        raise ValueError(
+                            f"{scope}/tau={source_tau} capped risk/EV shape "
+                            f"mismatch: {risk.shape} != {ev.shape}"
+                        )
+                    for duplicate_slug in variant_slugs[1:]:
+                        duplicate = np.asarray(
+                            row_sweep[duplicate_slug][scope][capped_risk_key],
+                            dtype=np.float32,
+                        )
+                        if not np.array_equal(risk, duplicate):
+                            raise ValueError(
+                                f"Capped sweep risk unexpectedly depends on fixed "
+                                f"Top-K for {scope}/tau={source_tau} at row {index}"
+                            )
+                    if resolved_layer_end is None:
+                        resolved_layer_end = int(risk.size)
+                    elif use_full_risk_curve and risk.size != resolved_layer_end:
+                        raise ValueError(
+                            "Full-layer sweep training requires one consistent "
+                            f"risk dimension, got {resolved_layer_end} and "
+                            f"{risk.size}"
+                        )
+                    if (
+                        layer_start < 0
+                        or resolved_layer_end > risk.size
+                        or resolved_layer_end <= layer_start
+                    ):
+                        raise ValueError(
+                            f"Requested risk slice [{layer_start},"
+                            f"{resolved_layer_end}) outside curve length "
+                            f"{risk.size}"
+                        )
+                    risk_dims.add(int(risk.size))
+                    ev_dims.add(int(ev.size))
+                    tau_label = format(source_tau, ".12g").replace(
+                        "-", "m"
+                    ).replace(".", "p")
+                    values[
+                        f"{scope}_tau{tau_label}_capped_topmass_085_"
+                        f"{feature_suffix}"
+                    ].append(
+                        np.concatenate(
+                            [risk[layer_start:resolved_layer_end], ev]
+                        ).astype(np.float32)
+                    )
         labels.append(int(label))
         image_ids.append(int(row["image_id"]))
         if len(labels) % 2000 == 0:
             print(f"[derive] processed {len(labels)} rows", flush=True)
+    if resolved_layer_end is None:
+        raise ValueError("No binary feature rows were available for sweep training")
     matrices = {
         name: np.stack(items).astype(np.float32, copy=False)
         for name, items in values.items()
@@ -175,11 +471,25 @@ def build_matrices(
         {
             "rows_total": len(rows),
             "rows_binary": len(labels),
+            "feature_method": feature_method,
+            "scopes": list(scope_blocks),
+            "risk_modes": list(selected_risk_modes),
+            "risk_feature_keys": {
+                "fixed_topk": risk_key,
+                "capped_topmass_085": capped_risk_key,
+            },
+            "ev_feature_blocks": {
+                scope: {
+                    "fixed_topk": blocks["ev"],
+                    "capped_topmass_085": blocks["capped_ev"],
+                }
+                for scope, blocks in scope_blocks.items()
+            },
             "risk_curve_dimensions": sorted(risk_dims),
             "ev_curve_dimensions": sorted(ev_dims),
-            "risk_layer_slice": [int(layer_start), int(layer_end)],
-            "risk_layers_inclusive": [int(layer_start), int(layer_end - 1)],
-            "selected_risk_dimension": int(layer_end - layer_start),
+            "risk_layer_slice": [int(layer_start), int(resolved_layer_end)],
+            "risk_layers_inclusive": [int(layer_start), int(resolved_layer_end - 1)],
+            "selected_risk_dimension": int(resolved_layer_end - layer_start),
             "variants": {
                 slug: {"source_tau": tau, "transport_top_k": top_k}
                 for slug, (tau, top_k) in expected_variants.items()
@@ -330,17 +640,23 @@ def write_markdown(path: Path, summary: list[dict], feature_audit: dict, train_a
     risk_start, risk_end = feature_audit["risk_layers_inclusive"]
     selected_risk_dim = int(feature_audit["selected_risk_dimension"])
     ev_dim = int(feature_audit["ev_curve_dimensions"][0])
+    method_label = FEATURE_METHODS[feature_audit["feature_method"]]["label"]
+    scope_label = " / ".join(scope.upper() for scope in feature_audit["scopes"])
     lines = [
-        "# Source tau × transport Top-K sweep (VV / VPEND)",
+        f"# Source tau × transport Top-K sweep ({scope_label})",
         "",
         "## Protocol",
         "",
-        "- Feature: hpre raw-logit Gaussian sqrt-matched-state risk "
+        f"- Feature: {method_label} sqrt-matched-state risk "
         f"layers {risk_start}-{risk_end} + corresponding full-layer EV.",
         f"- Dimension: {selected_risk_dim} risk layers + {ev_dim} EV layers "
         f"= {selected_risk_dim + ev_dim}.",
         "- Grid: YAML `source_tau_values` x `transport_top_k_values`.",
-        "- VV and VPEND are trained independently with identical image splits, seeds, and MLP settings.",
+        f"- Risk modes: {', '.join(feature_audit['risk_modes'])}. Fixed-TopK "
+        "uses the Cartesian grid; capped-topmass replaces fixed Top-K and is "
+        "trained once per source tau.",
+        f"- Scopes {scope_label} are trained independently with identical image "
+        "splits, seeds, and MLP settings.",
         f"- Feature audit: `{json.dumps(feature_audit, ensure_ascii=False)}`",
         f"- Training audit: `{json.dumps(train_audit, ensure_ascii=False)}`",
         "",
@@ -370,18 +686,59 @@ def write_markdown(path: Path, summary: list[dict], feature_audit: dict, train_a
 
 def main() -> None:
     args = parse_args()
-    if args.layer_start < 0 or args.layer_end <= args.layer_start:
-        raise ValueError("Expected 0 <= layer_start < layer_end")
+    if args.layer_start < 0:
+        raise ValueError("Expected layer_start >= 0")
+    if args.layer_end is not None and args.layer_end <= args.layer_start:
+        raise ValueError("Expected layer_end > layer_start")
     output_dir = Path(args.output_dir).resolve()
-    result_dir = output_dir / "results" / args.run_name
-    if result_dir.exists() and any(result_dir.iterdir()):
-        raise FileExistsError(f"Refusing to overwrite non-empty {result_dir}")
-    result_dir.mkdir(parents=True, exist_ok=True)
     config_root = load_config(args.config)
+    if args.if_enabled:
+        methods = configured_training_methods(config_root)
+        if not methods:
+            print(
+                "[sweep] skipped: "
+                "training.source_tau_transport_topk_sweep.enabled=false",
+                flush=True,
+            )
+            return
+        if args.feature_method is not None:
+            raise ValueError(
+                "--feature-method cannot be combined with --if-enabled; "
+                "configure feature_methods in YAML"
+            )
+        if args.risk_modes is not None:
+            raise ValueError(
+                "--risk-modes cannot be combined with --if-enabled; configure "
+                "risk_modes in YAML"
+            )
+        if args.run_name is not None:
+            raise ValueError(
+                "--run-name cannot be combined with --if-enabled because each "
+                "configured method uses its own result directory"
+            )
+        scopes = configured_training_scopes(config_root)
+        risk_modes = configured_training_risk_modes(config_root)
+    else:
+        methods = [args.feature_method or "hpre_raw_logit_gauss"]
+        scopes = ("vv", "vpend")
+        risk_modes = tuple(args.risk_modes or ["fixed_topk"])
+
+    result_dirs = {
+        method: output_dir / "results" / (
+            args.run_name or DEFAULT_RUN_NAMES[method]
+        )
+        for method in methods
+    }
+    for result_dir in result_dirs.values():
+        if result_dir.exists() and any(result_dir.iterdir()):
+            raise FileExistsError(f"Refusing to overwrite non-empty {result_dir}")
+
     torch_cfg = ((config_root.get("training") or {}).get("torch_probe") or {})
     dgst_cfg = ((config_root.get("feature_extraction") or {}).get("dgst_t") or {})
-    tau_values = [float(x) for x in dgst_cfg.get("source_tau_values", [])]
-    top_k_values = [int(x) for x in dgst_cfg.get("transport_top_k_values", [])]
+    tau_values = [float(x) for x in (dgst_cfg.get("source_tau_values") or [])]
+    top_k_values = [
+        int(x) for x in (dgst_cfg.get("transport_top_k_values") or [])
+    ]
     if not tau_values or not top_k_values:
         raise ValueError(
             "YAML must define feature_extraction.dgst_t.source_tau_values "
@@ -400,22 +757,33 @@ def main() -> None:
     validate_strict_82_split(splits)
     print(f"[load] {output_dir / 'features.pkl'}", flush=True)
     rows = load_pkl(str(output_dir / "features.pkl"))
-    matrices, labels, image_ids, feature_audit = build_matrices(
-        rows, expected_variants, args.layer_start, args.layer_end
-    )
-    del rows
-    records, train_audit = train_all(
-        matrices, labels, image_ids, splits, seeds, args.config,
-        args.device, result_dir,
-    )
-    summary = aggregate(records)
-    write_csv(records, result_dir / "per_seed.csv")
-    write_csv(summary, result_dir / "summary.csv")
-    (result_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    write_markdown(result_dir / "summary.md", summary, feature_audit, train_audit)
-    print(f"[done] {result_dir / 'summary.md'}", flush=True)
+    for method in methods:
+        result_dir = result_dirs[method]
+        result_dir.mkdir(parents=True, exist_ok=True)
+        matrices, labels, image_ids, feature_audit = build_matrices(
+            rows,
+            expected_variants,
+            args.layer_start,
+            args.layer_end,
+            method,
+            scopes,
+            risk_modes,
+        )
+        records, train_audit = train_all(
+            matrices, labels, image_ids, splits, seeds, args.config,
+            args.device, result_dir,
+        )
+        summary = aggregate(records)
+        write_csv(records, result_dir / "per_seed.csv")
+        write_csv(summary, result_dir / "summary.csv")
+        (result_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        write_markdown(
+            result_dir / "summary.md", summary, feature_audit, train_audit
+        )
+        print(f"[done] {result_dir / 'summary.md'}", flush=True)
+        del matrices
 
 
 if __name__ == "__main__":

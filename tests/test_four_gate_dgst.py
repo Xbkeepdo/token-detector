@@ -21,6 +21,8 @@ from features.dgst_t import (
     build_compact_four_gate_layer_capture,
     compute_four_gate_dgst_batch_from_captures,
     _cosine_distance_matrix,
+    _capped_topmass_indices,
+    _capped_topmass_union_indices,
     _gaussian_mad_gate,
     _prepare_transport_problem_for_state_cost,
     _solve_transport_problem,
@@ -432,6 +434,170 @@ class FourGateDGSTTests(unittest.TestCase):
                 places=6,
             )
         self.assertGreater(len(set(regions)), 1)
+
+    def test_capped_topmass_four_gate_risk_cosine_and_vpend_serialize(self) -> None:
+        patches = 8
+        layer = self._output_layer()
+        visual = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.9, 0.1],
+                [0.4, 0.8],
+                [0.0, 1.0],
+                [-0.5, 0.7],
+                [-1.0, 0.0],
+                [0.2, -0.8],
+                [0.7, -0.4],
+            ],
+            dtype=torch.float32,
+        )
+        h_prev = torch.cat(
+            (visual, torch.tensor([[0.3, 0.6], [1.0, 0.5]])), dim=0
+        ).unsqueeze(0)
+        o_attn = torch.zeros_like(h_prev)
+        o_ffn = torch.zeros_like(h_prev)
+        o_ffn[0, -1] = torch.tensor([0.2, -0.1])
+        attention = torch.zeros(1, 2, patches + 2, patches + 2)
+        attention[0, 0, -1, : patches + 1] = torch.tensor(
+            [0.30, 0.20, 0.15, 0.10, 0.08, 0.06, 0.05, 0.04, 0.02]
+        )
+        attention[0, 1, -1, : patches + 1] = torch.tensor(
+            [0.10, 0.12, 0.14, 0.16, 0.14, 0.12, 0.10, 0.08, 0.04]
+        )
+        capture = {
+            "h_prev": h_prev,
+            "h_mid": h_prev + o_attn,
+            "o_attn": o_attn,
+            "o_ffn": o_ffn,
+            "attn_weights": attention,
+        }
+        result = compute_four_gate_dgst_batch_from_captures(
+            model=SimpleNamespace(get_output_embeddings=lambda: layer),
+            captures=[capture],
+            visual_start=0,
+            visual_end=patches,
+            prompt_positions=[patches],
+            target_token_ids=[1],
+            prediction_positions=[patches + 1],
+            enabled_methods=["hpre_raw_logit_gauss"],
+            support_modes=["vv", "vpend"],
+            compute_capped_topmass_085=True,
+            capped_topmass_alpha=0.85,
+            capped_topmass_min_k=3,
+            capped_topmass_max_k=5,
+            source_tau_values=[0.05],
+            transport_top_k_values=[2, 4],
+        )[0]
+
+        compact = build_compact_four_gate_layer_capture(
+            output_layer=layer,
+            capture=capture,
+            visual_start=0,
+            visual_end=patches,
+            support_positions=list(range(patches)),
+            target_token_ids=[1],
+            prediction_positions=[patches + 1],
+            enabled_methods=["hpre_raw_logit_gauss"],
+        )
+        gate = _gaussian_mad_gate(
+            compact["hpre_raw_target_logits"][0], epsilon=1e-6
+        )
+        target = compact["attention_support"][0] * gate
+        target = target / target.sum()
+        source = compact["source_dist"][0]
+        region = _capped_topmass_indices(
+            target, 0.85, min_k=3, max_k=5
+        )
+        support = _capped_topmass_union_indices(
+            source, target, 0.85, min_k=3, max_k=5
+        )
+        cosine_map = F.cosine_similarity(
+            compact["prediction_hpre"][0].unsqueeze(0),
+            compact["visual_hpre"],
+            dim=-1,
+        )
+        expected_cosine = cosine_map.index_select(0, region).mean()
+        expected_risk = _solve_transport_problem(
+            _prepare_transport_problem_for_state_cost(
+                source_dist=source,
+                target_dist=target,
+                states=capture["h_prev"][0, :patches],
+                support=support,
+                sqrt_cosine=True,
+            ),
+            "emd",
+        )
+        risk_key = (
+            "dgst_t_hpre_raw_logit_gauss_risk_sqrt_hpre_"
+            "capped_topmass_085_per_layer"
+        )
+        cosine_key = (
+            "dgst_t_hpre_raw_logit_gauss_target_cosine_"
+            "capped_topmass_085_hpre_per_layer"
+        )
+        self.assertAlmostEqual(float(result[risk_key][0]), expected_risk, places=6)
+        self.assertAlmostEqual(
+            float(result[cosine_key][0]), float(expected_cosine), places=6
+        )
+        self.assertIn(
+            "dgst_t_vpend_hpre_raw_logit_gauss_risk_sqrt_hpre_"
+            "capped_topmass_085_per_layer",
+            result,
+        )
+        sweep_source_scores = F.cosine_similarity(
+            capture["o_ffn"][0, patches + 1].unsqueeze(0),
+            capture["h_mid"][0, :patches],
+            dim=-1,
+        )
+        sweep_source = torch.softmax(sweep_source_scores / 0.05, dim=-1)
+        sweep_support = _capped_topmass_union_indices(
+            sweep_source, target, 0.85, min_k=3, max_k=5
+        )
+        expected_sweep_capped_risk = _solve_transport_problem(
+            _prepare_transport_problem_for_state_cost(
+                source_dist=sweep_source,
+                target_dist=target,
+                states=capture["h_prev"][0, :patches],
+                support=sweep_support,
+                sqrt_cosine=True,
+            ),
+            "emd",
+        )
+        sweep = result["dgst_t_hparam_sweep"]
+        for variant_slug in ("tau0p05_topk2", "tau0p05_topk4"):
+            self.assertAlmostEqual(
+                float(sweep[variant_slug]["vv"][risk_key][0]),
+                expected_sweep_capped_risk,
+                places=6,
+            )
+        self.assertTrue(
+            torch.equal(
+                sweep["tau0p05_topk2"]["vv"][risk_key],
+                sweep["tau0p05_topk4"]["vv"][risk_key],
+            )
+        )
+
+        record = _build_four_gate_feature_record(
+            image_id=12,
+            span={"word": "chair", "label": 1},
+            response_index=patches + 1,
+            target_token_id=1,
+            model_out=SimpleNamespace(token_id=1),
+            dgst_t=result,
+        )
+        for feature_set in (
+            "hpre_raw_logit_gauss_risk_sqrt_matched_state_"
+            "capped_topmass_085+hpre_raw_logit_gauss_target_cosine_"
+            "capped_topmass_085",
+            "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state_"
+            "capped_topmass_085+vpend_hpre_raw_logit_gauss_target_cosine_"
+            "capped_topmass_085",
+        ):
+            matrix, labels = build_selected_matrix(
+                [record], parse_feature_set(feature_set)
+            )
+            self.assertEqual(matrix.shape, (1, 2))
+            self.assertEqual(labels.tolist(), [1])
 
     def test_geo_stateupd_lu1_uses_hmid_and_ffn_update_distances(self) -> None:
         layer = self._output_layer()

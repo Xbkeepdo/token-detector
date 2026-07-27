@@ -619,9 +619,17 @@ def _register_four_gate_aliases() -> None:
             f"{method}_risk": (
                 f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
             ),
+            f"{method}_risk_capped_topmass_085": (
+                f"dgst_t_{method}_risk_sqrt_{state_name}_"
+                "capped_topmass_085_per_layer"
+            ),
             f"{method}_target_cosine": (
                 f"dgst_t_{method}_target_cosine_"
                 f"topk{{target_region_top_k}}_{state_name}_per_layer"
+            ),
+            f"{method}_target_cosine_capped_topmass_085": (
+                f"dgst_t_{method}_target_cosine_"
+                f"capped_topmass_085_{state_name}_per_layer"
             ),
             f"{method}_ev": (
                 f"dgst_t_{method}_ev_"
@@ -631,6 +639,10 @@ def _register_four_gate_aliases() -> None:
                 f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
                 f"topk{{target_region_top_k}}_{state_name}_per_layer"
             ),
+            f"{method}_ev_target_dist_mass_x_cosine_capped_topmass_085": (
+                f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
+                f"capped_topmass_085_{state_name}_per_layer"
+            ),
         }
         for block, feature_key in specs.items():
             FEATURE_ALIASES[block] = block
@@ -639,6 +651,10 @@ def _register_four_gate_aliases() -> None:
         cost_risk_specs = {
             f"{method}_risk_sqrt_matched_state": (
                 f"dgst_t_{method}_risk_sqrt_{state_name}_per_layer"
+            ),
+            f"{method}_risk_sqrt_matched_state_capped_topmass_085": (
+                f"dgst_t_{method}_risk_sqrt_{state_name}_"
+                "capped_topmass_085_per_layer"
             ),
             f"{method}_risk_geo_stateupd_lu1": (
                 f"dgst_t_{method}_risk_geo_stateupd_lu1_per_layer"
@@ -652,6 +668,13 @@ def _register_four_gate_aliases() -> None:
             cost_risk_specs[
                 f"{method}_risk_sqrt_stateupd_alpha{alpha_slug}"
             ] = f"dgst_t_{method}_risk_sqrt_stateupd_alpha{alpha_slug}_per_layer"
+            cost_risk_specs[
+                f"{method}_risk_sqrt_stateupd_alpha{alpha_slug}_"
+                "capped_topmass_085"
+            ] = (
+                f"dgst_t_{method}_risk_sqrt_stateupd_alpha{alpha_slug}_"
+                "capped_topmass_085_per_layer"
+            )
         for block, feature_key in cost_risk_specs.items():
             FEATURE_ALIASES[block] = block
             FEATURE_KEYS[block] = feature_key
@@ -673,16 +696,34 @@ def _register_four_gate_aliases() -> None:
                 f"{scoped_method}_risk": (
                     f"dgst_t_{scoped_method}_risk_sqrt_{state_name}_per_layer"
                 ),
+                f"{scoped_method}_risk_capped_topmass_085": (
+                    f"dgst_t_{scoped_method}_risk_sqrt_{state_name}_"
+                    "capped_topmass_085_per_layer"
+                ),
                 f"{scoped_method}_target_cosine": (
                     f"dgst_t_{scoped_method}_target_cosine_"
                     f"topk{{target_region_top_k}}_{state_name}_per_layer"
+                ),
+                f"{scoped_method}_target_cosine_capped_topmass_085": (
+                    f"dgst_t_{scoped_method}_target_cosine_"
+                    f"capped_topmass_085_{state_name}_per_layer"
                 ),
                 f"{scoped_method}_ev_target_dist_mass_x_cosine": (
                     f"dgst_t_{scoped_method}_ev_target_dist_mass_x_cosine_"
                     f"topk{{target_region_top_k}}_{state_name}_per_layer"
                 ),
+                f"{scoped_method}_ev_target_dist_mass_x_cosine_"
+                "capped_topmass_085": (
+                    f"dgst_t_{scoped_method}_ev_target_dist_mass_x_cosine_"
+                    f"capped_topmass_085_{state_name}_per_layer"
+                ),
                 f"{scoped_method}_risk_sqrt_matched_state": (
                     f"dgst_t_{scoped_method}_risk_sqrt_{state_name}_per_layer"
+                ),
+                f"{scoped_method}_risk_sqrt_matched_state_"
+                "capped_topmass_085": (
+                    f"dgst_t_{scoped_method}_risk_sqrt_{state_name}_"
+                    "capped_topmass_085_per_layer"
                 ),
                 f"{scoped_method}_risk_geo_stateupd_lu1": (
                     f"dgst_t_{scoped_method}_risk_geo_stateupd_lu1_per_layer"
@@ -698,6 +739,13 @@ def _register_four_gate_aliases() -> None:
                 ] = (
                     f"dgst_t_{scoped_method}_risk_sqrt_stateupd_"
                     f"alpha{alpha_slug}_per_layer"
+                )
+                specs[
+                    f"{scoped_method}_risk_sqrt_stateupd_alpha{alpha_slug}_"
+                    "capped_topmass_085"
+                ] = (
+                    f"dgst_t_{scoped_method}_risk_sqrt_stateupd_"
+                    f"alpha{alpha_slug}_capped_topmass_085_per_layer"
                 )
             for block, feature_key in specs.items():
                 FEATURE_ALIASES[block] = block

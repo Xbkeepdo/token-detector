@@ -325,6 +325,39 @@ class StageResumeTests(unittest.TestCase):
             self.assertEqual(pending, [])
             self.assertEqual(complete, 2)
 
+    def test_resume_detects_new_all_mention_token_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "features.pkl"
+            save_pkl(
+                [
+                    {
+                        "image_id": 1,
+                        "response_token_idx": 2,
+                        "token_str": "person",
+                        "label": 1,
+                    }
+                ],
+                str(output),
+            )
+            labeling = {
+                1: {
+                    "object_token_spans": [
+                        {"word": "person", "token_indices": [2], "label": 1},
+                        {"word": "person", "token_indices": [7], "label": 1},
+                    ]
+                }
+            }
+            pending, complete = _pending_samples_for_resume(
+                samples=[{"image_id": 1}],
+                labeling_results=labeling,
+                root_output_path=str(output),
+                root_part_paths=[],
+            )
+            self.assertEqual(complete, 0)
+            self.assertEqual([row["image_id"] for row in pending], [1])
+            self.assertTrue(pending[0]["_feature_families_needed"]["root"])
+
     def test_official_svar_resume_only_requires_images_with_found_samples(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

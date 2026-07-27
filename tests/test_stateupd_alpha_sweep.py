@@ -216,18 +216,29 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
                 "hpre_raw_logit_gauss_risk_sqrt_matched_state",
                 "hpre_raw_logit_gauss_risk_sqrt_matched_state+"
                 "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
+                "hpre_raw_logit_gauss_risk_sqrt_matched_state_"
+                "capped_topmass_085+hpre_raw_logit_gauss_target_cosine_"
+                "capped_topmass_085",
                 "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
                 "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state",
                 "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state+"
                 "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
+                "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state_"
+                "capped_topmass_085+vpend_hpre_raw_logit_gauss_target_cosine_"
+                "capped_topmass_085",
                 "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine",
                 "hpre_softmax_prob_gauss_risk",
                 "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
                 "hpre_softmax_prob_gauss_risk+"
                 "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
+                "hpre_softmax_prob_gauss_risk_capped_topmass_085+"
+                "hpre_softmax_prob_gauss_target_cosine_capped_topmass_085",
                 "vpend_hpre_softmax_prob_gauss_risk",
                 "vpend_hpre_softmax_prob_gauss_risk+"
                 "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine",
+                "vpend_hpre_softmax_prob_gauss_risk_capped_topmass_085+"
+                "vpend_hpre_softmax_prob_gauss_target_cosine_"
+                "capped_topmass_085",
             ],
         }
         cases = {
@@ -273,6 +284,10 @@ class StateUpdateAlphaSweepTests(unittest.TestCase):
             self.assertEqual(dgst["cost_mode"], "sqrt_matched_state")
             self.assertEqual(dgst["cost_modes"], expected["cost_modes"])
             self.assertFalse(dgst["compute_ffn_injection_features"])
+            self.assertTrue(dgst["compute_capped_topmass_085"])
+            self.assertEqual(float(dgst["capped_topmass_085_alpha"]), 0.85)
+            self.assertEqual(int(dgst["capped_topmass_085_min_k"]), 32)
+            self.assertEqual(int(dgst["capped_topmass_085_max_k"]), 64)
             self.assertTrue(dgst["compute_prompt_cafe"])
             self.assertEqual(float(dgst["prompt_cafe_temperature"]), 10.0)
             self.assertEqual(int(dgst["prompt_cafe_layer"]), 22)

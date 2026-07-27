@@ -475,6 +475,43 @@ class CocoTokenAlignmentTests(unittest.TestCase):
         self.assertEqual(summary["hallucinated_mentions"], 1)
         self.assertAlmostEqual(summary["chair_i"], 1 / 3)
 
+        all_mentions_entry = self.label_coco._compact_label_entry(
+            image_id=7,
+            caption=caption,
+            spans=spans,
+            chair_info=chair_info,
+            official_svar_samples=official,
+            sample_unit="all_mentions",
+        )
+        self.assertEqual(
+            all_mentions_entry["labeling_protocol"]["sample_unit"],
+            "all_mentions",
+        )
+        self.assertEqual(len(all_mentions_entry["object_token_spans"]), 3)
+
+    def test_disabled_generation_manifest_is_not_written(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            manifest = self.label_coco._validate_or_initialize_generation_run_manifest(
+                output_dir=output,
+                model_key="test_model",
+                model_cfg={"hf_name": "test/model", "max_new_tokens": 8},
+                prompt="Describe this image.",
+                generations={
+                    "1": {
+                        "generated_text": "a dog",
+                        "response_token_ids": [1, 2],
+                    }
+                },
+                generation_shard_dir=output / "generation_shards",
+                expected_image_ids={1},
+                fresh_start=False,
+                adopt_legacy=False,
+                validate_manifest=False,
+            )
+            self.assertEqual(manifest["status"], "complete")
+            self.assertFalse((output / "generation_manifest.json").exists())
+
     def test_skip_keeps_full_mentions_but_never_substitutes_second_mention(self) -> None:
         spans = [
             {

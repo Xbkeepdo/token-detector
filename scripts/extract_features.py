@@ -82,9 +82,11 @@ def main():
         get_dgst_t_cfg,
         get_extraction_model_cfg,
         load_config,
+        manifest_validation_enabled,
     )
 
     config = load_config(args.config)
+    validate_manifests = manifest_validation_enabled(config)
     extraction_mode = _resolve_extraction_mode(config, args.extraction_mode)
     if extraction_mode == "baseline_only":
         baseline_config = (config.get("feature_extraction") or {}).get(
@@ -233,6 +235,7 @@ def main():
         artifact_paths=root_artifacts,
         resume=args.resume,
         adopt_legacy=bool((config.get("run") or {}).get("adopt_legacy_artifacts")),
+        enabled=validate_manifests,
     )
 
     baseline_output_path = None
@@ -266,6 +269,7 @@ def main():
                 adopt_legacy=bool(
                     (config.get("run") or {}).get("adopt_legacy_artifacts")
                 ),
+                enabled=validate_manifests,
             )
         if _official_svar_enabled(effective_baseline_config):
             official_dir = os.path.join(baseline_dir, "svar_official")
@@ -299,6 +303,7 @@ def main():
                 adopt_legacy=bool(
                     (config.get("run") or {}).get("adopt_legacy_artifacts")
                 ),
+                enabled=validate_manifests,
             )
     if args.resume:
         root_part_paths = sorted(
@@ -375,6 +380,7 @@ def main():
         )
         pending_samples, complete_count = _pending_samples_for_resume(
             samples=samples,
+            labeling_results=labeling_results,
             root_output_path=output_path,
             root_part_paths=root_part_paths,
             baseline_output_path=baseline_output_path,
@@ -766,9 +772,57 @@ def _done_image_ids(output_path: str, part_paths: list[str]) -> set[int]:
     return done
 
 
+def _controlled_keys_by_image(
+    output_path: str,
+    part_paths: list[str],
+) -> dict[int, set[tuple[int, str, int]]]:
+    """Collect exact controlled-token keys already present per image."""
+
+    keys: dict[int, set[tuple[int, str, int]]] = {}
+    for path in [output_path, *part_paths]:
+        if not os.path.exists(path):
+            continue
+        for feat in load_pkl(path):
+            if "image_id" not in feat:
+                continue
+            image_id = int(feat["image_id"])
+            keys.setdefault(image_id, set()).add(
+                (
+                    int(feat.get("response_token_idx", -1)),
+                    str(feat.get("token_str") or ""),
+                    int(feat.get("label", -100)),
+                )
+            )
+    return keys
+
+
+def _expected_controlled_keys(
+    label_info: Mapping[str, Any],
+) -> set[tuple[int, str, int]]:
+    expected: set[tuple[int, str, int]] = set()
+    for span in label_info.get("object_token_spans") or []:
+        indices = span.get("token_indices") or []
+        if not indices:
+            continue
+        expected.add(
+            (
+                int(indices[0]),
+                str(
+                    span.get("word")
+                    or span.get("canonical_object")
+                    or span.get("surface")
+                    or ""
+                ),
+                int(span.get("label", -100)),
+            )
+        )
+    return expected
+
+
 def _pending_samples_for_resume(
     *,
     samples: list[dict],
+    labeling_results: Optional[Mapping[int, Mapping[str, Any]]] = None,
     root_output_path: str,
     root_part_paths: list[str],
     baseline_output_path: Optional[str] = None,
@@ -786,10 +840,19 @@ def _pending_samples_for_resume(
     """
 
     root_done = _done_image_ids(root_output_path, root_part_paths)
+    root_keys = _controlled_keys_by_image(root_output_path, root_part_paths)
     controlled_done = (
         _done_image_ids(baseline_output_path, baseline_part_paths or [])
         if baseline_output_path is not None
         else set()
+    )
+    controlled_keys = (
+        _controlled_keys_by_image(
+            baseline_output_path,
+            baseline_part_paths or [],
+        )
+        if baseline_output_path is not None
+        else {}
     )
     official_done = (
         _done_image_ids(
@@ -805,6 +868,19 @@ def _pending_samples_for_resume(
     complete_count = 0
     for sample in samples:
         image_id = int(sample["image_id"])
+        expected_controlled = (
+            _expected_controlled_keys(labeling_results[image_id])
+            if labeling_results is not None
+            else None
+        )
+        root_is_complete = image_id in root_done and (
+            expected_controlled is None
+            or root_keys.get(image_id, set()) == expected_controlled
+        )
+        controlled_is_complete = image_id in controlled_done and (
+            expected_controlled is None
+            or controlled_keys.get(image_id, set()) == expected_controlled
+        )
         official_is_required = bool(
             baseline_official_output_path is not None
             and (
@@ -813,10 +889,10 @@ def _pending_samples_for_resume(
             )
         )
         needed = {
-            "root": image_id not in root_done,
+            "root": not root_is_complete,
             "controlled": bool(
                 baseline_output_path is not None
-                and image_id not in controlled_done
+                and not controlled_is_complete
             ),
             "official": bool(
                 official_is_required and image_id not in official_done
@@ -963,12 +1039,16 @@ def _feature_key(feat: dict) -> tuple:
 def _prepare_baseline_only_provenance(args, config: dict) -> None:
     """Protect the delegated standalone baseline extractor with provenance."""
 
-    from utils.config_utils import get_extraction_model_cfg
+    from utils.config_utils import (
+        get_extraction_model_cfg,
+        manifest_validation_enabled,
+    )
 
     model_cfg = get_extraction_model_cfg(config, args.model)
     if args.max_pixels is not None:
         model_cfg["max_pixels"] = int(args.max_pixels)
     baseline_cfg = _combined_baseline_config(config)
+    validate_manifests = manifest_validation_enabled(config)
     baseline_subdir = str(baseline_cfg.get("output_subdir", "baseline"))
     baseline_dir = os.path.join(args.output_dir, baseline_subdir)
     output_path = os.path.join(baseline_dir, "features.pkl")
@@ -1005,6 +1085,7 @@ def _prepare_baseline_only_provenance(args, config: dict) -> None:
             adopt_legacy=bool(
                 (config.get("run") or {}).get("adopt_legacy_artifacts")
             ),
+            enabled=validate_manifests,
         )
     if _official_svar_enabled(baseline_cfg):
         official_dir = os.path.join(baseline_dir, "svar_official")
@@ -1030,6 +1111,7 @@ def _prepare_baseline_only_provenance(args, config: dict) -> None:
             adopt_legacy=bool(
                 (config.get("run") or {}).get("adopt_legacy_artifacts")
             ),
+            enabled=validate_manifests,
         )
 
 
@@ -1064,10 +1146,11 @@ def _feature_provenance(
             "Refusing feature extraction from a non-exact token locator "
             f"({locator!r}); expected 'exact_response_offsets'."
         )
-    if str(sample_unit) != "first_canonical_mention":
+    if str(sample_unit) not in {"first_canonical_mention", "all_mentions"}:
         raise RuntimeError(
             "Refusing feature extraction from an incompatible sample unit "
-            f"({sample_unit!r}); expected 'first_canonical_mention'."
+            f"({sample_unit!r}); expected 'first_canonical_mention' or "
+            "'all_mentions'."
         )
     if not isinstance(labeling_payload, Mapping) or any(
         not isinstance(row, Mapping) or int(row.get("schema_version", -1)) != 2
@@ -1164,7 +1247,10 @@ def _validate_or_write_feature_manifest(
     artifact_paths: list[str],
     resume: bool,
     adopt_legacy: bool,
+    enabled: bool = True,
 ) -> None:
+    if not enabled:
+        return
     path = Path(manifest_path)
     retained = any(Path(value).exists() for value in artifact_paths)
     if retained and not resume:

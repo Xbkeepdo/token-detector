@@ -103,6 +103,7 @@ def main() -> None:
         get_labeling_cfg,
         get_model_cfg,
         load_config,
+        manifest_validation_enabled,
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -110,6 +111,7 @@ def main() -> None:
     config = load_config(args.config)
     model_cfg = get_model_cfg(config, args.model)
     labeling_cfg = get_labeling_cfg(config)
+    validate_manifests = manifest_validation_enabled(config)
     adopt_legacy_generation = _legacy_generation_adoption_enabled(config)
     if args.max_pixels is not None:
         if args.max_pixels <= 0:
@@ -148,6 +150,7 @@ def main() -> None:
             prompt=prompt,
             resume=bool(args.resume),
             adopt_legacy=adopt_legacy_generation,
+            validate_manifest=validate_manifests,
         )
 
     if args.caption_file:
@@ -201,6 +204,7 @@ def main() -> None:
         expected_image_ids=expected_generation_ids,
         fresh_start=not load_existing_generations,
         adopt_legacy=adopt_legacy_generation,
+        validate_manifest=validate_manifests,
     )
     if args.resume:
         _merge_generation_shards(generations, generation_shard_dir)
@@ -213,6 +217,7 @@ def main() -> None:
             generations=generations,
             expected_image_ids=expected_generation_ids,
             adopt_legacy=adopt_legacy_generation,
+            validate_manifest=validate_manifests,
         )
     expected_labeling_manifest = _expected_labeling_manifest(
         samples=selected_samples,
@@ -221,7 +226,7 @@ def main() -> None:
         labeling_cfg=labeling_cfg,
         generation_manifest=generation_manifest,
     )
-    if can_resume_labels and existing_labeling:
+    if validate_manifests and can_resume_labels and existing_labeling:
         _validate_existing_labeling_for_resume(
             labeling=existing_labeling,
             manifest_path=labeling_manifest_path,
@@ -237,7 +242,11 @@ def main() -> None:
         generations_path=generations_path,
         summary_path=os.path.join(args.output_dir, "chair_summary.json"),
         manifest_path=labeling_manifest_path,
-        expected_manifest=expected_labeling_manifest,
+        expected_manifest=(
+            expected_labeling_manifest if validate_manifests else None
+        ),
+        expected_sample_unit=str(labeling_cfg["sample_unit"]),
+        validate_manifest=validate_manifests,
         ground_truth_path=ground_truth_path,
         adopt_legacy_ground_truth=adopt_legacy_generation,
         persist_generations=True,
@@ -306,6 +315,7 @@ def main() -> None:
             spans=spans,
             chair_info=chair_info,
             official_svar_samples=official_svar_samples,
+            sample_unit=str(labeling_cfg["sample_unit"]),
         )
 
     save_json(generations, generations_path)
@@ -318,10 +328,11 @@ def main() -> None:
             int(sample["image_id"]) for sample in selected_samples
         },
     )
-    save_json(
-        generation_manifest,
-        os.path.join(args.output_dir, GENERATION_MANIFEST_NAME),
-    )
+    if validate_manifests:
+        save_json(
+            generation_manifest,
+            os.path.join(args.output_dir, GENERATION_MANIFEST_NAME),
+        )
     save_json(labeling, labeling_path)
     save_json(chair_summary(labeling), os.path.join(args.output_dir, "chair_summary.json"))
     completed_manifest = _expected_labeling_manifest(
@@ -340,7 +351,8 @@ def main() -> None:
     )
     # This manifest is the completion marker and must land only after every
     # labeling-side artifact has been written and validated.
-    save_json(completed_manifest, labeling_manifest_path)
+    if validate_manifests:
+        save_json(completed_manifest, labeling_manifest_path)
     print(f"[COCO-CHAIR] Saved {len(labeling)} labels to {labeling_path}")
 
 
@@ -572,11 +584,12 @@ def _validate_or_initialize_generation_run_manifest(
     expected_image_ids: set[int],
     fresh_start: bool,
     adopt_legacy: bool,
+    validate_manifest: bool = True,
 ) -> dict[str, object]:
     """Bind partial generations/shards to one model, prompt, and cohort."""
 
     path = output_dir / GENERATION_MANIFEST_NAME
-    if path.is_symlink():
+    if validate_manifest and path.is_symlink():
         raise ValueError(f"Refusing a symlinked generation manifest: {path}")
     expected = build_generation_run_manifest(
         model=model_key,
@@ -584,6 +597,19 @@ def _validate_or_initialize_generation_run_manifest(
         prompt=prompt,
         expected_image_ids=expected_image_ids,
     )
+    if not validate_manifest:
+        current = (
+            build_generation_manifest(
+                model=model_key,
+                model_cfg=model_cfg,
+                prompt=prompt,
+                generations=generations,
+                expected_image_ids=expected_image_ids,
+            )
+            if _generation_mapping_complete(generations, expected_image_ids)
+            else expected
+        )
+        return current
     if fresh_start:
         save_json(expected, str(path))
         return expected
@@ -661,10 +687,20 @@ def _validate_or_adopt_generation_manifest(
     generations: Mapping[str, Any],
     expected_image_ids: set[int],
     adopt_legacy: bool,
+    validate_manifest: bool = True,
 ) -> dict[str, object]:
     path = output_dir / GENERATION_MANIFEST_NAME
-    if path.is_symlink():
+    if validate_manifest and path.is_symlink():
         raise ValueError(f"Refusing a symlinked generation manifest: {path}")
+    if not validate_manifest:
+        manifest = build_generation_manifest(
+            model=model_key,
+            model_cfg=model_cfg,
+            prompt=prompt,
+            generations=generations,
+            expected_image_ids=expected_image_ids,
+        )
+        return manifest
     if path.exists():
         manifest = load_json(str(path))
         validate_generation_identity(
@@ -721,6 +757,7 @@ def _reuse_generation_artifacts(
     prompt: str,
     resume: bool = False,
     adopt_legacy: bool = False,
+    validate_manifest: bool = True,
 ) -> None:
     """Safely copy immutable generation inputs into a new experiment output."""
 
@@ -743,7 +780,7 @@ def _reuse_generation_artifacts(
         source_payload, expected_image_ids, source_generations
     )
     source_manifest_path = source / GENERATION_MANIFEST_NAME
-    if source_manifest_path.is_file():
+    if source_manifest_path.is_file() and validate_manifest:
         source_manifest = load_json(str(source_manifest_path))
         validate_generation_manifest(
             source_manifest,
@@ -761,11 +798,12 @@ def _reuse_generation_artifacts(
             generations=source_payload,
             expected_image_ids=expected_image_ids,
         )
-        print(
-            "[COCO-CHAIR] Reusable generations have no manifest; their "
-            "content and image cohort were validated and a manifest will be "
-            "created automatically in the new output."
-        )
+        if not source_manifest_path.is_file():
+            print(
+                "[COCO-CHAIR] Reusable generations have no manifest; their "
+                "content and image cohort were validated and a manifest will be "
+                "created automatically in the new output."
+            )
 
     target_generations = target / "generations.json"
     if target_generations.is_symlink():
@@ -793,11 +831,11 @@ def _reuse_generation_artifacts(
         )
 
     target_manifest_path = target / GENERATION_MANIFEST_NAME
-    if target_manifest_path.is_symlink():
+    if validate_manifest and target_manifest_path.is_symlink():
         raise ValueError(
             f"Refusing a symlinked generation manifest: {target_manifest_path}"
         )
-    if target_manifest_path.exists():
+    if target_manifest_path.exists() and validate_manifest:
         target_manifest = load_json(str(target_manifest_path))
         validate_generation_manifest(
             target_manifest,
@@ -807,9 +845,8 @@ def _reuse_generation_artifacts(
             generations=source_payload,
             expected_image_ids=expected_image_ids,
         )
-    else:
-        target_manifest = dict(source_manifest)
-        save_json(target_manifest, str(target_manifest_path))
+    elif validate_manifest:
+        save_json(dict(source_manifest), str(target_manifest_path))
 
     source_splits = source / "image_splits.json"
     target_splits = target / "image_splits.json"
@@ -956,6 +993,7 @@ def _all_labeling_available(
     labeling: dict,
     *,
     expected_manifest: dict | None = None,
+    expected_sample_unit: str | None = None,
 ) -> bool:
     """Return whether resume can safely skip the entire labeling stage."""
     expected_ids = {str(int(sample["image_id"])) for sample in samples}
@@ -1008,6 +1046,12 @@ def _all_labeling_available(
             return False
         if not isinstance(label.get("real_words"), list):
             return False
+        if expected_sample_unit is not None:
+            protocol = label.get("labeling_protocol") or {}
+            if not isinstance(protocol, Mapping) or str(
+                protocol.get("sample_unit", "")
+            ) != str(expected_sample_unit):
+                return False
         if expected_manifest is not None:
             if int(label.get("schema_version", -1)) != int(
                 expected_manifest["label_schema_version"]
@@ -1032,16 +1076,19 @@ def _reuse_complete_labeling(
     ground_truth_path: str | None = None,
     adopt_legacy_ground_truth: bool = False,
     persist_generations: bool = False,
+    expected_sample_unit: str | None = None,
+    validate_manifest: bool = True,
 ) -> bool:
     if not _all_labeling_available(
         samples,
         generations,
         labeling,
         expected_manifest=expected_manifest,
+        expected_sample_unit=expected_sample_unit,
     ):
         return False
     actual_manifest = None
-    if expected_manifest is not None:
+    if validate_manifest and expected_manifest is not None:
         if not manifest_path or not os.path.exists(manifest_path):
             return False
         actual_manifest = load_json(manifest_path)
@@ -1064,7 +1111,7 @@ def _reuse_complete_labeling(
             if isinstance(actual_manifest, Mapping)
             else None
         )
-        if saved_ground_truth_sha256 is None:
+        if saved_ground_truth_sha256 is None and validate_manifest:
             if not adopt_legacy_ground_truth or actual_manifest is None or manifest_path is None:
                 return False
             actual_manifest = dict(actual_manifest)
@@ -1622,6 +1669,7 @@ def _compact_label_entry(
     spans: list[dict],
     chair_info: dict,
     official_svar_samples: list[dict] | None = None,
+    sample_unit: str = "first_canonical_mention",
 ) -> dict:
     all_object_spans = [
         {
@@ -1646,11 +1694,16 @@ def _compact_label_entry(
         for span in spans
         if int(span.get("label", -100)) in (LABEL_HALLUCINATED, LABEL_REAL)
     ]
-    object_spans = _first_canonical_mentions(all_object_spans)
+    if sample_unit == "first_canonical_mention":
+        object_spans = _first_canonical_mentions(all_object_spans)
+    elif sample_unit == "all_mentions":
+        object_spans = list(all_object_spans)
+    else:
+        raise ValueError(f"Unsupported labeling sample_unit: {sample_unit!r}")
     return {
         "schema_version": LABELING_SCHEMA_VERSION,
         "labeling_protocol": {
-            "sample_unit": "first_canonical_mention",
+            "sample_unit": sample_unit,
             "primary_locator": "exact_response_offsets",
         },
         "image_id": int(image_id),

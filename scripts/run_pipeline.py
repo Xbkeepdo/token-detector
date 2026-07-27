@@ -25,6 +25,7 @@ from utils.config_utils import (  # noqa: E402
     extraction_mode_flags,
     get_model_cfg,
     load_config,
+    manifest_validation_enabled,
     resolve_dgst_four_gate_methods,
     resolve_run_config,
 )
@@ -120,6 +121,7 @@ def main() -> None:
                 expected_image_ids=expected_image_ids,
                 resume=bool(run.get("resume")),
                 adopt_legacy=bool(run.get("adopt_legacy_artifacts", False)),
+                write_manifest=manifest_validation_enabled(config),
             )
             run["reuse_generations_from"] = str(source.resolve())
         if not bool(run.get("resume")):
@@ -696,11 +698,14 @@ def _require_complete_generations(
         generations=generations,
         expected_image_ids=image_ids,
     )
-    _atomic_write_json(manifest_path, manifest)
-    print(
-        f"[Pipeline] Complete generations.json validated; wrote "
-        f"{GENERATION_MANIFEST_NAME} automatically."
-    )
+    if manifest_validation_enabled(config):
+        _atomic_write_json(manifest_path, manifest)
+        print(
+            f"[Pipeline] Complete generations.json validated; wrote "
+            f"{GENERATION_MANIFEST_NAME} automatically."
+        )
+    else:
+        print("[Pipeline] Complete generations.json validated (manifest disabled).")
     return manifest
 
 
@@ -1165,6 +1170,7 @@ def _reuse_generation_artifacts(
     expected_image_ids: Sequence[int],
     resume: bool = False,
     adopt_legacy: bool = False,
+    write_manifest: bool = True,
 ) -> None:
     """Copy only generation artifacts after validating their full identity."""
 
@@ -1222,8 +1228,9 @@ def _reuse_generation_artifacts(
     else:
         _copy_reused_artifact(source_generations_path, target_generations_path)
 
-    target_manifest_path = destination / GENERATION_MANIFEST_NAME
-    _atomic_write_json(target_manifest_path, dict(source_manifest))
+    if write_manifest:
+        target_manifest_path = destination / GENERATION_MANIFEST_NAME
+        _atomic_write_json(target_manifest_path, dict(source_manifest))
 
     source_split_path = source / "image_splits.json"
     copied_split = False

@@ -47,7 +47,11 @@ from features.qa_baseline import (  # noqa: E402
 )
 from features.qa_extractor import qa_prompt  # noqa: E402
 from models import build_model  # noqa: E402
-from utils.config_utils import get_model_cfg, load_config  # noqa: E402
+from utils.config_utils import (  # noqa: E402
+    get_model_cfg,
+    load_config,
+    manifest_validation_enabled,
+)
 from utils.generation_provenance import stable_sha256  # noqa: E402
 from utils.qa_paths import resolve_qa_output_name, resolve_qa_paths  # noqa: E402
 
@@ -242,6 +246,7 @@ def main() -> None:
     args = parse_args()
     feature_devices = _normalize_devices(args.feature_devices, args.device)
     config = load_config(args.config)
+    validate_manifests = manifest_validation_enabled(config)
     model_cfg = get_model_cfg(config, args.model)
     label_protocol = normalize_qa_label_protocol(args.label_protocol)
     qa_cfg = config.get("qa_benchmarks") or {}
@@ -316,6 +321,7 @@ def main() -> None:
         expected_manifest,
         baseline_dir=baseline_dir,
         resume=bool(args.resume),
+        enabled=validate_manifests,
     )
 
     if (
@@ -415,7 +421,8 @@ def main() -> None:
         "question_counts": split_manifest["question_counts"],
         "image_counts": split_manifest["image_counts"],
     }
-    atomic_write_json(manifest_path, completed)
+    if validate_manifests:
+        atomic_write_json(manifest_path, completed)
     print(
         f"[extract_qa_baselines] Complete: {args.model}/{args.dataset}/"
         f"{label_protocol}; records={len(records)}, methods={list(methods)}, "
@@ -531,6 +538,7 @@ def _validate_or_initialize_manifest(
     *,
     baseline_dir: Path,
     resume: bool,
+    enabled: bool = True,
 ) -> None:
     artifacts_exist = any(
         (
@@ -540,7 +548,7 @@ def _validate_or_initialize_manifest(
             (baseline_dir / "halloc").exists(),
         )
     )
-    if path.exists():
+    if enabled and path.exists():
         import json
 
         with path.open(encoding="utf-8") as handle:
@@ -554,7 +562,7 @@ def _validate_or_initialize_manifest(
             raise RuntimeError(
                 f"QA baseline resume provenance mismatch: {mismatches}"
             )
-    elif artifacts_exist:
+    elif enabled and artifacts_exist:
         raise RuntimeError(
             f"QA baseline artifacts exist without {MANIFEST_NAME}; refusing "
             "unverifiable resume. Use a new baseline directory."
@@ -563,7 +571,8 @@ def _validate_or_initialize_manifest(
         raise FileExistsError(
             f"QA baseline artifacts already exist: {baseline_dir}"
         )
-    atomic_write_json(path, dict(expected))
+    if enabled:
+        atomic_write_json(path, dict(expected))
 
 
 def _validate_halloc_cache_files(

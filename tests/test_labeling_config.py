@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from utils.config_utils import get_labeling_cfg
+from utils.config_utils import get_labeling_cfg, manifest_validation_enabled
 
 
 class LabelingConfigTests(unittest.TestCase):
@@ -26,6 +26,14 @@ class LabelingConfigTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "save_all_mentions must remain true"):
             get_labeling_cfg({"labeling": {"save_all_mentions": False}})
+
+    def test_all_mentions_and_disabled_manifests_are_configurable(self) -> None:
+        config = {
+            "run": {"validate_manifests": False},
+            "labeling": {"sample_unit": "all_mentions"},
+        }
+        self.assertEqual(get_labeling_cfg(config)["sample_unit"], "all_mentions")
+        self.assertFalse(manifest_validation_enabled(config))
 
 
 if __name__ == "__main__":

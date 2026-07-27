@@ -10,7 +10,7 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     exit 2
 fi
 MODEL="${MODEL:-qwen3_vl_8b}"
-OUTPUT="${OUTPUT:-default}"               # qa_benchmarks/<model>/<output>/
+OUTPUT="${OUTPUT:-VPEND}"               # qa_benchmarks/<model>/<output>/
 DATASET="${DATASET:-pope}"                 # pope | clevr_exist_9k | amber_discriminative
 CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"

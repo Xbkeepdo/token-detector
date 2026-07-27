@@ -46,6 +46,7 @@ from scripts.train_baselines import (  # noqa: E402
 )
 from utils.config_utils import (  # noqa: E402
     load_config,
+    manifest_validation_enabled,
     qa_extraction_family_flags,
 )
 from utils.qa_paths import resolve_qa_output_name, resolve_qa_paths  # noqa: E402
@@ -106,6 +107,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    validate_manifests = manifest_validation_enabled(config)
     family_flags = qa_extraction_family_flags(config)
     if not family_flags["baseline"]:
         print(
@@ -135,25 +137,39 @@ def main() -> None:
     feature_path = baseline_dir / "features.pkl"
     manifest_path = baseline_dir / MANIFEST_NAME
     split_path = baseline_dir / SPLIT_MANIFEST_NAME
-    manifest = _load_json_object(manifest_path)
-    if manifest.get("status") != "complete":
+    manifest = (
+        _load_json_object(manifest_path) if manifest_path.is_file() else {}
+    )
+    if validate_manifests and manifest.get("status") != "complete":
         raise RuntimeError(
             f"QA baseline extraction is not complete according to {manifest_path}"
         )
-    if str(manifest.get("model")) != args.model:
+    if validate_manifests and str(manifest.get("model")) != args.model:
         raise RuntimeError("QA baseline manifest belongs to another model")
-    if str(manifest.get("dataset")) != args.dataset:
+    if validate_manifests and str(manifest.get("dataset")) != args.dataset:
         raise RuntimeError("QA baseline manifest belongs to another dataset")
-    if str(manifest.get("protocol")) != QA_BASELINE_PROTOCOL:
+    if (
+        validate_manifests
+        and str(manifest.get("protocol")) != QA_BASELINE_PROTOCOL
+    ):
         raise RuntimeError("Unsupported QA baseline extraction protocol")
-    if str(manifest.get("label_protocol")) != label_protocol:
+    if (
+        validate_manifests
+        and str(manifest.get("label_protocol")) != label_protocol
+    ):
         raise RuntimeError(
             "QA baseline manifest belongs to another label protocol"
         )
-    if sha256_file(feature_path) != manifest.get("features_sha256"):
+    if (
+        validate_manifests
+        and sha256_file(feature_path) != manifest.get("features_sha256")
+    ):
         raise RuntimeError("QA baseline features.pkl hash differs from its manifest")
     labels_path = run_dir / "labels.jsonl"
-    if sha256_file(labels_path) != manifest.get("labels_sha256"):
+    if (
+        validate_manifests
+        and sha256_file(labels_path) != manifest.get("labels_sha256")
+    ):
         raise RuntimeError(
             "QA labels changed after baseline extraction; re-extract baselines"
         )
@@ -162,9 +178,22 @@ def main() -> None:
         records = pickle.load(handle)
     if not isinstance(records, list) or not records:
         raise RuntimeError(f"No QA baseline records found in {feature_path}")
-    if len(records) != int(manifest.get("num_records", -1)):
+    if validate_manifests and len(records) != int(
+        manifest.get("num_records", -1)
+    ):
         raise RuntimeError("QA baseline record count differs from its manifest")
     extracted_methods = normalize_baseline_methods(manifest.get("methods") or ())
+    if not extracted_methods:
+        extracted_methods = normalize_baseline_methods(
+            sorted(
+                set.intersection(
+                    *[
+                        set((record.get("baselines") or {}).keys())
+                        for record in records
+                    ]
+                )
+            )
+        )
     training_cfg = config.get("training") or {}
     baseline_training_cfg = training_cfg.get("baseline") or {}
     if not isinstance(baseline_training_cfg, Mapping):

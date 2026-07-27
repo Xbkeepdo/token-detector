@@ -1,22 +1,23 @@
 # fj01 server-path mirror of model_configs_unified.yaml.
 # Unified COCO caption and POPE/CLEVR/AMBER QA hallucination-detection settings.
 #
-# `run.sh` only selects model/output/devices and invokes the three stages.
+# `run.sh` only selects model/output/devices and invokes the pipeline stages.
 # Prompt, extraction families, DGST branches and training behavior live here.
 # The active compact profile keeps VV as the backward-compatible branch and
-# additionally extracts VPend branches. The active comparison sweeps source tau
-# and transport Top-K while reusing each target gate, cosine and EV calculation.
+# additionally extracts VPend branches. Hyperparameter sweep variants are
+# disabled; extraction uses only the primary tau and transport Top-K below.
 
 run:
   prompt: "Describe this image."
   extraction_mode: "all"                   # all | method_only | ads_cgc_only | baseline_only
+  validate_manifests: false              # Do not read or write provenance manifest sidecars.
 
 experiment:
   mode: "vpend"                         # Visual plus post-image prompt support.
 
 labeling:
   schema_version: 2
-  sample_unit: "first_canonical_mention"   # One training sample per image/canonical COCO object.
+  sample_unit: "all_mentions"              # Keep every object occurrence in the generated caption.
   primary_locator: "exact_response_offsets" # Exact span over the generated response token IDs.
   save_all_mentions: true                  # Preserve occurrence-level CHAIRs/CHAIRi statistics.
   save_svar_official_samples: true         # Also build the paper-code canonical/surface lookup samples.
@@ -207,9 +208,8 @@ feature_extraction:
 
     # Shared transport math for all four gates and both direct controls.
     tau: 0.07
-    # Reuse each decoder forward and compare the Cartesian source-tau x Top-K
-    # sweep. Only risk changes; target gates, cosine, and EV are shared.
-    source_tau_values: [0.02, 0.03, 0.04, 0.05, 0.06]
+    # Optional Cartesian source-tau x Top-K sweep; both null means disabled.
+    source_tau_values: null                 # null disables source-tau / Top-K sweep feature variants.
     # InsLen CAFE: max over prompt positions of the generated object-token
     # probability from hpre Logit Lens. The paper/code use scale=0.1, which is
     # equivalent to softmax(logits / temperature) with temperature=10.
@@ -224,7 +224,14 @@ feature_extraction:
     compute_ffn_injection_features: false
     ffn_injection_eps: 1.0e-12
     transport_top_k: 64
-    transport_top_k_values: [16, 32, 64, 128]
+    transport_top_k_values: null
+    # Adaptive capped-topmass ablation: retain cumulative target/source mass
+    # 0.85, but clamp each side's K to [32,64]. Risk uses the union; target
+    # cosine uses the target-only region.
+    compute_capped_topmass_085: true
+    capped_topmass_085_alpha: 0.85
+    capped_topmass_085_min_k: 32
+    capped_topmass_085_max_k: 64
     # Primary: C_ij = sqrt((1-cos(h_state_i,h_state_j))/2), where h_state is
     # h_prev for hpre methods. The state-update family uses
     # C_alpha=(1-alpha)*d_state+alpha*d_update for alpha=0.1,...,0.9.
@@ -245,8 +252,8 @@ feature_extraction:
     atarget_visual_top_k: 32
     relative_vll_mad_epsilon: 1.0e-6
 
-    # Legacy-probability, barrier-cost, topmass, the other FFN diagnostics,
-    # and Sinkhorn switches intentionally do not appear in the active config.
+    # Legacy-probability, barrier-cost, uncapped topmass, the other FFN
+    # diagnostics, and Sinkhorn switches remain disabled.
 
 dataset:
   coco_root: "/root/rivermind-data/dataset/coco"
@@ -266,6 +273,15 @@ training:
   positive_class: "real"                   # real headline; hallucination metrics are also reported.
   split_protocol: "strict_82_no_validation" # Image-disjoint 80/20; validation is empty.
   threshold_selection: "train_f1"          # Backward-compatible headline; both thresholds are reported.
+  # When enabled, run.sh trains these tau x Top-K variants after the ordinary
+  # method/baseline stage. Risk and matching EV both use every decoder layer.
+  source_tau_transport_topk_sweep:
+    enabled: false
+    feature_methods:
+      - "hpre_raw_logit_gauss"
+      - "hpre_softmax_prob_gauss"
+    # fixed_topk trains tau x Top-K; capped trains one de-duplicated run per tau.
+    risk_modes: ["fixed_topk", "capped_topmass_085"]
   baseline:
     # Training-only selection: this does not change/re-extract baseline/features.pkl.
     # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
@@ -305,6 +321,7 @@ training:
       # VV: fixed sqrt-matched baseline plus alpha=0.1,...,0.9 state/update risks.
       - "hpre_raw_logit_gauss_risk_sqrt_matched_state"
       - "hpre_raw_logit_gauss_risk_sqrt_matched_state+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_raw_logit_gauss_risk_sqrt_matched_state_capped_topmass_085+hpre_raw_logit_gauss_target_cosine_capped_topmass_085"
       - "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01"
       # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
@@ -327,6 +344,7 @@ training:
       # # Legacy VP examples (require support_modes to include "vp").
       - "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state"
       - "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state+vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state_capped_topmass_085+vpend_hpre_raw_logit_gauss_target_cosine_capped_topmass_085"
       - "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
       # - "vpend_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01"
       # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
@@ -350,6 +368,7 @@ training:
       - "hpre_softmax_prob_gauss_risk"
       - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_capped_topmass_085+hpre_softmax_prob_gauss_target_cosine_capped_topmass_085"
       # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01"
       # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha02"
@@ -371,6 +390,7 @@ training:
       - "vpend_hpre_softmax_prob_gauss_risk"
       #- "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       - "vpend_hpre_softmax_prob_gauss_risk+vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "vpend_hpre_softmax_prob_gauss_risk_capped_topmass_085+vpend_hpre_softmax_prob_gauss_target_cosine_capped_topmass_085"
       # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01"
       # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
       # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha02"

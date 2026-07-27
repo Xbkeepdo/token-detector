@@ -69,6 +69,7 @@ from utils.config_utils import (
     get_cgc_cfg,
     get_model_cfg,
     load_config,
+    manifest_validation_enabled,
     qa_extraction_family_flags,
 )
 from utils.qa_paths import resolve_qa_output_name, resolve_qa_paths
@@ -527,6 +528,7 @@ def _prepare_baseline_specs(
     run_dir: Path,
     label_protocols: tuple[str, ...],
     resume: bool,
+    validate_manifests: bool = True,
 ) -> list[dict]:
     """Validate provenance and describe every baseline output transaction."""
 
@@ -584,6 +586,7 @@ def _prepare_baseline_specs(
             "selected_keys": selected_keys,
             "cache_ids": validate_qa_cache_ids(selected_questions),
             "expected_manifest": expected_manifest,
+            "validate_manifests": bool(validate_manifests),
         }
         if not _baseline_spec_complete(spec):
             _validate_or_initialize_manifest(
@@ -591,6 +594,7 @@ def _prepare_baseline_specs(
                 expected_manifest,
                 baseline_dir=baseline_dir,
                 resume=resume,
+                enabled=validate_manifests,
             )
         if (
             resume
@@ -610,9 +614,27 @@ def _baseline_spec_complete(spec: dict) -> bool:
     manifest_path = baseline_dir / QA_BASELINE_MANIFEST_NAME
     feature_path = baseline_dir / "features.pkl"
     split_path = baseline_dir / QA_BASELINE_SPLIT_MANIFEST_NAME
-    if not manifest_path.is_file() or not feature_path.is_file() or not split_path.is_file():
+    if not feature_path.is_file() or not split_path.is_file():
         return False
     try:
+        if not bool(spec.get("validate_manifests", True)):
+            with feature_path.open("rb") as handle:
+                records = pickle.load(handle)
+            if not isinstance(records, list):
+                return False
+            actual_keys = {str(record.get("key")) for record in records}
+            if actual_keys != set(spec["selected_keys"]):
+                return False
+            for record in records:
+                validate_baseline_record(record, required=spec["methods"])
+            with split_path.open(encoding="utf-8") as handle:
+                stored_split = json.load(handle)
+            return stored_split == build_qa_probe_split_manifest(
+                records,
+                label_protocol=spec["label_protocol"],
+            )
+        if not manifest_path.is_file():
+            return False
         with manifest_path.open(encoding="utf-8") as handle:
             manifest = json.load(handle)
         if manifest.get("status") != "complete":
@@ -667,10 +689,11 @@ def _finalize_baseline_spec(spec: dict, shard_size: int) -> None:
         "image_counts": split_manifest["image_counts"],
         "shared_forward": True,
     }
-    atomic_write_json(
-        baseline_dir / QA_BASELINE_MANIFEST_NAME,
-        completed,
-    )
+    if bool(spec.get("validate_manifests", True)):
+        atomic_write_json(
+            baseline_dir / QA_BASELINE_MANIFEST_NAME,
+            completed,
+        )
 
 
 def _qa_extraction_config_fingerprint(
@@ -853,6 +876,7 @@ def main():
     generation_devices = _normalize_devices(args.generation_devices, args.device)
     feature_devices = _normalize_devices(args.feature_devices, args.device)
     config = load_config(args.config)
+    validate_manifests = manifest_validation_enabled(config)
     qa_cfg = config.get("qa_benchmarks") or {}
     family_flags = qa_extraction_family_flags(config)
     extraction_mode = str(family_flags["mode"])
@@ -1097,6 +1121,7 @@ def main():
                 run_dir=Path(output_dir),
                 label_protocols=baseline_label_protocols,
                 resume=bool(args.resume),
+                validate_manifests=validate_manifests,
             )
             if baseline_enabled
             else []

@@ -5,9 +5,9 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-MODEL="${MODEL:-llava_1_5_7b}"  # llava_1_5_7b
-OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO4000-512-TC}"
-CONFIG="${CONFIG:-configs/model_configs_server_fj01.yaml}"
+MODEL="${MODEL:-llava_1_5_7b}"  # llava_1_5_7b  qwen3_vl_8b
+OUTPUT="${OUTPUT:-outputs/${MODEL}/COCO-4000-ALLMENTION-SWEEP}"  # outputs/<model>/<output>/
+CONFIG="${CONFIG:-configs/model_configs_unified.yaml}"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 DEVICE="${DEVICE:-cuda:0}"
@@ -57,3 +57,11 @@ LABEL_ARGS=()
     --config "$CONFIG" \
     --output-dir "$OUTPUT" \
     --device "$DEVICE"
+
+# Step 4: Optionally train every YAML-configured source-tau x Top-K sweep.
+# The Python entrypoint exits immediately when the YAML switch is disabled.
+"$PYTHON_BIN" scripts/train_source_tau_transport_topk_sweep.py \
+    --output-dir "$OUTPUT" \
+    --config "$CONFIG" \
+    --device "$DEVICE" \
+    --if-enabled

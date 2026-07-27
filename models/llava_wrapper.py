@@ -1,7 +1,6 @@
 """LLaVA-1.5 wrapper for generation and feature extraction."""
 
 from __future__ import annotations
-from dataclasses import replace
 from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
@@ -341,6 +340,18 @@ class LLaVAWrapper(BaseLVLMWrapper):
                     transport_top_k_values=cfg_dgst_t.get(
                         "transport_top_k_values"
                     ),
+                    compute_capped_topmass_085=bool(
+                        cfg_dgst_t.get("compute_capped_topmass_085", False)
+                    ),
+                    capped_topmass_alpha=float(
+                        cfg_dgst_t.get("capped_topmass_085_alpha", 0.85)
+                    ),
+                    capped_topmass_min_k=int(
+                        cfg_dgst_t.get("capped_topmass_085_min_k", 32)
+                    ),
+                    capped_topmass_max_k=int(
+                        cfg_dgst_t.get("capped_topmass_085_max_k", 64)
+                    ),
                     compute_prompt_cafe=bool(
                         cfg_dgst_t.get("compute_prompt_cafe", False)
                     ),
@@ -406,55 +417,18 @@ class LLaVAWrapper(BaseLVLMWrapper):
         prompt: Optional[str] = None,
         requirements: Optional[ExtractionRequirements] = None,
     ) -> List[ModelOutput]:
-        """Run one causal prefix forward for each requested target token."""
-        response_ids, requested_indices, targets = self.validate_causal_batch_request(
+        """Extract every requested causal row in one full-caption forward."""
+        return self._extract_token_features_batch_full_response(
+            image=image,
             response_token_ids=response_token_ids,
             response_token_indices=response_token_indices,
             target_token_ids=target_token_ids,
+            cfg_dgst_t=cfg_dgst_t,
+            prompt=prompt,
+            requirements=requirements,
         )
-        if not requested_indices:
-            return []
 
-        per_prefix_requirements = requirements
-        if requirements is not None and requirements.response_hidden_states:
-            per_prefix_requirements = replace(
-                requirements,
-                response_hidden_states=False,
-            )
-
-        outputs: List[ModelOutput] = []
-        for response_index, target_token_id in zip(requested_indices, targets):
-            outputs.append(
-                self.extract_token_features(
-                    image=image,
-                    prefix_token_ids=response_ids[:response_index],
-                    response_token_idx=int(response_index),
-                    target_token_id=int(target_token_id),
-                    cfg_dgst_t=cfg_dgst_t,
-                    prompt=prompt,
-                    requirements=per_prefix_requirements,
-                )
-            )
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        if requirements is not None and requirements.response_hidden_states:
-            shared_capture = self._extract_full_response_baseline_capture(
-                image=image,
-                response_token_ids=response_ids,
-                prompt=prompt,
-            )
-            for output in outputs:
-                output.response_hidden_states = shared_capture[
-                    "response_hidden_states"
-                ]
-                output.baseline_capture = {
-                    **(output.baseline_capture or {}),
-                    **shared_capture["statistics"],
-                }
-        return outputs
-
-    def _extract_token_features_batch_full_response_legacy(
+    def _extract_token_features_batch_full_response(
         self,
         image: Image.Image,
         response_token_ids: Sequence[int],
@@ -464,7 +438,7 @@ class LLaVAWrapper(BaseLVLMWrapper):
         prompt: Optional[str] = None,
         requirements: Optional[ExtractionRequirements] = None,
     ) -> List[ModelOutput]:
-        """Retained reference implementation; public extraction never calls it."""
+        """Use causal-mask rows from one teacher-forced full response."""
         response_ids, requested_indices, targets = self.validate_causal_batch_request(
             response_token_ids=response_token_ids,
             response_token_indices=response_token_indices,
@@ -669,6 +643,9 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 capped_topmass_max_k=cfg_dgst_t.get("capped_topmass_085_max_k", 64),
                 compute_topmass_085=cfg_dgst_t.get("compute_topmass_085", True),
                 compute_capped_topmass_085=cfg_dgst_t.get("compute_capped_topmass_085", True),
+                four_gate_compute_capped_topmass_085=cfg_dgst_t.get(
+                    "compute_capped_topmass_085", False
+                ),
                 target_gate_mode=cfg_dgst_t.get("target_gate_mode", "legacy_prob"),
                 relative_vll_mad_epsilon=cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6),
                 relative_vll_logit_source=cfg_dgst_t.get("relative_vll_logit_source", "h_mid"),

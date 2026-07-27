@@ -49,7 +49,7 @@ from scripts.train_torch_probe_feature_sets import (
     TorchProbeConfig,
     train_and_evaluate_probe,
 )
-from utils.config_utils import load_config
+from utils.config_utils import get_labeling_cfg, load_config
 from utils.io_utils import load_json, save_json, save_pkl
 from utils.split_utils import validate_strict_82_split
 
@@ -259,7 +259,8 @@ def main() -> None:
             "run_name": args.run_name,
             "result_stem": f"{args.model}_baselines",
             "label_protocol": (
-                "shared_first_canonical_mention_exact_response_offsets"
+                f"shared_{get_labeling_cfg(config)['sample_unit']}_"
+                "exact_response_offsets"
             ),
             "write_summary": write_summary,
             "positive_class": positive_class,
