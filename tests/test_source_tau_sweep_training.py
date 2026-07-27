@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.train_source_tau_transport_topk_sweep import (
     DEFAULT_RUN_NAMES,
     build_matrices,
+    configured_capped_topmass_alphas,
     configured_training_methods,
     configured_training_risk_modes,
     configured_training_scopes,
@@ -86,11 +87,19 @@ class SourceTauSweepTrainingTests(unittest.TestCase):
         config = load_config(
             str(ROOT / "configs" / "model_configs_unified.yaml")
         )
-        self.assertEqual(configured_training_methods(config), [])
+        disabled = copy.deepcopy(config)
+        disabled["training"]["source_tau_transport_topk_sweep"][
+            "enabled"
+        ] = False
+        self.assertEqual(configured_training_methods(disabled), [])
         self.assertEqual(configured_training_scopes(config), ("vv",))
         self.assertEqual(
             configured_training_risk_modes(config),
-            ("fixed_topk", "capped_topmass_085"),
+            ("fixed_topk", "capped_topmass_alpha_sweep"),
+        )
+        self.assertEqual(
+            configured_capped_topmass_alphas(config),
+            (0.7, 0.75, 0.8, 0.85, 0.9),
         )
 
         enabled = copy.deepcopy(config)
@@ -147,6 +156,67 @@ class SourceTauSweepTrainingTests(unittest.TestCase):
             [1, 2, 3, 7, 8, 9],
         )
         self.assertEqual(audit["risk_modes"], ["capped_topmass_085"])
+
+    def test_capped_alpha_sweep_builds_one_matrix_per_tau_and_alpha(self) -> None:
+        variants = {
+            "tau0p1_topk16": (0.1, 16),
+            "tau0p1_topk64": (0.1, 64),
+        }
+        alpha_specs = {
+            "capped_topmass_070": ([1, 2, 3], [7, 8, 9]),
+            "capped_topmass_085": ([4, 5, 6], [10, 11, 12]),
+        }
+        rows = []
+        for image_id, label in ((1, 0), (2, 1)):
+            row = {"image_id": image_id, "label": label}
+            for alpha_slug, (_risk, ev) in alpha_specs.items():
+                row[
+                    "dgst_t_hpre_raw_logit_gauss_ev_target_dist_mass_x_"
+                    f"cosine_{alpha_slug}_hpre_per_layer"
+                ] = ev
+            row["dgst_t_hparam_sweep"] = {
+                variant_slug: {
+                    "source_tau": tau,
+                    "transport_top_k": top_k,
+                    "vv": {
+                        "dgst_t_hpre_raw_logit_gauss_risk_sqrt_hpre_"
+                        f"{alpha_slug}_per_layer": risk
+                        for alpha_slug, (risk, _ev) in alpha_specs.items()
+                    },
+                }
+                for variant_slug, (tau, top_k) in variants.items()
+            }
+            rows.append(row)
+
+        matrices, _labels, _image_ids, audit = build_matrices(
+            rows=rows,
+            expected_variants=variants,
+            layer_start=0,
+            layer_end=None,
+            scopes=("vv",),
+            risk_modes=("capped_topmass_alpha_sweep",),
+            capped_topmass_alphas=(0.7, 0.85),
+        )
+
+        self.assertEqual(
+            list(matrices),
+            [
+                "vv_tau0p1_capped_topmass_070_hpre_risk_plus_ev",
+                "vv_tau0p1_capped_topmass_085_hpre_risk_plus_ev",
+            ],
+        )
+        np.testing.assert_allclose(
+            matrices["vv_tau0p1_capped_topmass_070_hpre_risk_plus_ev"][0],
+            [1, 2, 3, 7, 8, 9],
+        )
+        np.testing.assert_allclose(
+            matrices["vv_tau0p1_capped_topmass_085_hpre_risk_plus_ev"][0],
+            [4, 5, 6, 10, 11, 12],
+        )
+        self.assertEqual(
+            audit["capped_topmass_alpha_by_slug"],
+            {"capped_topmass_070": 0.7, "capped_topmass_085": 0.85},
+        )
 
     def test_run_sh_invokes_sweep_after_main_training(self) -> None:
         text = (ROOT / "run.sh").read_text(encoding="utf-8")

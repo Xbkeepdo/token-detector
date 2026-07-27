@@ -10,10 +10,12 @@ ROOT = Path(__file__).resolve().parents[1]
 GENERIC_SWEEP_KEYS = {
     "four_gate_source_tau_values",
     "four_gate_transport_top_k_values",
+    "four_gate_capped_topmass_alphas",
 }
 DIRECT_SWEEP_KEYS = {
     "source_tau_values",
     "transport_top_k_values",
+    "capped_topmass_alphas",
 }
 
 

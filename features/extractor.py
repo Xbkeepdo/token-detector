@@ -1072,6 +1072,16 @@ def _build_four_gate_feature_record(
     has_capped_topmass = bool(
         dgst_t.get("dgst_t_compute_capped_topmass_085", False)
     )
+    capped_alpha_by_slug = dict(
+        dgst_t.get("dgst_t_capped_topmass_alpha_by_slug") or {}
+    )
+    if has_capped_topmass and not capped_alpha_by_slug:
+        capped_alpha_by_slug = {
+            "capped_topmass_085": float(
+                dgst_t.get("dgst_t_capped_topmass_alpha", 0.85)
+            )
+        }
+    capped_slugs = tuple(capped_alpha_by_slug)
     required_metadata = (
         "dgst_t_profile",
         "dgst_t_mad_axis",
@@ -1134,9 +1144,9 @@ def _build_four_gate_feature_record(
                 risk_suffix = _four_gate_risk_suffix(cost_mode, state_name)
                 method_keys.append(f"dgst_t_{method}_{risk_suffix}_per_layer")
                 if has_capped_topmass:
-                    method_keys.append(
-                        f"dgst_t_{method}_{risk_suffix}_"
-                        "capped_topmass_085_per_layer"
+                    method_keys.extend(
+                        f"dgst_t_{method}_{risk_suffix}_{alpha_slug}_per_layer"
+                        for alpha_slug in capped_slugs
                     )
             method_keys.extend(
                 [
@@ -1147,14 +1157,15 @@ def _build_four_gate_feature_record(
                 ]
             )
             if has_capped_topmass:
-                method_keys.extend(
-                    [
+                for alpha_slug in capped_slugs:
+                    method_keys.extend(
+                        [
                         f"dgst_t_{method}_target_cosine_"
-                        f"capped_topmass_085_{state_name}_per_layer",
+                        f"{alpha_slug}_{state_name}_per_layer",
                         f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
-                        f"capped_topmass_085_{state_name}_per_layer",
-                    ]
-                )
+                        f"{alpha_slug}_{state_name}_per_layer",
+                        ]
+                    )
     vp_method_keys = []
     if has_vp_scope:
         for method in methods:
@@ -1176,9 +1187,9 @@ def _build_four_gate_feature_record(
                     f"dgst_t_vp_{method}_{risk_suffix}_per_layer"
                 )
                 if has_capped_topmass:
-                    vp_method_keys.append(
-                        f"dgst_t_vp_{method}_{risk_suffix}_"
-                        "capped_topmass_085_per_layer"
+                    vp_method_keys.extend(
+                        f"dgst_t_vp_{method}_{risk_suffix}_{alpha_slug}_per_layer"
+                        for alpha_slug in capped_slugs
                     )
             vp_method_keys.extend(
                 [
@@ -1189,14 +1200,15 @@ def _build_four_gate_feature_record(
                 ]
             )
             if has_capped_topmass:
-                vp_method_keys.extend(
-                    [
+                for alpha_slug in capped_slugs:
+                    vp_method_keys.extend(
+                        [
                         f"dgst_t_vp_{method}_target_cosine_"
-                        f"capped_topmass_085_{state_name}_per_layer",
+                        f"{alpha_slug}_{state_name}_per_layer",
                         f"dgst_t_vp_{method}_ev_target_dist_mass_x_cosine_"
-                        f"capped_topmass_085_{state_name}_per_layer",
-                    ]
-                )
+                        f"{alpha_slug}_{state_name}_per_layer",
+                        ]
+                    )
     vp_matrix_keys = (
         (
             "dgst_t_vp_attention_support_per_layer",
@@ -1228,9 +1240,9 @@ def _build_four_gate_feature_record(
                     f"dgst_t_vpend_{method}_{risk_suffix}_per_layer"
                 )
                 if has_capped_topmass:
-                    vpend_method_keys.append(
-                        f"dgst_t_vpend_{method}_{risk_suffix}_"
-                        "capped_topmass_085_per_layer"
+                    vpend_method_keys.extend(
+                        f"dgst_t_vpend_{method}_{risk_suffix}_{alpha_slug}_per_layer"
+                        for alpha_slug in capped_slugs
                     )
             vpend_method_keys.extend(
                 [
@@ -1241,14 +1253,15 @@ def _build_four_gate_feature_record(
                 ]
             )
             if has_capped_topmass:
-                vpend_method_keys.extend(
-                    [
+                for alpha_slug in capped_slugs:
+                    vpend_method_keys.extend(
+                        [
                         f"dgst_t_vpend_{method}_target_cosine_"
-                        f"capped_topmass_085_{state_name}_per_layer",
+                        f"{alpha_slug}_{state_name}_per_layer",
                         f"dgst_t_vpend_{method}_ev_target_dist_mass_x_cosine_"
-                        f"capped_topmass_085_{state_name}_per_layer",
-                    ]
-                )
+                        f"{alpha_slug}_{state_name}_per_layer",
+                        ]
+                    )
     vpend_matrix_keys = (
         (
             "dgst_t_vpend_attention_support_per_layer",
@@ -1296,6 +1309,14 @@ def _build_four_gate_feature_record(
     }
     for key in required_metadata:
         feat[key] = dgst_t[key]
+    if has_capped_topmass:
+        feat["dgst_t_capped_topmass_alphas"] = [
+            float(value) for value in capped_alpha_by_slug.values()
+        ]
+        feat["dgst_t_capped_topmass_alpha_by_slug"] = {
+            str(slug): float(value)
+            for slug, value in capped_alpha_by_slug.items()
+        }
     if has_vv_scope:
         feat["dgst_t_vv_support_size"] = int(dgst_t["dgst_t_vv_support_size"])
         if "dgst_t_vv_support_positions" in dgst_t:
@@ -1380,13 +1401,14 @@ def _build_four_gate_feature_record(
                 key = f"dgst_t_{method}_{risk_suffix}_per_layer"
                 feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
                 if has_capped_topmass:
-                    capped_key = (
-                        f"dgst_t_{method}_{risk_suffix}_"
-                        "capped_topmass_085_per_layer"
-                    )
-                    feat[capped_key] = _compact_numpy(
-                        dgst_t[capped_key], dtype=np.float32
-                    )
+                    for alpha_slug in capped_slugs:
+                        capped_key = (
+                            f"dgst_t_{method}_{risk_suffix}_"
+                            f"{alpha_slug}_per_layer"
+                        )
+                        feat[capped_key] = _compact_numpy(
+                            dgst_t[capped_key], dtype=np.float32
+                        )
             for suffix in (
                 f"target_cosine_{topk_slug}_{state_name}_per_layer",
                 f"ev_target_dist_mass_x_cosine_{topk_slug}_{state_name}_per_layer",
@@ -1394,15 +1416,16 @@ def _build_four_gate_feature_record(
                 key = f"dgst_t_{method}_{suffix}"
                 feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)
             if has_capped_topmass:
-                for suffix in (
-                    f"target_cosine_capped_topmass_085_{state_name}_per_layer",
-                    "ev_target_dist_mass_x_cosine_"
-                    f"capped_topmass_085_{state_name}_per_layer",
-                ):
-                    key = f"dgst_t_{method}_{suffix}"
-                    feat[key] = _compact_numpy(
-                        dgst_t[key], dtype=np.float32
-                    )
+                for alpha_slug in capped_slugs:
+                    for suffix in (
+                        f"target_cosine_{alpha_slug}_{state_name}_per_layer",
+                        "ev_target_dist_mass_x_cosine_"
+                        f"{alpha_slug}_{state_name}_per_layer",
+                    ):
+                        key = f"dgst_t_{method}_{suffix}"
+                        feat[key] = _compact_numpy(
+                            dgst_t[key], dtype=np.float32
+                        )
     if has_vp_scope:
         for key in vp_method_keys:
             feat[key] = _compact_numpy(dgst_t[key], dtype=np.float32)

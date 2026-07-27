@@ -358,6 +358,9 @@ class Qwen3VLWrapper(BaseLVLMWrapper):
                 four_gate_compute_capped_topmass_085=bool(
                     cfg_dgst_t.get("compute_capped_topmass_085", False)
                 ),
+                four_gate_capped_topmass_alphas=cfg_dgst_t.get(
+                    "capped_topmass_alphas"
+                ),
                 target_gate_mode=cfg_dgst_t.get("target_gate_mode", "four_gate"),
                 relative_vll_mad_epsilon=float(cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6)),
                 relative_vll_logit_source=cfg_dgst_t.get("relative_vll_logit_source", "h_mid"),

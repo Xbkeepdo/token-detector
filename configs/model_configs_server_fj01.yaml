@@ -229,6 +229,9 @@ feature_extraction:
     # 0.85, but clamp each side's K to [32,64]. Risk uses the union; target
     # cosine uses the target-only region.
     compute_capped_topmass_085: true
+    # Capped Top-Mass alpha sweep. Alpha 0.85 keeps the historical field names.
+    capped_topmass_alphas: [0.7, 0.75, 0.8, 0.85, 0.9]
+    # Legacy scalar retained for old outputs/config readers.
     capped_topmass_085_alpha: 0.85
     capped_topmass_085_min_k: 32
     capped_topmass_085_max_k: 64
@@ -280,8 +283,8 @@ training:
     feature_methods:
       - "hpre_raw_logit_gauss"
       - "hpre_softmax_prob_gauss"
-    # fixed_topk trains tau x Top-K; capped trains one de-duplicated run per tau.
-    risk_modes: ["fixed_topk", "capped_topmass_085"]
+    # fixed_topk trains tau x Top-K; capped alpha sweep trains tau x alpha.
+    risk_modes: ["fixed_topk", "capped_topmass_alpha_sweep"]
   baseline:
     # Training-only selection: this does not change/re-extract baseline/features.pkl.
     # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.

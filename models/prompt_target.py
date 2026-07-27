@@ -654,6 +654,9 @@ def _dgst_options(cfg: Mapping[str, Any]) -> dict[str, Any]:
         "four_gate_compute_capped_topmass_085": bool(
             cfg.get("compute_capped_topmass_085", False)
         ),
+        "four_gate_capped_topmass_alphas": cfg.get(
+            "capped_topmass_alphas"
+        ),
         "target_gate_mode": cfg.get("target_gate_mode", "four_gate"),
         "relative_vll_mad_epsilon": float(cfg.get("relative_vll_mad_epsilon", 1e-6)),
         "relative_vll_logit_source": cfg.get("relative_vll_logit_source", "h_mid"),

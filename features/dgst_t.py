@@ -28,6 +28,53 @@ COSINE16_TOP_K = 16
 GAUSSIAN_MAD_SCALE = 1.4826
 STATEUPD_ALPHA_TENTHS = tuple(range(1, 10))
 
+
+def _capped_topmass_alpha_slug(alpha: float) -> str:
+    """Return a stable field-name suffix for one cumulative-mass threshold."""
+    value = float(alpha)
+    percent = value * 100.0
+    rounded_percent = int(round(percent))
+    if math.isclose(percent, rounded_percent, rel_tol=0.0, abs_tol=1e-9):
+        return f"capped_topmass_{rounded_percent:03d}"
+    numeric = format(value, ".12g").replace("-", "m").replace(".", "p")
+    return f"capped_topmass_a{numeric}"
+
+
+def _normalize_capped_topmass_alphas(
+    values: Sequence[float] | float | None,
+    *,
+    legacy_alpha: float = TOPMASS_ALPHA_085,
+) -> tuple[tuple[str, float], ...]:
+    raw_values = (
+        [legacy_alpha]
+        if values is None
+        else [values]
+        if isinstance(values, (int, float))
+        else list(values)
+    )
+    normalized: list[tuple[str, float]] = []
+    seen: set[float] = set()
+    seen_slugs: set[str] = set()
+    for raw_value in raw_values:
+        alpha = float(raw_value)
+        if not math.isfinite(alpha) or not (0.0 < alpha <= 1.0):
+            raise ValueError(
+                "capped_topmass_alphas must contain finite values in (0, 1]."
+            )
+        if alpha in seen:
+            continue
+        slug = _capped_topmass_alpha_slug(alpha)
+        if slug in seen_slugs:
+            raise ValueError(
+                f"Two capped top-mass alphas map to the same slug {slug!r}."
+            )
+        seen.add(alpha)
+        seen_slugs.add(slug)
+        normalized.append((slug, alpha))
+    if not normalized:
+        raise ValueError("capped_topmass_alphas must not be empty when enabled.")
+    return tuple(normalized)
+
 # The active DGST profile keeps four matched target-gate constructions.  The
 # prefix names deliberately encode both the decoder state used for the logit
 # lens and whether the gate sees a raw target logit or a vocabulary-softmax
@@ -314,6 +361,7 @@ def compute_dgst_t_batch_from_captures(
     four_gate_source_tau_values: Sequence[float] | float | None = None,
     four_gate_transport_top_k_values: Sequence[int] | int | None = None,
     four_gate_compute_capped_topmass_085: bool = False,
+    four_gate_capped_topmass_alphas: Sequence[float] | float | None = None,
     compute_prompt_cafe: bool = False,
     prompt_cafe_temperature: float = 10.0,
     prompt_cafe_layer: int = 22,
@@ -376,6 +424,7 @@ def compute_dgst_t_batch_from_captures(
                 four_gate_compute_capped_topmass_085
             ),
             capped_topmass_alpha=float(capped_topmass_alpha),
+            capped_topmass_alphas=four_gate_capped_topmass_alphas,
             capped_topmass_min_k=int(capped_topmass_min_k),
             capped_topmass_max_k=int(capped_topmass_max_k),
             compute_prompt_cafe=bool(compute_prompt_cafe),
@@ -4005,6 +4054,7 @@ def compute_four_gate_dgst_batch_from_captures(
     transport_top_k_values: Sequence[int] | int | None = None,
     compute_capped_topmass_085: bool = False,
     capped_topmass_alpha: float = TOPMASS_ALPHA_085,
+    capped_topmass_alphas: Sequence[float] | float | None = None,
     capped_topmass_min_k: int = CAPPED_TOPMASS_MIN_K,
     capped_topmass_max_k: int = CAPPED_TOPMASS_MAX_K,
     compute_prompt_cafe: bool = False,
@@ -4032,7 +4082,9 @@ def compute_four_gate_dgst_batch_from_captures(
     ``compute_capped_topmass_085`` adds an adaptive support ablation: source
     and target each retain enough descending probability mass to reach alpha,
     with the selected K clamped to ``[min_k, max_k]``. Risk uses their union;
-    cosine/EV use the target-only capped region.
+    cosine/EV use the target-only capped region. ``capped_topmass_alphas``
+    optionally expands this into a validation sweep while retaining the
+    historical 0.85 field names when alpha 0.85 is present.
     """
     active_modes = _normalize_four_gate_support_modes(
         support_modes,
@@ -4092,6 +4144,7 @@ def compute_four_gate_dgst_batch_from_captures(
             transport_top_k_values=transport_top_k_values,
             compute_capped_topmass_085=bool(compute_capped_topmass_085),
             capped_topmass_alpha=float(capped_topmass_alpha),
+            capped_topmass_alphas=capped_topmass_alphas,
             capped_topmass_min_k=int(capped_topmass_min_k),
             capped_topmass_max_k=int(capped_topmass_max_k),
             release_layer_captures=False,
@@ -4154,7 +4207,7 @@ def compute_four_gate_dgst_batch_from_captures(
             result["dgst_t_hparam_sweep"] = combined_sweep
             result["dgst_t_hparam_sweep_definition"] = (
                 "cartesian_source_tau_x_transport_top_k_fixed_risk_plus_"
-                "source_tau_capped_topmass_085_risk"
+                "source_tau_x_capped_topmass_alpha_risk"
                 if compute_capped_topmass_085
                 else "cartesian_source_tau_x_transport_top_k_risk_only"
             )
@@ -4333,6 +4386,7 @@ def _compute_four_gate_single_scope_from_captures(
     transport_top_k_values: Sequence[int] | int | None = None,
     compute_capped_topmass_085: bool = False,
     capped_topmass_alpha: float = TOPMASS_ALPHA_085,
+    capped_topmass_alphas: Sequence[float] | float | None = None,
     capped_topmass_min_k: int = CAPPED_TOPMASS_MIN_K,
     capped_topmass_max_k: int = CAPPED_TOPMASS_MAX_K,
     release_layer_captures: bool = False,
@@ -4371,13 +4425,12 @@ def _compute_four_gate_single_scope_from_captures(
         )
     if int(target_region_top_k) <= 0:
         raise ValueError("target_region_top_k must be a positive integer.")
+    capped_alpha_specs: tuple[tuple[str, float], ...] = ()
     if compute_capped_topmass_085:
-        if not math.isfinite(float(capped_topmass_alpha)) or not (
-            0.0 < float(capped_topmass_alpha) <= 1.0
-        ):
-            raise ValueError(
-                "capped_topmass_alpha must be finite and in (0, 1]."
-            )
+        capped_alpha_specs = _normalize_capped_topmass_alphas(
+            capped_topmass_alphas,
+            legacy_alpha=float(capped_topmass_alpha),
+        )
         if int(capped_topmass_min_k) <= 0:
             raise ValueError("capped_topmass_min_k must be positive.")
         if int(capped_topmass_max_k) < int(capped_topmass_min_k):
@@ -4451,14 +4504,23 @@ def _compute_four_gate_single_scope_from_captures(
                     for active_cost in normalized_cost_modes
                 },
                 "capped_problems": {
-                    (method, active_cost): []
+                    (alpha_slug, method, active_cost): []
+                    for alpha_slug, _alpha_value in capped_alpha_specs
                     for method in methods
                     for active_cost in normalized_cost_modes
                 },
                 "cosines": {method: [] for method in methods},
                 "ev": {method: [] for method in methods},
-                "capped_cosines": {method: [] for method in methods},
-                "capped_ev": {method: [] for method in methods},
+                "capped_cosines": {
+                    (alpha_slug, method): []
+                    for alpha_slug, _alpha_value in capped_alpha_specs
+                    for method in methods
+                },
+                "capped_ev": {
+                    (alpha_slug, method): []
+                    for alpha_slug, _alpha_value in capped_alpha_specs
+                    for method in methods
+                },
             }
         )
 
@@ -4474,7 +4536,7 @@ def _compute_four_gate_single_scope_from_captures(
         for variant_slug, _tau_value, _top_k_value in sweep_specs
     }
     sweep_capped_risk_values = {
-        tau_slug: [
+        (tau_slug, alpha_slug): [
             {
                 (method, active_cost): []
                 for method in methods
@@ -4483,6 +4545,7 @@ def _compute_four_gate_single_scope_from_captures(
             for _target_id in target_ids
         ]
         for tau_slug, _tau_value in sweep_tau_specs
+        for alpha_slug, _alpha_value in capped_alpha_specs
     }
 
     for layer_index, capture in enumerate(captures):
@@ -4529,8 +4592,9 @@ def _compute_four_gate_single_scope_from_captures(
         }
         layer_sweep_capped_problems = (
             {
-                (tau_slug, method, active_cost): []
+                (tau_slug, alpha_slug, method, active_cost): []
                 for tau_slug, _tau_value in sweep_tau_specs
+                for alpha_slug, _alpha_value in capped_alpha_specs
                 for method in methods
                 for active_cost in normalized_cost_modes
             }
@@ -4651,26 +4715,29 @@ def _compute_four_gate_single_scope_from_captures(
                     )
                     record["problems"][(method, active_cost)].append(problem)
                 if compute_capped_topmass_085:
-                    capped_support = _capped_topmass_union_indices(
-                        source_dist,
-                        target_dist,
-                        float(capped_topmass_alpha),
-                        min_k=int(capped_topmass_min_k),
-                        max_k=int(capped_topmass_max_k),
-                    )
-                    for active_cost in normalized_cost_modes:
-                        record["capped_problems"][(method, active_cost)].append(
-                            _prepare_four_gate_cost_problem(
-                                cost_mode=active_cost,
-                                source_dist=source_dist,
-                                target_dist=target_dist,
-                                matched_states=cost_states,
-                                hmid_states=visual_hmid,
-                                hout_states=visual_hout,
-                                update_states=visual_update,
-                                support=capped_support,
-                            )
+                    for alpha_slug, alpha_value in capped_alpha_specs:
+                        capped_support = _capped_topmass_union_indices(
+                            source_dist,
+                            target_dist,
+                            alpha_value,
+                            min_k=int(capped_topmass_min_k),
+                            max_k=int(capped_topmass_max_k),
                         )
+                        for active_cost in normalized_cost_modes:
+                            record["capped_problems"][
+                                (alpha_slug, method, active_cost)
+                            ].append(
+                                _prepare_four_gate_cost_problem(
+                                    cost_mode=active_cost,
+                                    source_dist=source_dist,
+                                    target_dist=target_dist,
+                                    matched_states=cost_states,
+                                    hmid_states=visual_hmid,
+                                    hout_states=visual_hout,
+                                    update_states=visual_update,
+                                    support=capped_support,
+                                )
+                            )
                 for variant_slug, tau_value, top_k_value in sweep_specs:
                     variant_source_dist = sweep_source_dist[tau_value]
                     variant_support = _topk_union_indices(
@@ -4696,28 +4763,34 @@ def _compute_four_gate_single_scope_from_captures(
                 if compute_capped_topmass_085:
                     for tau_slug, tau_value in sweep_tau_specs:
                         variant_source_dist = sweep_source_dist[tau_value]
-                        variant_capped_support = _capped_topmass_union_indices(
-                            variant_source_dist,
-                            target_dist,
-                            float(capped_topmass_alpha),
-                            min_k=int(capped_topmass_min_k),
-                            max_k=int(capped_topmass_max_k),
-                        )
-                        for active_cost in normalized_cost_modes:
-                            layer_sweep_capped_problems[
-                                (tau_slug, method, active_cost)
-                            ].append(
-                                _prepare_four_gate_cost_problem(
-                                    cost_mode=active_cost,
-                                    source_dist=variant_source_dist,
-                                    target_dist=target_dist,
-                                    matched_states=cost_states,
-                                    hmid_states=visual_hmid,
-                                    hout_states=visual_hout,
-                                    update_states=visual_update,
-                                    support=variant_capped_support,
-                                )
+                        for alpha_slug, alpha_value in capped_alpha_specs:
+                            variant_capped_support = _capped_topmass_union_indices(
+                                variant_source_dist,
+                                target_dist,
+                                alpha_value,
+                                min_k=int(capped_topmass_min_k),
+                                max_k=int(capped_topmass_max_k),
                             )
+                            for active_cost in normalized_cost_modes:
+                                layer_sweep_capped_problems[
+                                    (
+                                        tau_slug,
+                                        alpha_slug,
+                                        method,
+                                        active_cost,
+                                    )
+                                ].append(
+                                    _prepare_four_gate_cost_problem(
+                                        cost_mode=active_cost,
+                                        source_dist=variant_source_dist,
+                                        target_dist=target_dist,
+                                        matched_states=cost_states,
+                                        hmid_states=visual_hmid,
+                                        hout_states=visual_hout,
+                                        update_states=visual_update,
+                                        support=variant_capped_support,
+                                    )
+                                )
                 region = _stable_topk_indices(
                     target_dist,
                     int(target_region_top_k),
@@ -4743,35 +4816,38 @@ def _compute_four_gate_single_scope_from_captures(
                 record["cosines"][method].append(target_cosine)
                 record["ev"][method].append(evidence_value)
                 if compute_capped_topmass_085:
-                    capped_region = _capped_topmass_indices(
-                        target_dist,
-                        float(capped_topmass_alpha),
-                        min_k=int(capped_topmass_min_k),
-                        max_k=int(capped_topmass_max_k),
-                    )
-                    if capped_region.numel() == 0:
-                        capped_target_cosine = 0.0
-                        capped_evidence_value = 0.0
-                    else:
-                        capped_local_cosine = cosine_map.index_select(
-                            0, capped_region
+                    for alpha_slug, alpha_value in capped_alpha_specs:
+                        capped_region = _capped_topmass_indices(
+                            target_dist,
+                            alpha_value,
+                            min_k=int(capped_topmass_min_k),
+                            max_k=int(capped_topmass_max_k),
                         )
-                        capped_target_cosine = float(
-                            capped_local_cosine.mean().item()
+                        if capped_region.numel() == 0:
+                            capped_target_cosine = 0.0
+                            capped_evidence_value = 0.0
+                        else:
+                            capped_local_cosine = cosine_map.index_select(
+                                0, capped_region
+                            )
+                            capped_target_cosine = float(
+                                capped_local_cosine.mean().item()
+                            )
+                            capped_target_mass = target_dist.index_select(
+                                0, capped_region
+                            ).sum()
+                            capped_evidence_value = float(
+                                (
+                                    capped_target_mass
+                                    * capped_local_cosine.mean()
+                                ).item()
+                            )
+                        record["capped_cosines"][(alpha_slug, method)].append(
+                            capped_target_cosine
                         )
-                        capped_target_mass = target_dist.index_select(
-                            0, capped_region
-                        ).sum()
-                        capped_evidence_value = float(
-                            (
-                                capped_target_mass
-                                * capped_local_cosine.mean()
-                            ).item()
+                        record["capped_ev"][(alpha_slug, method)].append(
+                            capped_evidence_value
                         )
-                    record["capped_cosines"][method].append(
-                        capped_target_cosine
-                    )
-                    record["capped_ev"][method].append(capped_evidence_value)
 
         if layer_sweep_problems:
             layer_sweep_risks = _solve_exact_emd_problem_series(
@@ -4796,6 +4872,7 @@ def _compute_four_gate_single_scope_from_captures(
             )
             for (
                 tau_slug,
+                alpha_slug,
                 method,
                 active_cost,
             ), target_values in layer_sweep_capped_risks.items():
@@ -4804,7 +4881,9 @@ def _compute_four_gate_single_scope_from_captures(
                         "Capped sweep OT result count does not match target count."
                     )
                 for target_offset, value in enumerate(target_values):
-                    sweep_capped_risk_values[tau_slug][target_offset][
+                    sweep_capped_risk_values[
+                        (tau_slug, alpha_slug)
+                    ][target_offset][
                         (method, active_cost)
                     ].append(float(value))
 
@@ -4884,12 +4963,24 @@ def _compute_four_gate_single_scope_from_captures(
             ).detach().to(device="cpu", dtype=torch.float32),
         }
         if compute_capped_topmass_085:
+            capped_alpha_map = dict(capped_alpha_specs)
+            compatibility_alpha = capped_alpha_map.get(
+                "capped_topmass_085", capped_alpha_specs[0][1]
+            )
             result.update(
                 {
                     "dgst_t_compute_capped_topmass_085": True,
                     "dgst_t_capped_topmass_alpha": float(
-                        capped_topmass_alpha
+                        compatibility_alpha
                     ),
+                    "dgst_t_capped_topmass_alphas": [
+                        float(alpha_value)
+                        for _alpha_slug, alpha_value in capped_alpha_specs
+                    ],
+                    "dgst_t_capped_topmass_alpha_by_slug": {
+                        alpha_slug: float(alpha_value)
+                        for alpha_slug, alpha_value in capped_alpha_specs
+                    },
                     "dgst_t_capped_topmass_min_k": int(
                         capped_topmass_min_k
                     ),
@@ -4948,13 +5039,16 @@ def _compute_four_gate_single_scope_from_captures(
                     risk_series[(method, active_cost)], dtype=torch.float32
                 )
                 if compute_capped_topmass_085:
-                    result[
-                        f"dgst_t_{method}_{risk_suffix}_"
-                        "capped_topmass_085_per_layer"
-                    ] = torch.tensor(
-                        capped_risk_series[(method, active_cost)],
-                        dtype=torch.float32,
-                    )
+                    for alpha_slug, _alpha_value in capped_alpha_specs:
+                        result[
+                            f"dgst_t_{method}_{risk_suffix}_"
+                            f"{alpha_slug}_per_layer"
+                        ] = torch.tensor(
+                            capped_risk_series[
+                                (alpha_slug, method, active_cost)
+                            ],
+                            dtype=torch.float32,
+                        )
             topk_slug = f"topk{int(target_region_top_k)}"
             result[
                 f"dgst_t_{method}_target_cosine_{topk_slug}_{state_name}_per_layer"
@@ -4966,18 +5060,21 @@ def _compute_four_gate_single_scope_from_captures(
                 record["ev"][method], dtype=torch.float32
             )
             if compute_capped_topmass_085:
-                result[
-                    f"dgst_t_{method}_target_cosine_"
-                    f"capped_topmass_085_{state_name}_per_layer"
-                ] = torch.tensor(
-                    record["capped_cosines"][method], dtype=torch.float32
-                )
-                result[
-                    f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
-                    f"capped_topmass_085_{state_name}_per_layer"
-                ] = torch.tensor(
-                    record["capped_ev"][method], dtype=torch.float32
-                )
+                for alpha_slug, _alpha_value in capped_alpha_specs:
+                    result[
+                        f"dgst_t_{method}_target_cosine_"
+                        f"{alpha_slug}_{state_name}_per_layer"
+                    ] = torch.tensor(
+                        record["capped_cosines"][(alpha_slug, method)],
+                        dtype=torch.float32,
+                    )
+                    result[
+                        f"dgst_t_{method}_ev_target_dist_mass_x_cosine_"
+                        f"{alpha_slug}_{state_name}_per_layer"
+                    ] = torch.tensor(
+                        record["capped_ev"][(alpha_slug, method)],
+                        dtype=torch.float32,
+                    )
         if sweep_specs:
             scope_sweep = {}
             for variant_slug, tau_value, top_k_value in sweep_specs:
@@ -4999,16 +5096,17 @@ def _compute_four_gate_single_scope_from_captures(
                             dtype=torch.float32,
                         )
                         if compute_capped_topmass_085:
-                            capped_risk_key = (
-                                f"dgst_t_{method}_{risk_suffix}_"
-                                "capped_topmass_085_per_layer"
-                            )
-                            risk_curves[capped_risk_key] = torch.tensor(
-                                sweep_capped_risk_values[tau_slug][target_offset][
-                                    (method, active_cost)
-                                ],
-                                dtype=torch.float32,
-                            )
+                            for alpha_slug, _alpha_value in capped_alpha_specs:
+                                capped_risk_key = (
+                                    f"dgst_t_{method}_{risk_suffix}_"
+                                    f"{alpha_slug}_per_layer"
+                                )
+                                risk_curves[capped_risk_key] = torch.tensor(
+                                    sweep_capped_risk_values[
+                                        (tau_slug, alpha_slug)
+                                    ][target_offset][(method, active_cost)],
+                                    dtype=torch.float32,
+                                )
                 scope_sweep[variant_slug] = {
                     "source_tau": float(tau_value),
                     "transport_top_k": int(top_k_value),

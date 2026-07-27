@@ -1,5 +1,13 @@
 # Current Task
 
+## 2026-07-27 capped Top-Mass alpha 超参验证
+
+- 将 compact four-gate 路径中原先固定的 `capped_topmass_085` 扩展为 YAML 可配置的多 alpha 实验。两份活动配置均新增 `feature_extraction.dgst_t.capped_topmass_alphas: [0.7, 0.75, 0.8, 0.85, 0.9]`；字段名分别使用 `capped_topmass_070/075/080/085/090`。旧开关 `compute_capped_topmass_085`、旧标量 `capped_topmass_085_alpha` 和所有 0.85 字段继续保留，因此已有 0.85 缓存与旧训练入口仍可读取。
+- VV、VP、VPEND 的各模型 wrapper 和 prompt-target 共用入口现在都会透传 alpha 列表。特征提取对每个 alpha 分别构造 source/target capped union support、exact EMD risk、target-only cosine 与 EV，并在根记录和 `dgst_t_hparam_sweep` 中序列化动态字段；同时保存 `dgst_t_capped_topmass_alphas` 与 slug 到数值的映射供审计。
+- sweep 训练新增 `capped_topmass_alpha_sweep` 模式。固定 Top-K 仍训练 `source tau × transport Top-K`，新 capped 模式训练 `source tau × capped alpha`，并验证同一 source tau 下不同固定 Top-K 变体中的 capped risk 完全一致，避免重复训练。两份 YAML 的默认 `risk_modes` 已改为 `[fixed_topk, capped_topmass_alpha_sweep]`；0.85 只由新 sweep 训练一次，不再与旧单值模式重复。
+- 验证：相关 Python 文件 `py_compile` 通过；four-gate 数值、动态字段和序列化回归 19/19 通过；训练矩阵、YAML 选择和去重回归 7/7 通过；五个模型 wrapper、两个直接 four-gate 路径与 prompt-target plumbing 3/3 通过；两份 YAML 运行时解析、fj01 禁用开关 CLI no-op 与 `git diff --check` 通过。首次训练测试因动态 EV 尚未登记在静态 alias 表而失败，已改为读取带完整 provenance 的动态字段后通过；首次 plumbing 检查发现 LLaVA/InternVL 的直接 four-gate快路未透传 alpha 列表，补齐后通过。本轮未启动正式 GPU 特征重提取或训练。
+- 扩展回归中 LLaVA/InternVL 完整 caption batch-forward 2/2 通过。`test_stateupd_alpha_sweep.py` 为 3/4：唯一失败仍是旧断言强制 unified YAML 必须启用 `support_modes=[vv,vpend]`，而用户当前 unified 配置明确保留为 `[vv]`；该失败与 capped alpha 改动无关，本轮未覆盖用户的 scope 选择。
+
 ## 2026-07-26 sweep 全层默认与 run.sh 自动训练开关
 
 - Sweep 训练新增 `risk_modes` 选择，支持 `fixed_topk` 与 `capped_topmass_085`；两份活动 YAML 当前都配置为同时训练两类（总开关仍为 `false`）。fixed 模式沿用 source tau × transport Top-K 笛卡尔网格；capped 模式以自适应 source/target top-mass union 取代固定 Top-K，因此只按 source tau 训练一次，不会把同一 tau 下不同 Top-K 的等价 capped 曲线重复训练。

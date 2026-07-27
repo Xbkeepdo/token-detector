@@ -41,7 +41,11 @@ FEATURE_METHODS = {
         "feature_suffix": "hpre_softmax_prob_gauss_risk_plus_ev",
     },
 }
-RISK_MODES = ("fixed_topk", "capped_topmass_085")
+RISK_MODES = (
+    "fixed_topk",
+    "capped_topmass_085",
+    "capped_topmass_alpha_sweep",
+)
 
 DEFAULT_RUN_NAMES = {
     "hpre_raw_logit_gauss": (
@@ -80,6 +84,41 @@ def feature_method_spec(method: str) -> dict:
             },
         },
     }
+
+
+def capped_topmass_alpha_slug(alpha: float) -> str:
+    value = float(alpha)
+    percent = value * 100.0
+    rounded_percent = int(round(percent))
+    if np.isclose(percent, rounded_percent, rtol=0.0, atol=1e-9):
+        return f"capped_topmass_{rounded_percent:03d}"
+    numeric = format(value, ".12g").replace("-", "m").replace(".", "p")
+    return f"capped_topmass_a{numeric}"
+
+
+def configured_capped_topmass_alphas(config_root: dict) -> tuple[float, ...]:
+    dgst_cfg = ((config_root.get("feature_extraction") or {}).get("dgst_t") or {})
+    raw_values = dgst_cfg.get("capped_topmass_alphas")
+    if raw_values is None:
+        raw_values = [dgst_cfg.get("capped_topmass_085_alpha", 0.85)]
+    elif isinstance(raw_values, (int, float)):
+        raw_values = [raw_values]
+    elif not isinstance(raw_values, (list, tuple)):
+        raise ValueError(
+            "feature_extraction.dgst_t.capped_topmass_alphas must be a number or list"
+        )
+    values = tuple(dict.fromkeys(float(value) for value in raw_values))
+    if not values or any(
+        not np.isfinite(value) or not (0.0 < value <= 1.0)
+        for value in values
+    ):
+        raise ValueError(
+            "capped_topmass_alphas must contain finite values in (0, 1]"
+        )
+    slugs = [capped_topmass_alpha_slug(value) for value in values]
+    if len(slugs) != len(set(slugs)):
+        raise ValueError("capped_topmass_alphas contain colliding field-name slugs")
+    return values
 
 
 def parse_args() -> argparse.Namespace:
@@ -212,15 +251,17 @@ def configured_training_risk_modes(config_root: dict) -> tuple[str, ...]:
             f"Unsupported sweep risk modes {unknown}; expected a subset of "
             f"{list(RISK_MODES)}"
         )
-    if "capped_topmass_085" in modes:
+    if {"capped_topmass_085", "capped_topmass_alpha_sweep"} & set(modes):
         dgst_cfg = (
             (config_root.get("feature_extraction") or {}).get("dgst_t") or {}
         )
         if not bool(dgst_cfg.get("compute_capped_topmass_085", False)):
             raise ValueError(
-                "capped_topmass_085 sweep training requires "
+                "capped top-mass sweep training requires "
                 "feature_extraction.dgst_t.compute_capped_topmass_085=true"
             )
+    if "capped_topmass_alpha_sweep" in modes:
+        configured_capped_topmass_alphas(config_root)
     return modes
 
 
@@ -257,6 +298,7 @@ def build_matrices(
     feature_method: str = "hpre_raw_logit_gauss",
     scopes: Sequence[str] = ("vv", "vpend"),
     risk_modes: Sequence[str] = ("fixed_topk",),
+    capped_topmass_alphas: Sequence[float] | None = None,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, dict]:
     spec = feature_method_spec(feature_method)
     unknown_scopes = sorted(set(scopes) - set(spec["scope_blocks"]))
@@ -276,6 +318,41 @@ def build_matrices(
     risk_key = spec["risk_key"]
     capped_risk_key = spec["capped_risk_key"]
     feature_suffix = spec["feature_suffix"]
+    capped_alpha_values = tuple(
+        dict.fromkeys(float(value) for value in (capped_topmass_alphas or ()))
+    )
+    if any(
+        not np.isfinite(value) or not (0.0 < value <= 1.0)
+        for value in capped_alpha_values
+    ):
+        raise ValueError("capped Top-Mass alphas must be finite values in (0, 1]")
+    capped_alpha_specs = tuple(
+        (capped_topmass_alpha_slug(value), value)
+        for value in capped_alpha_values
+    )
+    if (
+        "capped_topmass_alpha_sweep" in selected_risk_modes
+        and not capped_alpha_specs
+    ):
+        raise ValueError(
+            "capped_topmass_alpha_sweep requires at least one capped Top-Mass alpha"
+        )
+    if len({slug for slug, _value in capped_alpha_specs}) != len(capped_alpha_specs):
+        raise ValueError("capped Top-Mass alphas contain colliding field-name slugs")
+
+    def dynamic_capped_risk_key(alpha_slug: str) -> str:
+        return (
+            f"dgst_t_{feature_method}_risk_sqrt_hpre_"
+            f"{alpha_slug}_per_layer"
+        )
+
+    def dynamic_capped_ev_block(scope: str, alpha_slug: str) -> str:
+        prefix = "" if scope == "vv" else f"{scope}_"
+        return (
+            f"{prefix}{feature_method}_ev_target_dist_mass_x_cosine_"
+            f"{alpha_slug}_hpre"
+        )
+
     tau_variant_groups: dict[float, list[str]] = {}
     for variant_slug, (source_tau, _top_k) in expected_variants.items():
         tau_variant_groups.setdefault(float(source_tau), []).append(variant_slug)
@@ -295,6 +372,16 @@ def build_matrices(
                 f"capped_topmass_085_{feature_suffix}": []
                 for scope in scope_blocks
                 for source_tau in tau_variant_groups
+            }
+        )
+    if "capped_topmass_alpha_sweep" in selected_risk_modes:
+        values.update(
+            {
+                f"{scope}_tau{format(source_tau, '.12g').replace('-', 'm').replace('.', 'p')}_"
+                f"{alpha_slug}_{feature_suffix}": []
+                for scope in scope_blocks
+                for source_tau in tau_variant_groups
+                for alpha_slug, _alpha in capped_alpha_specs
             }
         )
     labels = []
@@ -331,6 +418,24 @@ def build_matrices(
                         f"Invalid {scope}/{risk_mode} EV curve at row {index}"
                     )
                 ev_by_mode[risk_mode] = ev
+            capped_alpha_ev = {}
+            if "capped_topmass_alpha_sweep" in selected_risk_modes:
+                for alpha_slug, _alpha in capped_alpha_specs:
+                    block_name = dynamic_capped_ev_block(scope, alpha_slug)
+                    ev_key = f"dgst_t_{block_name}_per_layer"
+                    try:
+                        ev = np.asarray(row[ev_key], dtype=np.float32)
+                    except KeyError as exc:
+                        raise KeyError(
+                            f"Missing {scope}/{alpha_slug} EV feature {ev_key} "
+                            f"at row {index}; re-extract with the configured "
+                            "capped alphas"
+                        ) from exc
+                    if ev.ndim != 1 or not np.all(np.isfinite(ev)):
+                        raise ValueError(
+                            f"Invalid {scope}/{alpha_slug} EV curve at row {index}"
+                        )
+                    capped_alpha_ev[alpha_slug] = ev
             for variant_slug, expected in expected_variants.items():
                 variant = row_sweep[variant_slug]
                 actual = (
@@ -454,6 +559,77 @@ def build_matrices(
                             [risk[layer_start:resolved_layer_end], ev]
                         ).astype(np.float32)
                     )
+            if "capped_topmass_alpha_sweep" in selected_risk_modes:
+                for alpha_slug, _alpha in capped_alpha_specs:
+                    ev = capped_alpha_ev[alpha_slug]
+                    alpha_risk_key = dynamic_capped_risk_key(alpha_slug)
+                    for source_tau, variant_slugs in tau_variant_groups.items():
+                        representative_slug = variant_slugs[0]
+                        try:
+                            risk = np.asarray(
+                                row_sweep[representative_slug][scope][
+                                    alpha_risk_key
+                                ],
+                                dtype=np.float32,
+                            )
+                        except KeyError as exc:
+                            raise KeyError(
+                                f"Missing {scope}/{representative_slug}/"
+                                f"{alpha_risk_key} at row {index}; re-extract sweep "
+                                "features with the configured capped alphas"
+                            ) from exc
+                        if risk.ndim != 1 or not np.all(np.isfinite(risk)):
+                            raise ValueError(
+                                f"Invalid {scope}/tau={source_tau}/{alpha_slug} "
+                                f"capped risk at row {index}"
+                            )
+                        if risk.shape != ev.shape:
+                            raise ValueError(
+                                f"{scope}/tau={source_tau}/{alpha_slug} capped "
+                                f"risk/EV shape mismatch: {risk.shape} != {ev.shape}"
+                            )
+                        for duplicate_slug in variant_slugs[1:]:
+                            duplicate = np.asarray(
+                                row_sweep[duplicate_slug][scope][alpha_risk_key],
+                                dtype=np.float32,
+                            )
+                            if not np.array_equal(risk, duplicate):
+                                raise ValueError(
+                                    "Capped alpha-sweep risk unexpectedly depends "
+                                    f"on fixed Top-K for {scope}/tau={source_tau}/"
+                                    f"{alpha_slug} at row {index}"
+                                )
+                        if resolved_layer_end is None:
+                            resolved_layer_end = int(risk.size)
+                        elif use_full_risk_curve and risk.size != resolved_layer_end:
+                            raise ValueError(
+                                "Full-layer sweep training requires one consistent "
+                                f"risk dimension, got {resolved_layer_end} and "
+                                f"{risk.size}"
+                            )
+                        if (
+                            layer_start < 0
+                            or resolved_layer_end > risk.size
+                            or resolved_layer_end <= layer_start
+                        ):
+                            raise ValueError(
+                                f"Requested risk slice [{layer_start},"
+                                f"{resolved_layer_end}) outside curve length "
+                                f"{risk.size}"
+                            )
+                        risk_dims.add(int(risk.size))
+                        ev_dims.add(int(ev.size))
+                        tau_label = format(source_tau, ".12g").replace(
+                            "-", "m"
+                        ).replace(".", "p")
+                        values[
+                            f"{scope}_tau{tau_label}_{alpha_slug}_"
+                            f"{feature_suffix}"
+                        ].append(
+                            np.concatenate(
+                                [risk[layer_start:resolved_layer_end], ev]
+                            ).astype(np.float32)
+                        )
         labels.append(int(label))
         image_ids.append(int(row["image_id"]))
         if len(labels) % 2000 == 0:
@@ -477,13 +653,29 @@ def build_matrices(
             "risk_feature_keys": {
                 "fixed_topk": risk_key,
                 "capped_topmass_085": capped_risk_key,
+                "capped_topmass_alpha_sweep": {
+                    alpha_slug: dynamic_capped_risk_key(alpha_slug)
+                    for alpha_slug, _alpha in capped_alpha_specs
+                },
             },
             "ev_feature_blocks": {
                 scope: {
                     "fixed_topk": blocks["ev"],
                     "capped_topmass_085": blocks["capped_ev"],
+                    "capped_topmass_alpha_sweep": {
+                        alpha_slug: (
+                            f"dgst_t_{dynamic_capped_ev_block(scope, alpha_slug)}"
+                            "_per_layer"
+                        )
+                        for alpha_slug, _alpha in capped_alpha_specs
+                    },
                 }
                 for scope, blocks in scope_blocks.items()
+            },
+            "capped_topmass_alphas": list(capped_alpha_values),
+            "capped_topmass_alpha_by_slug": {
+                alpha_slug: alpha
+                for alpha_slug, alpha in capped_alpha_specs
             },
             "risk_curve_dimensions": sorted(risk_dims),
             "ev_curve_dimensions": sorted(ev_dims),
@@ -735,6 +927,7 @@ def main() -> None:
 
     torch_cfg = ((config_root.get("training") or {}).get("torch_probe") or {})
     dgst_cfg = ((config_root.get("feature_extraction") or {}).get("dgst_t") or {})
+    capped_topmass_alphas = configured_capped_topmass_alphas(config_root)
     tau_values = [float(x) for x in (dgst_cfg.get("source_tau_values") or [])]
     top_k_values = [
         int(x) for x in (dgst_cfg.get("transport_top_k_values") or [])
@@ -768,6 +961,7 @@ def main() -> None:
             method,
             scopes,
             risk_modes,
+            capped_topmass_alphas=capped_topmass_alphas,
         )
         records, train_audit = train_all(
             matrices, labels, image_ids, splits, seeds, args.config,

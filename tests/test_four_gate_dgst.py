@@ -483,6 +483,7 @@ class FourGateDGSTTests(unittest.TestCase):
             support_modes=["vv", "vpend"],
             compute_capped_topmass_085=True,
             capped_topmass_alpha=0.85,
+            capped_topmass_alphas=[0.7, 0.85, 0.9],
             capped_topmass_min_k=3,
             capped_topmass_max_k=5,
             source_tau_values=[0.05],
@@ -544,6 +545,30 @@ class FourGateDGSTTests(unittest.TestCase):
             "capped_topmass_085_per_layer",
             result,
         )
+        self.assertEqual(result["dgst_t_capped_topmass_alphas"], [0.7, 0.85, 0.9])
+        self.assertEqual(
+            result["dgst_t_capped_topmass_alpha_by_slug"],
+            {
+                "capped_topmass_070": 0.7,
+                "capped_topmass_085": 0.85,
+                "capped_topmass_090": 0.9,
+            },
+        )
+        for alpha_slug in (
+            "capped_topmass_070",
+            "capped_topmass_085",
+            "capped_topmass_090",
+        ):
+            self.assertIn(
+                "dgst_t_hpre_raw_logit_gauss_risk_sqrt_hpre_"
+                f"{alpha_slug}_per_layer",
+                result,
+            )
+            self.assertIn(
+                "dgst_t_vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_"
+                f"cosine_{alpha_slug}_hpre_per_layer",
+                result,
+            )
         sweep_source_scores = F.cosine_similarity(
             capture["o_ffn"][0, patches + 1].unsqueeze(0),
             capture["h_mid"][0, :patches],
@@ -584,6 +609,20 @@ class FourGateDGSTTests(unittest.TestCase):
             target_token_id=1,
             model_out=SimpleNamespace(token_id=1),
             dgst_t=result,
+        )
+        self.assertEqual(
+            record["dgst_t_capped_topmass_alpha_by_slug"],
+            result["dgst_t_capped_topmass_alpha_by_slug"],
+        )
+        self.assertIn(
+            "dgst_t_hpre_raw_logit_gauss_risk_sqrt_hpre_"
+            "capped_topmass_070_per_layer",
+            record,
+        )
+        self.assertIn(
+            "dgst_t_vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine_"
+            "capped_topmass_090_hpre_per_layer",
+            record,
         )
         for feature_set in (
             "hpre_raw_logit_gauss_risk_sqrt_matched_state_"

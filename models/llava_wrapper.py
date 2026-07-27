@@ -343,6 +343,9 @@ class LLaVAWrapper(BaseLVLMWrapper):
                     compute_capped_topmass_085=bool(
                         cfg_dgst_t.get("compute_capped_topmass_085", False)
                     ),
+                    capped_topmass_alphas=cfg_dgst_t.get(
+                        "capped_topmass_alphas"
+                    ),
                     capped_topmass_alpha=float(
                         cfg_dgst_t.get("capped_topmass_085_alpha", 0.85)
                     ),
@@ -645,6 +648,9 @@ class LLaVAWrapper(BaseLVLMWrapper):
                 compute_capped_topmass_085=cfg_dgst_t.get("compute_capped_topmass_085", True),
                 four_gate_compute_capped_topmass_085=cfg_dgst_t.get(
                     "compute_capped_topmass_085", False
+                ),
+                four_gate_capped_topmass_alphas=cfg_dgst_t.get(
+                    "capped_topmass_alphas"
                 ),
                 target_gate_mode=cfg_dgst_t.get("target_gate_mode", "legacy_prob"),
                 relative_vll_mad_epsilon=cfg_dgst_t.get("relative_vll_mad_epsilon", 1e-6),
