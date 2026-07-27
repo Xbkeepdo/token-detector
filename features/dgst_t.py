@@ -5834,12 +5834,18 @@ def _solve_exact_emd_problem_series(
     ]
     if not jobs:
         return output
+    job_groups = _group_exact_emd_jobs(
+        jobs,
+        deduplicate=_four_gate_emd_dedup_enabled(),
+    )
 
     requested_workers = _requested_cost_variant_emd_workers()
-    active_workers = min(int(requested_workers), len(jobs))
+    active_workers = min(int(requested_workers), len(job_groups))
     if active_workers == 1:
-        for name, problem_index, problem in jobs:
-            output[name][problem_index] = _solve_transport_problem(problem, "emd")
+        for problem, destinations in job_groups:
+            value = _solve_transport_problem(problem, "emd")
+            for name, problem_index in destinations:
+                output[name][problem_index] = value
         return output
 
     # Keep one pool alive for the extraction process. ThreadPoolExecutor starts
@@ -5848,15 +5854,77 @@ def _solve_exact_emd_problem_series(
     executor = _get_emd_thread_pool(requested_workers)
     futures = [
         (
-            name,
-            problem_index,
+            destinations,
             executor.submit(_solve_transport_problem, problem, "emd"),
         )
-        for name, problem_index, problem in jobs
+        for problem, destinations in job_groups
     ]
-    for name, problem_index, future in futures:
-        output[name][problem_index] = future.result()
+    for destinations, future in futures:
+        value = future.result()
+        for name, problem_index in destinations:
+            output[name][problem_index] = value
     return output
+
+
+def _four_gate_emd_dedup_enabled() -> bool:
+    """Return whether identity-safe exact-EMD solve deduplication is enabled."""
+    raw = os.environ.get("DGST_FOUR_GATE_EMD_DEDUP", "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "DGST_FOUR_GATE_EMD_DEDUP must be one of "
+        "1/0, true/false, yes/no, or on/off."
+    )
+
+
+def _group_exact_emd_jobs(
+    jobs: Sequence[tuple[Any, int, Any]],
+    *,
+    deduplicate: bool,
+) -> list[tuple[Any, list[tuple[Any, int]]]]:
+    """Group only problems that share the exact prepared NumPy objects.
+
+    The four-gate preparation cache returns the same source marginal, target
+    marginal, and cost-matrix objects when alpha variants resolve to the same
+    distribution keys and exact union support. Object identity therefore gives
+    a zero-collision proof that the POT inputs are identical, without hashing
+    floating arrays or comparing already-computed risks. Other problem types
+    deliberately remain unique.
+    """
+    if not deduplicate:
+        return [
+            (problem, [(name, problem_index)])
+            for name, problem_index, problem in jobs
+        ]
+    try:
+        import numpy as np
+    except Exception:  # pragma: no cover - NumPy is a project dependency
+        np = None
+    grouped: list[tuple[Any, list[tuple[Any, int]]]] = []
+    group_index_by_identity: dict[tuple[int, int, int], int] = {}
+    for name, problem_index, problem in jobs:
+        identity = None
+        if (
+            np is not None
+            and isinstance(problem, (tuple, list))
+            and len(problem) == 3
+            and all(isinstance(value, np.ndarray) for value in problem)
+        ):
+            identity = tuple(id(value) for value in problem)
+        group_index = (
+            None
+            if identity is None
+            else group_index_by_identity.get(identity)
+        )
+        if group_index is None:
+            grouped.append((problem, [(name, problem_index)]))
+            if identity is not None:
+                group_index_by_identity[identity] = len(grouped) - 1
+        else:
+            grouped[group_index][1].append((name, problem_index))
+    return grouped
 
 
 @torch.no_grad()

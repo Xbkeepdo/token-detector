@@ -20,6 +20,7 @@ from features.dgst_t import (
     _compute_gate_comparison_from_parts,
     _compute_cost_variant_risks,
     _cosine_distance_matrix,
+    _group_exact_emd_jobs,
     _relative_vll_evidence_signal,
     _sinkhorn_linear_cost_batch,
     _solve_exact_emd_problem_series,
@@ -248,6 +249,65 @@ class CostVariantTests(unittest.TestCase):
             "risk_a": [3.0, 0.0, 1.0],
             "risk_b": [2.0, 4.0],
         })
+
+    def test_exact_emd_dedup_reuses_only_identical_numpy_problem_objects(self) -> None:
+        source = np.asarray([0.6, 0.4], dtype=np.float32)
+        target = np.asarray([0.2, 0.8], dtype=np.float32)
+        cost = np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+        shared = (source, target, cost)
+        equal_but_distinct = (source.copy(), target.copy(), cost.copy())
+        jobs = [
+            ("alpha070", 0, shared),
+            ("alpha075", 0, shared),
+            ("alpha080", 0, equal_but_distinct),
+        ]
+
+        groups = _group_exact_emd_jobs(jobs, deduplicate=True)
+
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(
+            groups[0][1],
+            [("alpha070", 0), ("alpha075", 0)],
+        )
+        self.assertEqual(groups[1][1], [("alpha080", 0)])
+
+    def test_exact_emd_dedup_preserves_outputs_and_reduces_solver_calls(self) -> None:
+        source = np.asarray([0.6, 0.4], dtype=np.float32)
+        target = np.asarray([0.2, 0.8], dtype=np.float32)
+        cost = np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+        shared = (source, target, cost)
+        problems = {
+            "alpha070": [shared],
+            "alpha075": [shared],
+            "alpha080": [(source.copy(), target.copy(), cost.copy())],
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "DGST_COST_VARIANT_EMD_WORKERS": "1",
+                "DGST_FOUR_GATE_EMD_DEDUP": "0",
+            },
+        ), patch(
+            "features.dgst_t._solve_transport_problem",
+            wraps=_solve_transport_problem,
+        ) as uncached_solver:
+            uncached = _solve_exact_emd_problem_series(problems)
+        with patch.dict(
+            os.environ,
+            {
+                "DGST_COST_VARIANT_EMD_WORKERS": "1",
+                "DGST_FOUR_GATE_EMD_DEDUP": "1",
+            },
+        ), patch(
+            "features.dgst_t._solve_transport_problem",
+            wraps=_solve_transport_problem,
+        ) as dedup_solver:
+            deduplicated = _solve_exact_emd_problem_series(problems)
+
+        self.assertEqual(uncached, deduplicated)
+        self.assertEqual(uncached_solver.call_count, 3)
+        self.assertEqual(dedup_solver.call_count, 2)
 
     def test_numpy_emd_fast_path_matches_tensor_solver(self) -> None:
         source = np.asarray([0.6, 0.3, 0.1], dtype=np.float32)
