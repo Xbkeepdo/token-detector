@@ -34,6 +34,8 @@ POPE_PROMPT_TEMPLATE = "{question}\nAnswer the question using a single word or p
 _POPE_PROMPT_TEMPLATES = {
     "llava_1_5_7b": "USER: <image>\n{question}\nAnswer the question using a single word or phrase.\nASSISTANT:",
     "llava_next_7b": "[INST] <image>\n{question}\nAnswer the question using a single word or phrase. [/INST]",
+    "llava_next_8b": "{question}\nAnswer the question using a single word or phrase.",
+    "llava_next_llama3_8b": "{question}\nAnswer the question using a single word or phrase.",
     "_default": "{question}\nAnswer the question using a single word or phrase.",
 }
 

@@ -58,12 +58,21 @@ feature_extraction:
     alpha: 2.0
     ot_solver: "emd"
     atarget_visual_top_k: 32
+    compute_topmass_085: false
+    compute_capped_topmass_085: false
+    topmass_085_alpha: 0.85
+    capped_topmass_085_alpha: 0.85
+    capped_topmass_085_min_k: 32
+    capped_topmass_085_max_k: 64
+    target_gate_mode: "relativevll"
+    relative_vll_mad_epsilon: 1.0e-6
+    relative_vll_logit_source: "h_mid"
 
 dataset:
   coco_root: "/home/apulis-dev/code/token-grounding-detector/data/coco"
   annotation_file: "/home/apulis-dev/code/token-grounding-detector/data/coco/annotations/instances_val2014.json"
   captions_file: "/home/apulis-dev/code/token-grounding-detector/data/coco/annotations/captions_val2014.json"
-  num_images: 4000
+  num_images: 500
   train_ratio: 0.90
   seed: 42
 

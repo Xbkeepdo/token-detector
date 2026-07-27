@@ -1,0 +1,123 @@
+# LLaVA-OneVision-1.5-8B-Instruct VP + relative VLL + geo-cost config.
+#
+# Typical command:
+#   MODEL=llava_onevision_1_5_8b \
+#   CONFIG=configs/model_configs_llava_onevision_vp_relativevll_cost_geo.yaml \
+#   OUTPUT=outputs/llava_onevision_1_5_8b/COCO500-vp-relativevll-cost-geo \
+#   bash run.sh
+
+experiment:
+  mode: "vp"
+  feature_sets:
+    vp:
+      - "risk_visual_prompt_relative_vll_cost_geo"
+      - "target_visual_prompt_hidden_cosine_visual_prompt_relative_vll"
+      - "risk_visual_prompt_relative_vll_cost_geo+target_visual_prompt_hidden_cosine_visual_prompt_relative_vll"
+
+models:
+  llava_onevision_1_5_8b:
+    hf_name: "/home/apulis-dev/userdata/models/LLaVA-OneVision-1.5-8B-Instruct"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    image_size: 336
+    patch_size: 14
+    num_layers: 36
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    image_token: "<|image_pad|>"
+    prompt_template: null
+
+  llava_onevision_1_5_8b_instruct:
+    hf_name: "/home/apulis-dev/userdata/models/LLaVA-OneVision-1.5-8B-Instruct"
+    architecture: "concatenation"
+    num_visual_tokens: null
+    image_size: 336
+    patch_size: 14
+    num_layers: 36
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    image_token: "<|image_pad|>"
+    prompt_template: null
+
+feature_extraction:
+  ads:
+    top_patch_pct: 0.10
+    connectivity: 8
+    min_blob_area: 3
+    top_k_layers: 10
+
+  cgc:
+    top_k_pct: 0.05
+    mid_layer_pct: [0.25, 0.75]
+    use_attn_weighting: false
+
+  dgst_t:
+    tau: 0.07
+    transport_top_k: 64
+    cost_mode: "decomposed"
+    lambda_d: 1.0
+    lambda_s: 1.0
+    lambda_t: 1.0
+    lambda_int: 1.0
+    baseline_layers: 10
+    risk_start_layer: 15
+    alpha: 2.0
+    ot_solver: "emd"
+    atarget_visual_top_k: 32
+
+    compute_topmass_085: false
+    compute_capped_topmass_085: false
+    topmass_085_alpha: 0.85
+    capped_topmass_085_alpha: 0.85
+    capped_topmass_085_min_k: 32
+    capped_topmass_085_max_k: 64
+
+    target_gate_mode: "relative"
+    relative_vll_mad_epsilon: 1.0e-6
+    relative_vll_logit_source: "h_mid"
+
+    relative_cost_mode: "geo"
+    relative_cost_modes: ["geo"]
+
+    relative_barrier_lambda: 1.0
+    relative_barrier_margin: 0.5
+    relative_barrier_max: 3.0
+    compute_ffn_injection_features: false
+
+    dgst_t_dual_scope: false
+
+dataset:
+  coco_root: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco"
+  annotation_file: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco/annotations/instances_val2014.json"
+  captions_file: "/home/apulis-dev/userdata/DGST/token-grounding-detector/data/coco/annotations/captions_val2014.json"
+  num_images: 500
+  train_ratio: 0.90
+  seed: 42
+
+classifiers:
+  xgb:
+    max_depth: [4, 6, 8]
+    learning_rate: [0.1, 0.05]
+    n_estimators: [100, 200, 500]
+  rf:
+    max_depth: [null, 10, 20]
+    n_estimators: [200, 400, 600]
+  mlp:
+    hidden_layer_sizes: [[64], [128], [256]]
+    learning_rate_init: [0.01, 0.001]
+    solver: ["adam", "sgd"]
+    max_iter: 500
+
+pope:
+  pope_dir: "data/pope"
+  splits: ["random", "popular", "adversarial"]
+  prompt_templates:
+    llava_onevision_1_5_8b: "{question}\nAnswer the question using a single word or phrase."
+    llava_onevision_1_5_8b_instruct: "{question}\nAnswer the question using a single word or phrase."
+    _default: "{question}\nAnswer the question using a single word or phrase."

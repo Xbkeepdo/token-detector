@@ -23,6 +23,11 @@ except ImportError:
 
 from utils.io_utils import load_pkl, save_pkl
 
+LABEL_HALLUCINATED = 0
+LABEL_REAL = 1
+POSITIVE_LABEL = LABEL_REAL
+POSITIVE_CLASS_NAME = "real"
+
 
 def build_feature_matrix(
     features: List[dict],
@@ -73,6 +78,12 @@ def build_feature_matrix(
         y_rows.append(int(f[label_key]))
         meta.append(f)
 
+    if not X_rows:
+        return (
+            np.empty((0, 0), dtype=np.float32),
+            np.empty((0,), dtype=np.int32),
+            [],
+        )
     X = np.stack(X_rows, axis=0)
     y = np.array(y_rows, dtype=np.int32)
     return X, y, meta
@@ -85,10 +96,19 @@ def split_by_image_id(
     test_image_ids: Optional[set] = None,
 ) -> Tuple[List[dict], List[dict], List[dict]]:
     """Split feature list by image id to prevent leakage."""
+    if test_image_ids is None:
+        raise ValueError("Strict outer-8:2 training requires explicit test_image_ids.")
+    overlaps = {
+        "train/val": set(train_image_ids) & set(val_image_ids),
+        "train/test": set(train_image_ids) & set(test_image_ids),
+        "val/test": set(val_image_ids) & set(test_image_ids),
+    }
+    bad = {name: len(values) for name, values in overlaps.items() if values}
+    if bad:
+        raise ValueError(f"Image-level train/val/test splits overlap: {bad}")
     train = [f for f in features if f["image_id"] in train_image_ids]
     val   = [f for f in features if f["image_id"] in val_image_ids]
-    test  = [f for f in features if f["image_id"] in test_image_ids] \
-            if test_image_ids else val
+    test  = [f for f in features if f["image_id"] in test_image_ids]
     return train, val, test
 
 
@@ -149,27 +169,88 @@ def grid_search(
     best_params = {}
     best_score = -1.0
 
-    if X_train.shape[0] == 0 or X_val.shape[0] == 0:
+    if X_train.shape[0] == 0:
         raise ValueError(
-            f"grid_search received empty split: "
-            f"X_train={X_train.shape}, X_val={X_val.shape}. "
-            "Ensure both train and val splits contain labeled object tokens."
+            f"grid_search received empty training split: X_train={X_train.shape}."
         )
     if len(np.unique(y_train)) < 2:
         raise ValueError(
             f"Training set contains only one class {np.unique(y_train)}. "
-            "Need at least one sample of each class (0=true, 1=hallucinated)."
+            "Need at least one sample of each class (0=hallucinated, 1=real)."
         )
 
-    for params in ParameterGrid(param_grid):
+    candidates = list(ParameterGrid(param_grid))
+    if not candidates:
+        candidates = [{}]
+    if X_val.shape[0] == 0:
+        # Pure strict-8:2 protocol: hyperparameters are fixed to the first
+        # declared configuration, the final estimator is fit on all 80% train
+        # rows, and no score from the 20% test partition influences selection.
+        # Only the decision threshold is selected by training-set F1.
+        params = candidates[0]
         clf = build_classifier(clf_type, params)
         clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_val)
+        train_scores = _positive_class_scores(clf, X_train)
+        threshold = select_decision_threshold(
+            y_train,
+            train_scores,
+            scoring="f1",
+        )
+        train_predictions = np.where(
+            train_scores >= threshold,
+            POSITIVE_LABEL,
+            1 - POSITIVE_LABEL,
+        )
+        train_score = f1_score(
+            y_train,
+            train_predictions,
+            pos_label=POSITIVE_LABEL,
+            zero_division=0,
+        )
+        setattr(clf, "_token_detector_threshold", float(threshold))
+        setattr(
+            clf,
+            "_token_detector_selection_protocol",
+            "fixed_hyperparameters_train_f1_threshold",
+        )
+        return clf, params, float(train_score)
+
+    for params in candidates:
+        clf = build_classifier(clf_type, params)
+        clf.fit(X_train, y_train)
+        threshold = None
+        try:
+            y_prob = _positive_class_scores(clf, X_val)
+            threshold = select_decision_threshold(
+                y_val,
+                y_prob,
+                scoring="accuracy" if scoring == "accuracy" else "f1",
+            )
+            y_pred = np.where(
+                y_prob >= threshold,
+                POSITIVE_LABEL,
+                1 - POSITIVE_LABEL,
+            )
+        except Exception:
+            y_prob = None
+            y_pred = clf.predict(X_val)
 
         if scoring == "f1":
-            score = f1_score(y_val, y_pred, zero_division=0)
+            score = f1_score(
+                y_val,
+                y_pred,
+                pos_label=POSITIVE_LABEL,
+                zero_division=0,
+            )
         elif scoring == "accuracy":
             score = accuracy_score(y_val, y_pred)
+        elif scoring == "auc":
+            try:
+                if y_prob is None:
+                    y_prob = _positive_class_scores(clf, X_val)
+                score = roc_auc_score(_positive_class_targets(y_val), y_prob)
+            except Exception:
+                score = -1.0
         else:
             raise ValueError(f"Unknown scoring: {scoring}")
 
@@ -177,6 +258,8 @@ def grid_search(
             best_score = score
             best_params = params
             best_clf = clf
+            if threshold is not None:
+                setattr(best_clf, "_token_detector_threshold", float(threshold))
 
     return best_clf, best_params, best_score
 
@@ -187,21 +270,67 @@ def evaluate_classifier(
     y: np.ndarray,
 ) -> Dict[str, float]:
     """Return precision, recall, F1, accuracy, and AUC."""
-    y_pred = clf.predict(X)
-
     try:
-        y_prob = clf.predict_proba(X)[:, 1]
-        auc = roc_auc_score(y, y_prob)
+        y_prob = _positive_class_scores(clf, X)
+        threshold = float(getattr(clf, "_token_detector_threshold", 0.5))
+        y_pred = np.where(
+            y_prob >= threshold,
+            POSITIVE_LABEL,
+            1 - POSITIVE_LABEL,
+        )
+        auc = roc_auc_score(_positive_class_targets(y), y_prob)
     except Exception:
+        threshold = None
+        y_pred = clf.predict(X)
         auc = float("nan")
 
     return {
-        "precision": precision_score(y, y_pred, zero_division=0),
-        "recall":    recall_score(y, y_pred, zero_division=0),
-        "f1":        f1_score(y, y_pred, zero_division=0),
+        "precision": precision_score(
+            y, y_pred, pos_label=POSITIVE_LABEL, zero_division=0
+        ),
+        "recall":    recall_score(
+            y, y_pred, pos_label=POSITIVE_LABEL, zero_division=0
+        ),
+        "f1":        f1_score(
+            y, y_pred, pos_label=POSITIVE_LABEL, zero_division=0
+        ),
         "accuracy":  accuracy_score(y, y_pred),
         "auc":       auc,
+        "decision_threshold": threshold,
+        "reported_positive_class": POSITIVE_CLASS_NAME,
     }
+
+
+def select_decision_threshold(
+    y_true: np.ndarray,
+    positive_scores: np.ndarray,
+    *,
+    scoring: str = "f1",
+) -> float:
+    """Select a binary decision threshold on the caller-provided fit rows."""
+    labels = np.asarray(y_true, dtype=np.int32).reshape(-1)
+    scores = np.asarray(positive_scores, dtype=np.float64).reshape(-1)
+    if labels.size != scores.size or labels.size == 0:
+        raise ValueError("Threshold selection requires equally sized non-empty arrays.")
+    targets = _positive_class_targets(labels)
+    candidates = np.unique(np.concatenate(([0.0], scores, [1.0])))
+    best_threshold = 0.5
+    best_key = (-np.inf, -np.inf, -np.inf)
+    for threshold in candidates:
+        prediction = (scores >= threshold).astype(np.int32)
+        if scoring == "accuracy":
+            primary = float(accuracy_score(targets, prediction))
+            secondary = float(f1_score(targets, prediction, zero_division=0))
+        elif scoring == "f1":
+            primary = float(f1_score(targets, prediction, zero_division=0))
+            secondary = float(accuracy_score(targets, prediction))
+        else:
+            raise ValueError("Threshold scoring must be 'f1' or 'accuracy'.")
+        key = (primary, secondary, -abs(float(threshold) - 0.5))
+        if key > best_key:
+            best_key = key
+            best_threshold = float(threshold)
+    return best_threshold
 
 
 def train_and_evaluate(
@@ -237,8 +366,8 @@ def train_and_evaluate(
     )
     print(
         f"[Train] Label balance — "
-        f"train: {y_train.mean():.2%} hallucinated, "
-        f"test: {y_test.mean():.2%} hallucinated"
+        f"train: {np.mean(y_train == LABEL_HALLUCINATED):.2%} hallucinated, "
+        f"test: {np.mean(y_test == LABEL_HALLUCINATED):.2%} hallucinated"
     )
 
     if X_train.shape[0] == 0:
@@ -249,22 +378,21 @@ def train_and_evaluate(
     if len(np.unique(y_train)) < 2:
         raise ValueError(
             f"[Train] train split has only one class {np.unique(y_train)}. "
-            "Need both class 0 (true) and class 1 (hallucinated) tokens."
+            "Need both class 0 (hallucinated) and class 1 (real) tokens."
         )
-    if X_val.shape[0] == 0 or len(np.unique(y_val)) < 2:
-        print(
-            f"[Train] WARNING: val split has {X_val.shape[0]} samples / "
-            f"{len(np.unique(y_val))} class(es). Falling back to train split for "
-            "hyperparameter tuning — do not use these results as final numbers."
-        )
-        X_val, y_val = X_train.copy(), y_train.copy()
-    if X_test.shape[0] == 0 or len(np.unique(y_test)) < 2:
-        print(
-            f"[Train] WARNING: test split has {X_test.shape[0]} samples / "
-            f"{len(np.unique(y_test))} class(es). Falling back to val split for "
-            "final evaluation."
-        )
-        X_test, y_test = X_val.copy(), y_val.copy()
+    for split_name, matrix, labels in (
+        ("val", X_val, y_val),
+        ("test", X_test, y_test),
+    ):
+        if split_name == "val" and matrix.shape[0] == 0:
+            continue
+        classes = np.unique(labels)
+        if matrix.shape[0] == 0 or classes.size < 2:
+            raise ValueError(
+                f"[Train] strict outer-8:2 training violation: {split_name} has "
+                f"{matrix.shape[0]} rows and classes {classes.tolist()}. "
+                "Splits are never substituted; repair labeling/image_splits.json."
+            )
 
     all_results = {}
 
@@ -324,6 +452,27 @@ def train_and_evaluate(
     print(f"\n[Train] Results saved to {results_path}")
 
     return all_results
+
+
+def _positive_class_targets(labels: np.ndarray) -> np.ndarray:
+    labels = np.asarray(labels, dtype=np.int32)
+    return (labels == POSITIVE_LABEL).astype(np.int32)
+
+
+def _positive_class_scores(clf, X: np.ndarray) -> np.ndarray:
+    if hasattr(clf, "predict_proba"):
+        probs = clf.predict_proba(X)
+        classes = list(getattr(clf, "classes_", []))
+        if POSITIVE_LABEL in classes:
+            return probs[:, classes.index(POSITIVE_LABEL)]
+        return 1.0 - probs[:, -1]
+    if hasattr(clf, "decision_function"):
+        scores = clf.decision_function(X)
+        classes = list(getattr(clf, "classes_", []))
+        if POSITIVE_LABEL in classes and classes.index(POSITIVE_LABEL) == 0:
+            return -np.asarray(scores, dtype=np.float32)
+        return np.asarray(scores, dtype=np.float32)
+    return (clf.predict(X) == POSITIVE_LABEL).astype(np.float32)
 
 
 def _sanitise_grid(grid: dict) -> None:

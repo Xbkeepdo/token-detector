@@ -1,0 +1,497 @@
+# fj01 server-path mirror of model_configs_unified.yaml.
+# Unified COCO caption and POPE/CLEVR/AMBER QA hallucination-detection settings.
+#
+# `run.sh` only selects model/output/devices and invokes the pipeline stages.
+# Prompt, extraction families, DGST branches and training behavior live here.
+# The active compact profile keeps VV as the backward-compatible branch and
+# additionally extracts VPend branches. Hyperparameter sweep variants are
+# disabled; extraction uses only the primary tau and transport Top-K below.
+
+run:
+  prompt: "Describe this image."
+  extraction_mode: "method_only"                   # all | method_only | ads_cgc_only | baseline_only
+  validate_manifests: false              # Do not read or write provenance manifest sidecars.
+
+experiment:
+  mode: "vpend"                         # Visual plus post-image prompt support.
+
+labeling:
+  schema_version: 2
+  sample_unit: "all_mentions"              # Keep every object occurrence in the generated caption.
+  primary_locator: "exact_response_offsets" # Exact span over the generated response token IDs.
+  save_all_mentions: true                  # Preserve occurrence-level CHAIRs/CHAIRi statistics.
+  save_svar_official_samples: true         # Also build the paper-code canonical/surface lookup samples.
+  alignment_failure_policy: "error"        # error | skip; never substitute a neighbouring token.
+
+# QA-only dataset/protocol settings. Models, DGST, ADS/CGC, baseline heads and
+# probe hyperparameters are shared with the COCO sections below.
+qa_benchmarks:
+  # QA uses the same four extraction modes as COCO. "all" shares one answer-
+  # token forward across DGST, ADS+CGC and every enabled baseline.
+  extraction_mode: "method_only"                  # all | method_only | ads_cgc_only | baseline_only
+  baseline_trainer: "shared_torch_mlp"    # Headline baseline in the cross-family QA table; actual runs follow training.baseline.trainers.
+  baseline_label_protocols:
+    - "object_hallucination_yes_only"
+    - "answer_correctness_all"
+  pope_dir: "/root/rivermind-data/dataset/pope"
+  coco_image_dir: "/root/rivermind-data/dataset/coco/val2014"
+  clevr_root: "/root/rivermind-data/dataset/CLEVR_v1.0"
+  clevr_dataset_name: "clevr_exist_9k"
+  clevr_train_questions: 7200
+  clevr_val_questions: 0
+  clevr_test_questions: 1800
+  amber_root: "/root/rivermind-data/dataset/AMBER"
+  prepared_root: "/root/rivermind-data/dataset/qa_benchmarks"
+  output_root: "/root/rivermind-data/accept/token-detector/outputs/qa_benchmarks"
+  split: "strict_image_level_82"
+  split_seed: 42
+  generation:
+    max_new_tokens: 8                     # Overrides caption generation's 512 only for QA.
+    temperature: 0.1
+    top_p: 0.5
+  # AMBER contains native images up to 54 MP. Qwen-family dynamic vision must
+  # bound those images or eager attention can request over 100 GiB. This
+  # override is applied to both generation and feature extraction, and does
+  # not change COCO, POPE, or CLEVR preprocessing.
+  dataset_model_overrides:
+    amber_discriminative:
+      max_pixels: 200704
+  # Compare the prompt's final causal row against the row immediately before
+  # the queried object's first contextual sub-token. Exact object spans are
+  # available for POPE/CLEVR; datasets without one retain prompt-last only.
+  position_protocols:
+    - "prompt_last_token"
+    - "question_object_pre_token"
+  label_protocols:
+   # - "object_hallucination_yes_only"
+    - "answer_correctness_all"
+
+models:
+  llava_1_5_7b:
+    hf_name: "/root/rivermind-fs/xiongbo/models/llava-1.5-7b-hf"
+    num_visual_tokens: 576
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    prompt_template: "USER: <image>\nDescribe this image.\nASSISTANT:"
+
+  llava_next_8b:
+    hf_name: "/root/rivermind-fs/xiongbo/models/LLaVA-NeXT-8B"
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    image_token: "<image>"
+    prompt_template: null
+
+  llava_onevision_1_5_8b:
+    hf_name: "/root/rivermind-fs/xiongbo/models/LLaVA-OneVision-1.5-8B-Instruct"
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    image_token: "<|image_pad|>"
+    prompt_template: null
+
+  llava_onevision_1_5_8b_instruct:
+    hf_name: "/root/rivermind-fs/xiongbo/models/LLaVA-OneVision-1.5-8B-Instruct"
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    image_token: "<|image_pad|>"
+    prompt_template: null
+
+  internvl_2_5_8b:
+    hf_name: "/root/rivermind-fs/xiongbo/models/InternVL2_5-8B"
+    num_visual_tokens: 256
+    image_size: 448
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    img_context_token: "<IMG_CONTEXT>"
+    prompt_template: "<|im_start|>user\n<image>\nDescribe this image.<|im_end|>\n<|im_start|>assistant\n"
+
+  qwen2_5_vl_7b:
+    hf_name: "/root/rivermind-fs/xiongbo/models/Qwen2.5-VL-7B-Instruct"
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    prompt_template: null
+
+  qwen3_vl_8b:
+    hf_name: "/root/rivermind-fs/xiongbo/models/Qwen3-VL-8B-Instruct"
+    num_layers: 36
+    max_new_tokens: 512
+    temperature: 0.1
+    top_p: 0.5
+    vision_start_token: "<|vision_start|>"
+    vision_end_token: "<|vision_end|>"
+    prompt_template: null
+
+feature_extraction:
+  # Extraction-only model settings. Existing captions keep their original
+  # generation provenance; feature manifests record these effective values.
+  model_overrides:
+    llava_next_8b:
+      image_grid_pinpoints: [[336, 336]]
+      dgst_attention_query_chunk_size: null
+      dgst_capture_device: null
+
+  # Family switches define what is available; run.extraction_mode selects the
+  # active subset without adding method switches to run.sh.
+  method:
+    enabled: true
+  ads_cgc:
+    enabled: true
+  baseline:
+    enabled: true
+    output_subdir: "baseline"
+    methods: ["metatoken"]         # Optional: "halloc", "svar", "dhcp", "projectaway"
+    seed: 42
+    metatoken:
+      classifiers: ["lr", "gb"]             # LR(lbfgs), GB(100 estimators).
+      gb_n_estimators: 100
+    svar:
+      protocols: ["controlled"]             # Exact response offsets; shared fair samples.
+      # Extraction stores all layers; training slices absolute layers [5,19).
+      layer_start: 5                         # Training start, inclusive.
+      layer_end: 19                          # Training end, exclusive (layers 5..18).
+      hidden_dim: 248
+      learning_rate: 0.001
+      batch_size: 32
+      epochs: 50
+    dhcp:
+      # Cross-backbone adaptation: dynamic visual grids are mass-preservingly
+      # resized to a fixed shape. The original LLaVA DHCP uses native P=576.
+      spatial_size: [12, 12]
+      hidden_dim: 128
+      learning_rate: 0.001
+      batch_size: 1024
+      epochs: 30
+    projectaway:
+      detection_only: true
+    halloc:
+      clip_model: "/root/rivermind-fs/xiongbo/models/clip-vit-base-patch32"          # Local pretrained CLIP ViT-B/32.
+      visualbert_model: "/root/rivermind-fs/xiongbo/models/visualbert-vqa-coco-pre" # Local pretrained VisualBERT.
+      freeze_clip: true
+      learning_rate: 1.0e-6
+      weight_decay: 1.0e-2
+      betas: [0.9, 0.999]
+      batch_size: 16
+      epochs: 25
+      scheduler: "cosine"
+
+  ads:
+    top_patch_pct: 0.10
+    connectivity: 8
+    min_blob_area: 3
+    top_k_layers: 10
+
+  cgc:
+    top_k_pct: 0.05
+    mid_layer_pct: [0.25, 0.75]
+    use_attn_weighting: false
+
+  dgst_t:
+    enabled: true
+    feature_output_profile: "four_gate_vv"   # Matched target gates plus optional direct controls.
+    target_gate_mode: "four_gate"
+    # raw_logit is the target-word unembedding dot product; softmax_prob applies
+    # vocabulary softmax first.  Methods can also be removed from this list.
+    four_gate_methods:
+      - "hpre_raw_logit_gauss"
+      - "hpre_softmax_prob_gauss"
+
+    # Shared transport math for all four gates and both direct controls.
+    tau: 0.07
+    # Optional Cartesian source-tau x Top-K sweep; both null means disabled.
+    source_tau_values: [0.03, 0.04, 0.05, 0.06] # null disables source-tau / Top-K sweep feature variants.
+    # InsLen CAFE: max over prompt positions of the generated object-token
+    # probability from hpre Logit Lens. The paper/code use scale=0.1, which is
+    # equivalent to softmax(logits / temperature) with temperature=10.
+    compute_prompt_cafe: true
+    prompt_cafe_temperature: 10.0
+    prompt_cafe_layer: 22
+    # Explicit support-mode switch. VPend = visual tokens plus only prompt
+    # positions >= visual_end; legacy VP remains code-compatible but is not
+    # used by the default experiment.
+    support_modes: ["vv", "vpend"]
+    # The active alpha sweep does not extract unrelated FFN/MHSA dominance.
+    compute_ffn_injection_features: false
+    ffn_injection_eps: 1.0e-12
+    transport_top_k: 64
+    transport_top_k_values: [64]
+    # Adaptive capped-topmass ablation: retain cumulative target/source mass
+    # 0.85, but clamp each side's K to [32,64]. Risk uses the union; target
+    # cosine uses the target-only region.
+    compute_capped_topmass_085: true
+    # Capped Top-Mass alpha sweep. Alpha 0.85 keeps the historical field names.
+    capped_topmass_alphas: [0.7, 0.75, 0.8, 0.85, 0.9]
+    # Legacy scalar retained for old outputs/config readers.
+    capped_topmass_085_alpha: 0.85
+    capped_topmass_085_min_k: 32
+    capped_topmass_085_max_k: 64
+    # Primary: C_ij = sqrt((1-cos(h_state_i,h_state_j))/2), where h_state is
+    # h_prev for hpre methods. The state-update family uses
+    # C_alpha=(1-alpha)*d_state+alpha*d_update for alpha=0.1,...,0.9.
+    cost_mode: "sqrt_matched_state"
+    cost_modes:
+      - "sqrt_matched_state"
+      # - "sqrt_stateupd_alpha01"
+      # - "sqrt_stateupd_alpha02"
+      # - "sqrt_stateupd_alpha03"
+      # - "sqrt_stateupd_alpha04"
+      # - "sqrt_stateupd_alpha05"
+      # - "sqrt_stateupd_alpha06"
+      # - "sqrt_stateupd_alpha07"
+      # - "sqrt_stateupd_alpha08"
+      # - "sqrt_stateupd_alpha09"
+    # Each branch selects its own target-dist top-K. EV = target-dist top-K
+    # mass * the matched-state mean target cosine in the same region (no shift).
+    atarget_visual_top_k: 32
+    relative_vll_mad_epsilon: 1.0e-6
+
+    # Legacy-probability, barrier-cost, uncapped topmass, the other FFN
+    # diagnostics, and Sinkhorn switches remain disabled.
+
+dataset:
+  coco_root: "/root/rivermind-data/dataset/coco"
+  annotation_file: "/root/rivermind-data/dataset/coco/annotations/instances_val2014.json"
+  captions_file: "/root/rivermind-data/dataset/coco/annotations/captions_val2014.json"
+  # COCO500-capped reuses a seed-42, hallucination-stratified subset of the
+  # retained COCO4000 captions. Generation/labeling must therefore be skipped;
+  # feature extraction reads the exact IDs already stored in the output dir.
+  num_images: 500
+  train_images: 400
+  test_images: 100
+  seed: 42
+  shared_split_path: null
+
+# Root features.pkl probe settings. Names are aliases registered by the
+# feature-training implementation and are read directly by train_and_eval.py.
+training:
+  trainer: "torch_mlp"                     # torch_mlp | sklearn
+  positive_class: "real"                   # real headline; hallucination metrics are also reported.
+  split_protocol: "strict_82_no_validation" # Image-disjoint 80/20; validation is empty.
+  threshold_selection: "train_f1"          # Backward-compatible headline; both thresholds are reported.
+  # When enabled, run.sh trains these tau x Top-K variants after the ordinary
+  # method/baseline stage. Risk and matching EV both use every decoder layer.
+  source_tau_transport_topk_sweep:
+    enabled: true
+    feature_methods:
+      - "hpre_raw_logit_gauss"
+      - "hpre_softmax_prob_gauss"
+    # fixed_topk trains tau x Top-K; capped alpha sweep trains tau x alpha.
+    risk_modes: ["fixed_topk", "capped_topmass_alpha_sweep"]
+  baseline:
+    # Training-only selection: this does not change/re-extract baseline/features.pkl.
+    # HalLoc may remain in feature_extraction.baseline.methods while being skipped here.
+    # Run both heads on the same split/seeds and emit a side-by-side report.
+    trainers: ["native_paper", "shared_torch_mlp"]
+    methods: ["metatoken"]  #, "svar", "dhcp", "projectaway"
+    positive_class: "real"                  # real | hallucination; train F1 selects its threshold.
+    seeds: [43, 44, 45]                     # Use [43] for a quick single-seed run.
+    write_summary: true                     # Per-seed MD + aggregate mean/std MD.
+  torch_probe:
+    hidden_sizes: [128, 64, 32]
+    structure: "Linear-BatchNorm-ReLU-Dropout"
+    activation: "relu"
+    batch_norm: true
+    dropout: 0.3
+    drop_last: true                         # Drop the final incomplete training batch; evaluation never drops rows.
+    initialization: "kaiming_uniform_relu"
+    output_dim: 1
+    optimizer: "adam"
+    learning_rate: 0.001
+    weight_decay: 0.00001
+    batch_size: 256
+    max_epochs: 100
+    loss: "bce_with_logits"
+    feature_normalization: "none"
+    scheduler_monitor: "train_loss"
+    lr_factor: 0.5
+    lr_patience: 5
+    early_stopping_monitor: "train_loss"
+    early_stopping_patience: 10
+    checkpoint_selection: "minimum_train_loss"
+    fixed_threshold: 0.5
+    threshold_reporting: ["fixed_0.5", "train_f1"]
+    seeds: [43, 44, 45]                     # Shared by method, ADS+CGC, and QA dense baselines.
+  feature_sets:
+    method:
+      # VV: fixed sqrt-matched baseline plus alpha=0.1,...,0.9 state/update risks.
+      - "hpre_raw_logit_gauss_risk_sqrt_matched_state"
+      - "hpre_raw_logit_gauss_risk_sqrt_matched_state+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_raw_logit_gauss_risk_sqrt_matched_state_capped_topmass_085+hpre_raw_logit_gauss_target_cosine_capped_topmass_085"
+      - "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha02"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha02+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha03"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha03+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha04"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha04+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha05"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha05+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha06"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha06+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha07"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha07+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha08"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha08+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha09"
+      # - "hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha09+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # # Legacy VP examples (require support_modes to include "vp").
+      # - "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state"
+      # - "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state+vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "vpend_hpre_raw_logit_gauss_risk_sqrt_matched_state_capped_topmass_085+vpend_hpre_raw_logit_gauss_target_cosine_capped_topmass_085"
+      # - "vpend_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "vpend_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha01+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha02"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha02+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha03"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha03+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha04"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha04+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha05"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha05+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha06"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha06+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha07"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha07+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha08"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha08+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha09"
+      # - "vp_hpre_raw_logit_gauss_risk_sqrt_stateupd_alpha09+vp_hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # Generic risk resolves to the primary sqrt_matched_state field.
+      - "hpre_softmax_prob_gauss_risk"
+      - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      - "hpre_softmax_prob_gauss_risk_capped_topmass_085+hpre_softmax_prob_gauss_target_cosine_capped_topmass_085"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha02"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha02+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha03"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha03+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha04"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha04+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha05"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha05+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha06"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha06+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha07"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha07+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha08"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha08+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha09"
+      # - "hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha09+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vpend_hpre_softmax_prob_gauss_risk"
+      # #- "vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vpend_hpre_softmax_prob_gauss_risk+vpend_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vpend_hpre_softmax_prob_gauss_risk_capped_topmass_085+vpend_hpre_softmax_prob_gauss_target_cosine_capped_topmass_085"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha01+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha02"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha02+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha03"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha03+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha04"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha04+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha05"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha05+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha06"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha06+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha07"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha07+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha08"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha08+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha09"
+      # - "vp_hpre_softmax_prob_gauss_risk_sqrt_stateupd_alpha09+vp_hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "prompt_cafe"
+      # - "hmid_raw_logit_gauss_risk"
+      # - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+    #  - "hmid_softmax_prob_gauss_risk"
+     # - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+     # - "raw_attention_risk"
+     # - "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+     # - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+     # - "hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+     # - "hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
+      #- "raw_attention_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_source_target_js+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_source_target_js+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_raw_logit_gauss_source_target_js+hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_softmax_prob_gauss_source_target_js+hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_direct_source_target_js+hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
+      # - "raw_attention_source_target_js+raw_attention_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_one_minus_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_one_minus_target_dist_mass_x_cosine"
+      # - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_one_minus_target_dist_mass_x_cosine"
+      # - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_one_minus_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_one_minus_target_dist_mass_x_cosine"
+      # - "raw_attention_risk+raw_attention_one_minus_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_source_target_union_topk_js"
+      # - "hpre_softmax_prob_gauss_source_target_union_topk_js"
+      # - "hmid_raw_logit_gauss_source_target_union_topk_js"
+      # - "hmid_softmax_prob_gauss_source_target_union_topk_js"
+      # - "hpre_softmax_prob_direct_source_target_union_topk_js"
+      # - "raw_attention_source_target_union_topk_js"
+
+      # - "hpre_raw_logit_gauss_risk"
+      # - "hpre_raw_logit_gauss_target_cosine"
+      # - "hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_target_cosine"
+      # - "hpre_raw_logit_gauss_risk+hpre_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_gauss_risk"
+     # - "hpre_softmax_prob_gauss_target_cosine"
+      # - "hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+     # - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_target_cosine"
+      # - "hpre_softmax_prob_gauss_risk+hpre_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_raw_logit_gauss_risk"
+      # - "hmid_raw_logit_gauss_target_cosine"
+      # - "hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_target_cosine"
+      # - "hmid_raw_logit_gauss_risk+hmid_raw_logit_gauss_ev_target_dist_mass_x_cosine"
+      # - "hmid_softmax_prob_gauss_risk"
+    #  - "hmid_softmax_prob_gauss_target_cosine"
+      # - "hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+   #   - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_target_cosine"
+      # - "hmid_softmax_prob_gauss_risk+hmid_softmax_prob_gauss_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_direct_risk"
+      # - "hpre_softmax_prob_direct_target_cosine"
+      # - "hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
+      # - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_target_cosine"
+      # - "hpre_softmax_prob_direct_risk+hpre_softmax_prob_direct_ev_target_dist_mass_x_cosine"
+      # - "raw_attention_risk"
+     # - "raw_attention_target_cosine"
+      # - "raw_attention_ev_target_dist_mass_x_cosine"
+     # - "raw_attention_risk+raw_attention_target_cosine"
+      # - "raw_attention_risk+raw_attention_ev_target_dist_mass_x_cosine"
+      # - "raw_attention_risk+raw_attention_target_cosine+raw_attention_ev_target_dist_mass_x_cosine"
+    ads_cgc:
+      # - "ads"
+      # - "cgc"
+      - "ads+cgc"
+
+classifiers:
+  xgb:
+    max_depth: [4, 6, 8]
+    learning_rate: [0.1, 0.05]
+    n_estimators: [100, 200, 500]
+  rf:
+    max_depth: [null, 10, 20]
+    n_estimators: [200, 400, 600]
+  mlp:
+    hidden_layer_sizes: [[64], [128], [256]]
+    learning_rate_init: [0.01, 0.001]
+    solver: ["adam", "sgd"]
+    max_iter: 500

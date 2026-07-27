@@ -20,18 +20,26 @@ from sklearn.metrics import (
 from detection.train import build_feature_matrix
 from utils.io_utils import load_pkl
 
+LABEL_HALLUCINATED = 0
+LABEL_REAL = 1
+POSITIVE_LABEL = LABEL_REAL
+POSITIVE_CLASS_NAME = "real"
+
 
 def evaluate_ads_threshold(
     features: List[dict],
     tau: Optional[float] = None,
 ) -> Dict[str, float]:
-    """Evaluate DGST-T score as a standalone hallucination detector via thresholding."""
+    """Evaluate DGST-T score as a standalone real-token detector via thresholding."""
     valid = [f for f in features if f.get("label") in (0, 1)]
-    scores = np.array([f["dgst_t_score"] for f in valid], dtype=np.float32)
-    labels = np.array([f["label"] for f in valid], dtype=np.int32)
+    scores = -np.array([f["dgst_t_score"] for f in valid], dtype=np.float32)
+    labels = np.array(
+        [int(f["label"]) == POSITIVE_LABEL for f in valid],
+        dtype=np.int32,
+    )
 
     if tau is None:
-        tau = _best_threshold(scores, labels, higher_is_hallucinated=True)
+        tau = _best_threshold(scores, labels)
 
     y_pred = (scores > tau).astype(int)
     return _compute_metrics(labels, y_pred, scores)
@@ -43,11 +51,14 @@ def evaluate_cgc_threshold(
 ) -> Dict[str, float]:
     """Compatibility alias for DGST-T threshold evaluation."""
     valid = [f for f in features if f.get("label") in (0, 1)]
-    scores = np.array([f["dgst_t_score"] for f in valid], dtype=np.float32)
-    labels = np.array([f["label"] for f in valid], dtype=np.int32)
+    scores = -np.array([f["dgst_t_score"] for f in valid], dtype=np.float32)
+    labels = np.array(
+        [int(f["label"]) == POSITIVE_LABEL for f in valid],
+        dtype=np.int32,
+    )
 
     if tau is None:
-        tau = _best_threshold(scores, labels, higher_is_hallucinated=True)
+        tau = _best_threshold(scores, labels)
 
     y_pred = (scores > tau).astype(int)
     return _compute_metrics(labels, y_pred, scores)
@@ -56,7 +67,6 @@ def evaluate_cgc_threshold(
 def _best_threshold(
     scores: np.ndarray,
     labels: np.ndarray,
-    higher_is_hallucinated: bool = True,
 ) -> float:
     """Grid-search threshold that maximises F1."""
     thresholds = np.linspace(scores.min(), scores.max(), 200)
@@ -85,6 +95,7 @@ def _compute_metrics(
         "f1":        float(f1_score(y_true, y_pred, zero_division=0)),
         "accuracy":  float(accuracy_score(y_true, y_pred)),
         "auc":       float(auc),
+        "reported_positive_class": POSITIVE_CLASS_NAME,
     }
 
 
@@ -96,17 +107,28 @@ def evaluate_trained_classifier(
     X, y, _ = build_feature_matrix(features)
     y_pred = clf.predict(X)
     try:
-        y_prob = clf.predict_proba(X)[:, 1]
-        auc = roc_auc_score(y, y_prob)
+        classes = list(getattr(clf, "classes_", []))
+        if POSITIVE_LABEL in classes:
+            y_prob = clf.predict_proba(X)[:, classes.index(POSITIVE_LABEL)]
+        else:
+            y_prob = 1.0 - clf.predict_proba(X)[:, -1]
+        auc = roc_auc_score((y == POSITIVE_LABEL).astype(np.int32), y_prob)
     except Exception:
         auc = float("nan")
 
     return {
-        "precision": float(precision_score(y, y_pred, zero_division=0)),
-        "recall":    float(recall_score(y, y_pred, zero_division=0)),
-        "f1":        float(f1_score(y, y_pred, zero_division=0)),
+        "precision": float(
+            precision_score(y, y_pred, pos_label=POSITIVE_LABEL, zero_division=0)
+        ),
+        "recall":    float(
+            recall_score(y, y_pred, pos_label=POSITIVE_LABEL, zero_division=0)
+        ),
+        "f1":        float(
+            f1_score(y, y_pred, pos_label=POSITIVE_LABEL, zero_division=0)
+        ),
         "accuracy":  float(accuracy_score(y, y_pred)),
         "auc":       float(auc),
+        "reported_positive_class": POSITIVE_CLASS_NAME,
         "report":    classification_report(y, y_pred, zero_division=0),
     }
 
@@ -117,9 +139,9 @@ def print_confusion_matrix(clf, features: List[dict]) -> None:
     y_pred = clf.predict(X)
     cm = confusion_matrix(y, y_pred)
     print("Confusion Matrix (rows=true, cols=pred):")
-    print("              Pred: True  Pred: Hall")
-    print(f"  True: True      {cm[0,0]:>5}       {cm[0,1]:>5}")
-    print(f"  True: Hall      {cm[1,0]:>5}       {cm[1,1]:>5}")
+    print("              Pred: Hall  Pred: Real")
+    print(f"  True: Hall      {cm[0,0]:>5}       {cm[0,1]:>5}")
+    print(f"  True: Real      {cm[1,0]:>5}       {cm[1,1]:>5}")
 
 
 LAYER_RANGES = {
@@ -137,8 +159,8 @@ def layerwise_analysis(
 ) -> Dict[str, dict]:
     """Compute mean ± std and Mann-Whitney U p-value for true vs. hallucinated"""
     valid = [f for f in features if f.get("label") in (0, 1)]
-    true_feats = [f for f in valid if f["label"] == 0]
-    hall_feats = [f for f in valid if f["label"] == 1]
+    true_feats = [f for f in valid if f["label"] == LABEL_REAL]
+    hall_feats = [f for f in valid if f["label"] == LABEL_HALLUCINATED]
 
     true_mat = np.array([f[feature_key] for f in true_feats], dtype=np.float32)
     hall_mat = np.array([f[feature_key] for f in hall_feats], dtype=np.float32)

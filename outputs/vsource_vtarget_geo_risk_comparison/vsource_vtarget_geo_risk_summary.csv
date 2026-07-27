@@ -1,0 +1,4 @@
+model,model_display,n_hallucination,n_non_hallucination,hallucination_mean_avg,non_hallucination_mean_avg,diff_avg,peak_abs_diff_layer,peak_diff,num_layers
+qwen2_5_vl_7b,Qwen2.5-VL-7B,1636,554,0.24917392571428573,0.22841027714285714,0.020763647857142856,19,0.08042051,28
+internvl_2_5_8b,InternVL2.5-8B,3064,651,0.2547507140625,0.24651435625,0.0082363565625,2,0.04327959,32
+llava_1_5_7b,LLaVA-1.5-7B,691,757,0.47810826,0.45072802562500003,0.0273802346875,22,0.08686695,32

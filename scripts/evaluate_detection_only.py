@@ -42,7 +42,8 @@ def main():
         "feature_path": feat_path,
         "test_images": len(test_ids),
         "test_object_tokens": len(labeled_test),
-        "test_hallucinated_tokens": sum(1 for f in labeled_test if f["label"] == 1),
+        "test_hallucinated_tokens": sum(1 for f in labeled_test if f["label"] == 0),
+        "label_semantics": "0=hallucinated, 1=real",
     }
 
     print("\nDGST-T hallucination detection results")

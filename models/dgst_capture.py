@@ -2,10 +2,114 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
+
+
+_DGST_CHUNKED_ATTENTION_NAME = "dgst_chunked_eager"
+
+
+def chunked_eager_attention_forward(
+    module: Any,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **_kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact eager-attention formula with a bounded query-row workspace.
+
+    The stock Llama eager implementation materializes ``[B,H,Q,K]`` in FP16,
+    then another full matrix in FP32 for softmax.  LLaVA-NeXT AnyRes can make
+    that transient exceed 1 GiB.  This implementation performs the same
+    matmul, mask, FP32 softmax, cast, dropout, and value matmul in query chunks,
+    then separately returns only the DGST rows requested by the caller.
+    """
+    groups = int(getattr(module, "num_key_value_groups", 1))
+    if groups > 1:
+        batch, kv_heads, key_length, head_dim = key.shape
+        key = (
+            key[:, :, None, :, :]
+            .expand(batch, kv_heads, groups, key_length, head_dim)
+            .reshape(batch, kv_heads * groups, key_length, head_dim)
+        )
+        value = (
+            value[:, :, None, :, :]
+            .expand(batch, kv_heads, groups, key_length, head_dim)
+            .reshape(batch, kv_heads * groups, key_length, head_dim)
+        )
+
+    query_length = int(query.shape[-2])
+    key_length = int(key.shape[-2])
+    chunk_size = max(
+        1,
+        int(getattr(module, "_dgst_attention_query_chunk_size", 512)),
+    )
+    requested = tuple(
+        dict.fromkeys(
+            int(value)
+            for value in getattr(module, "_dgst_attention_query_positions", (-1,))
+        )
+    )
+    positions = tuple(
+        position if position >= 0 else query_length + position
+        for position in requested
+    )
+    invalid = [
+        position
+        for position in positions
+        if position < 0 or position >= query_length
+    ]
+    if invalid:
+        raise IndexError(
+            f"Chunked attention query positions outside length {query_length}: {invalid}"
+        )
+    module._dgst_attention_absolute_positions = positions
+
+    key_transposed = key.transpose(2, 3)
+
+    def weights_for(query_slice: torch.Tensor, start: int, end: int) -> torch.Tensor:
+        weights = torch.matmul(query_slice, key_transposed) * scaling
+        if attention_mask is not None:
+            weights = weights + attention_mask[:, :, start:end, :key_length]
+        weights = F.softmax(weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        return F.dropout(weights, p=float(dropout), training=module.training)
+
+    output_chunks = []
+    for start in range(0, query_length, chunk_size):
+        end = min(query_length, start + chunk_size)
+        weights = weights_for(query[:, :, start:end, :], start, end)
+        output_chunks.append(torch.matmul(weights, value))
+        del weights
+
+    position_index = torch.tensor(
+        positions,
+        dtype=torch.long,
+        device=query.device,
+    )
+    selected_query = query.index_select(2, position_index)
+    selected_weights = torch.matmul(selected_query, key_transposed) * scaling
+    if attention_mask is not None:
+        selected_mask = attention_mask.index_select(2, position_index)
+        selected_weights = selected_weights + selected_mask[:, :, :, :key_length]
+    selected_weights = F.softmax(
+        selected_weights,
+        dim=-1,
+        dtype=torch.float32,
+    ).to(query.dtype)
+    selected_weights = F.dropout(
+        selected_weights,
+        p=float(dropout),
+        training=module.training,
+    )
+
+    attention_output = torch.cat(output_chunks, dim=2)
+    return attention_output.transpose(1, 2).contiguous(), selected_weights
 
 
 def resolve_decoder_layers(model: Any):
@@ -61,40 +165,200 @@ def resolve_input_embedding_layer(model: Any):
     raise ValueError("Model does not expose input embeddings.")
 
 
+def resolve_decoder_final_norm(model: Any):
+    """Return the decoder final norm before LM head for Qwen, InternVL, or LLaVA."""
+    language_model = getattr(model, "language_model", None)
+    model_body = getattr(model, "model", None)
+    candidates = []
+    for module in (
+        language_model,
+        getattr(language_model, "model", None),
+        model_body,
+        getattr(model_body, "language_model", None),
+        getattr(getattr(model_body, "language_model", None), "model", None),
+        model,
+    ):
+        if module is not None:
+            candidates.append(getattr(module, "norm", None))
+
+    get_decoder = getattr(model, "get_decoder", None)
+    if callable(get_decoder):
+        decoder = get_decoder()
+        candidates.extend(
+            [
+                getattr(decoder, "norm", None),
+                getattr(getattr(decoder, "model", None), "norm", None),
+            ]
+        )
+
+    for norm in candidates:
+        if norm is not None:
+            return norm
+    raise ValueError(f"Cannot resolve decoder final norm for {type(model).__name__}.")
+
+
+def normalize_relative_vll_logit_source(value: str | None) -> str:
+    source = str(value or "h_mid").strip().lower()
+    if source in {"h_prev", "hpre", "h_pre", "prev", "pre", "raw_h_prev"}:
+        return "h_prev"
+    if source in {"h_mid", "mid", "raw_h_mid"}:
+        return "h_mid"
+    if source in {"final_norm_h_mid", "final_norm", "norm_h_mid", "finalnorm"}:
+        return "final_norm_h_mid"
+    raise ValueError(
+        "relative_vll_logit_source must be 'h_prev', 'h_mid', or 'final_norm_h_mid'."
+    )
+
+
+def apply_decoder_final_norm(norm_layer: Any, states: torch.Tensor) -> torch.Tensor:
+    """Apply decoder final norm to arbitrary layer states for VLL ablation."""
+    weight = getattr(norm_layer, "weight", None)
+    device = weight.device if weight is not None else states.device
+    dtype = weight.dtype if weight is not None else states.dtype
+    original_shape = states.shape
+    flat_states = states.reshape(-1, original_shape[-1]).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        normed = norm_layer(flat_states)
+    return normed.reshape(original_shape).to(device=states.device)
+
+
 def run_forward_with_dgst_captures(
     model: Any,
     *,
     output_hidden_states: bool = True,
+    retain_attention_updates: bool = True,
+    attention_query_positions: Sequence[int] | None = None,
+    capture_device: str | torch.device | None = None,
+    attention_query_chunk_size: int | None = None,
+    record_model_attentions: bool = True,
     **forward_kwargs,
 ):
-    """Run a forward pass while capturing decoder attention and FFN updates."""
+    """Run a forward pass while capturing decoder attention and FFN updates.
+
+    When ``attention_query_positions`` is supplied, decoder attention hooks
+    replace every full ``[B,H,Q,K]`` attention output with only the requested
+    query rows before the parent decoder can retain it.  DGST and the baseline
+    consumers only read those rows, so this avoids keeping one quadratic
+    attention matrix per layer for long multimodal sequences.
+
+    Negative positions follow normal Python indexing (``-1`` is the final
+    query row).  The normalized absolute positions are recorded in each
+    capture so downstream code can address rows by their original sequence
+    position without changing feature semantics.
+    """
     layers = resolve_decoder_layers(model)
+    resolved_capture_device = (
+        torch.device(capture_device) if capture_device is not None else None
+    )
+
+    def captured(value: torch.Tensor) -> torch.Tensor:
+        result = value.detach()
+        if (
+            resolved_capture_device is not None
+            and result.device != resolved_capture_device
+        ):
+            result = result.to(device=resolved_capture_device)
+        return result
+
+    requested_attention_positions = (
+        tuple(dict.fromkeys(int(value) for value in attention_query_positions))
+        if attention_query_positions is not None
+        else None
+    )
+    if requested_attention_positions is not None and not requested_attention_positions:
+        raise ValueError("attention_query_positions must not be empty when supplied.")
+    if attention_query_chunk_size is not None and attention_query_chunk_size <= 0:
+        raise ValueError("attention_query_chunk_size must be positive when supplied.")
     captures: list[dict[str, Any]] = [
-        {"h_prev": None, "o_attn": None, "attn_weights": None, "o_ffn": None}
+        {
+            "h_prev": None,
+            "o_attn": None,
+            "attn_weights": None,
+            "attention_query_positions": None,
+            "o_ffn": None,
+        }
         for _ in range(len(layers))
     ]
     handles = []
 
     def layer_pre_hook(index: int):
         def hook(_module, args):
-            captures[index]["h_prev"] = args[0].detach()
+            captures[index]["h_prev"] = captured(args[0])
 
         return hook
 
     def attention_hook(index: int):
         def hook(_module, _args, output):
             if isinstance(output, tuple):
-                captures[index]["o_attn"] = output[0].detach()
+                attention_update = captured(output[0])
+                captures[index]["o_attn"] = attention_update
+                if not retain_attention_updates:
+                    captures[index]["h_mid"] = (
+                        captures[index]["h_prev"] + attention_update
+                    )
+                    captures[index]["o_attn"] = None
                 if len(output) > 1 and output[1] is not None:
-                    captures[index]["attn_weights"] = output[1].detach()
+                    attention_weights = output[1]
+                    compact_positions = getattr(
+                        _module,
+                        "_dgst_attention_absolute_positions",
+                        None,
+                    )
+                    if compact_positions is not None:
+                        captures[index]["attention_query_positions"] = tuple(
+                            int(value) for value in compact_positions
+                        )
+                    elif requested_attention_positions is not None:
+                        query_length = int(attention_weights.shape[-2])
+                        normalized_positions = tuple(
+                            position if position >= 0 else query_length + position
+                            for position in requested_attention_positions
+                        )
+                        invalid = [
+                            position
+                            for position in normalized_positions
+                            if position < 0 or position >= query_length
+                        ]
+                        if invalid:
+                            raise IndexError(
+                                "DGST attention query position(s) outside decoder "
+                                f"length {query_length}: {invalid}"
+                            )
+                        query_index = torch.tensor(
+                            normalized_positions,
+                            dtype=torch.long,
+                            device=attention_weights.device,
+                        )
+                        attention_weights = attention_weights.index_select(
+                            -2,
+                            query_index,
+                        )
+                        captures[index]["attention_query_positions"] = (
+                            normalized_positions
+                        )
+                        # A forward hook may replace the module output.  The
+                        # attention output used by the residual path is left
+                        # untouched; only the diagnostic weights collected by
+                        # the parent decoder are reduced to the needed rows.
+                        output_values = list(output)
+                        output_values[1] = attention_weights
+                        output = tuple(output_values)
+                    captures[index]["attn_weights"] = captured(attention_weights)
             else:
-                captures[index]["o_attn"] = output.detach()
+                attention_update = captured(output)
+                captures[index]["o_attn"] = attention_update
+                if not retain_attention_updates:
+                    captures[index]["h_mid"] = (
+                        captures[index]["h_prev"] + attention_update
+                    )
+                    captures[index]["o_attn"] = None
+            return output
 
         return hook
 
     def mlp_hook(index: int):
         def hook(_module, _args, output):
-            captures[index]["o_ffn"] = output.detach()
+            captures[index]["o_ffn"] = captured(output)
 
         return hook
 
@@ -103,11 +367,49 @@ def run_forward_with_dgst_captures(
         handles.append(_layer_attention_module(layer).register_forward_hook(attention_hook(index)))
         handles.append(_layer_mlp_module(layer).register_forward_hook(mlp_hook(index)))
 
+    attention_modules = [_layer_attention_module(layer) for layer in layers]
+    original_attention_implementations: dict[int, tuple[Any, Any]] = {}
+    chunked_attention_enabled = attention_query_chunk_size is not None
+    if chunked_attention_enabled:
+        if requested_attention_positions is None:
+            raise ValueError(
+                "Chunked DGST attention requires attention_query_positions."
+            )
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        if _DGST_CHUNKED_ATTENTION_NAME not in ALL_ATTENTION_FUNCTIONS.valid_keys():
+            ALL_ATTENTION_FUNCTIONS.register(
+                _DGST_CHUNKED_ATTENTION_NAME,
+                chunked_eager_attention_forward,
+            )
+        for module in attention_modules:
+            config = getattr(module, "config", None)
+            if config is None:
+                raise TypeError(
+                    "Chunked DGST attention requires attention modules with a config."
+                )
+            config_id = id(config)
+            if config_id not in original_attention_implementations:
+                original_attention_implementations[config_id] = (
+                    config,
+                    config._attn_implementation,
+                )
+                config._attn_implementation = _DGST_CHUNKED_ATTENTION_NAME
+            module._dgst_attention_query_positions = requested_attention_positions
+            module._dgst_attention_query_chunk_size = int(attention_query_chunk_size)
+
     try:
         with torch.no_grad():
             outputs = model(
                 **forward_kwargs,
-                output_attentions=True,
+                # The chunked attention function returns the selected rows to
+                # our module hooks directly.  Asking Transformers' generic
+                # recorder to collect them as well is redundant and emits a
+                # misleading warning because the registered implementation
+                # has a custom name rather than the literal string "eager".
+                output_attentions=bool(
+                    record_model_attentions and not chunked_attention_enabled
+                ),
                 output_hidden_states=bool(output_hidden_states),
                 return_dict=True,
                 use_cache=False,
@@ -115,23 +417,192 @@ def run_forward_with_dgst_captures(
     finally:
         for handle in handles:
             handle.remove()
+        if chunked_attention_enabled:
+            for config, implementation in original_attention_implementations.values():
+                config._attn_implementation = implementation
+            for module in attention_modules:
+                for name in (
+                    "_dgst_attention_query_positions",
+                    "_dgst_attention_query_chunk_size",
+                    "_dgst_attention_absolute_positions",
+                ):
+                    if hasattr(module, name):
+                        delattr(module, name)
 
     attentions = getattr(outputs, "attentions", None)
     for index, capture in enumerate(captures):
-        if capture["h_prev"] is None or capture["o_attn"] is None or capture["o_ffn"] is None:
-            raise RuntimeError("DGST-T hooks did not capture h_prev, o_attn, and o_ffn for every layer.")
+        if (
+            capture["h_prev"] is None
+            or (capture["o_attn"] is None and capture.get("h_mid") is None)
+            or capture["o_ffn"] is None
+        ):
+            raise RuntimeError(
+                "DGST-T hooks did not capture h_prev, h_mid/o_attn, and o_ffn "
+                "for every layer."
+            )
         if capture["attn_weights"] is None and attentions is not None and index < len(attentions):
             capture["attn_weights"] = attentions[index]
         if capture["attn_weights"] is None:
             raise RuntimeError("DGST-T requires attention weights; load the model with eager attention.")
 
-        target_device = capture["o_attn"].device
+        target_state = capture.get("o_attn")
+        if target_state is None:
+            target_state = capture.get("h_mid")
+        target_device = target_state.device
         for key in ("h_prev", "o_ffn", "attn_weights"):
             if capture[key].device != target_device:
                 capture[key] = capture[key].to(target_device)
-        capture["h_mid"] = capture["h_prev"] + capture["o_attn"]
+        if capture.get("h_mid") is None:
+            capture["h_mid"] = capture["h_prev"] + capture["o_attn"]
+        if not retain_attention_updates and capture.get("o_attn") is not None:
+            # The active four-gate profile consumes h_mid but never o_attn
+            # separately. Releasing this full [B,S,D] tensor for every layer
+            # before vocabulary projection provides crucial headroom on 32-GiB
+            # GPUs while legacy diagnostic paths keep the old field by default.
+            capture["o_attn"] = None
+
+    if getattr(outputs, "attentions", None) is None:
+        # Recent Transformers Llama decoder layers discard the diagnostic
+        # attention return even when output_attentions=True.  The hooks are
+        # authoritative and also carry the compacted rows needed by ADS/CGC.
+        outputs.attentions = tuple(capture["attn_weights"] for capture in captures)
 
     return outputs, captures
+
+
+def attention_row_from_capture(
+    capture: dict[str, Any],
+    prediction_position: int,
+) -> torch.Tensor:
+    """Return one ``[H,K]`` row from a full or query-compacted capture."""
+    weights = capture.get("attn_weights")
+    if weights is None:
+        raise RuntimeError("DGST capture has no attention weights.")
+    query_positions = capture.get("attention_query_positions")
+    row_index = attention_row_index(
+        prediction_position=int(prediction_position),
+        attention_query_positions=query_positions,
+    )
+    return weights[0, :, row_index, :]
+
+
+def attention_row_index(
+    *,
+    prediction_position: int,
+    attention_query_positions: Sequence[int] | None,
+) -> int:
+    """Map an absolute decoder position to its compact attention-row index."""
+    position = int(prediction_position)
+    if attention_query_positions is None:
+        return position
+    positions = tuple(int(value) for value in attention_query_positions)
+    try:
+        return positions.index(position)
+    except ValueError as exc:
+        raise KeyError(
+            f"Attention row {position} was not captured; available rows={positions}."
+        ) from exc
+
+
+def run_forward_with_layer_hidden_captures(
+    model: Any,
+    *,
+    output_attentions: bool = False,
+    capture_all_layers: bool = True,
+    **forward_kwargs,
+):
+    """Run a forward while retaining raw decoder-layer outputs only.
+
+    Hugging Face ``hidden_states[-1]`` is final-normalized for the supported
+    decoder models, whereas DGST hooks expose the raw last residual state.  A
+    lightweight layer-output hook keeps ADS/CGC and ProjectAway identical in
+    DGST ``all`` and standalone extraction without installing the much larger
+    DGST attention/MLP capture set.
+    """
+    layers = resolve_decoder_layers(model)
+    selected = range(len(layers)) if capture_all_layers else (len(layers) - 1,)
+    captured: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def layer_hook(index: int):
+        def hook(_module, _args, output):
+            value = output[0] if isinstance(output, tuple) else output
+            captured[index] = value.detach()
+
+        return hook
+
+    for index in selected:
+        handles.append(layers[index].register_forward_hook(layer_hook(index)))
+    try:
+        with torch.no_grad():
+            outputs = model(
+                **forward_kwargs,
+                output_attentions=bool(output_attentions),
+                output_hidden_states=False,
+                return_dict=True,
+                use_cache=False,
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    missing = [index for index in selected if index not in captured]
+    if missing:
+        raise RuntimeError(f"Decoder output hooks missed layers: {missing}")
+    return outputs, [captured[index] for index in selected]
+
+
+def hidden_states_from_layer_outputs(
+    layer_outputs: Sequence[torch.Tensor],
+    *,
+    token_position: int,
+    visual_start: int,
+    visual_end: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract raw per-layer token and visual residual states."""
+    if not layer_outputs:
+        raise ValueError("No decoder layer outputs were captured.")
+    token_states = torch.stack(
+        [state[0, int(token_position), :] for state in layer_outputs], dim=0
+    )
+    patch_states = torch.stack(
+        [
+            state[0, int(visual_start) : int(visual_end), :]
+            for state in layer_outputs
+        ],
+        dim=0,
+    )
+    return token_states, patch_states
+
+
+def final_normalized_hidden_slice(
+    *,
+    model: Any,
+    out: Any,
+    start: int,
+    end: int,
+    dgst_captures: Sequence[dict[str, Any]] | None = None,
+    layer_outputs: Sequence[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Return the final-norm decoder state for one response slice.
+
+    This normalizes hook-derived raw residual states exactly once and uses the
+    model-provided final-normalized state when it is already available.
+    """
+    hidden_states = getattr(out, "hidden_states", None)
+    if hidden_states is not None:
+        return hidden_states[-1][0, int(start) : int(end), :]
+    if dgst_captures is not None:
+        last = dgst_captures[-1]
+        if last.get("h_mid") is None or last.get("o_ffn") is None:
+            raise RuntimeError("Last DGST capture was released before hidden slicing.")
+        raw = last["h_mid"] + last["o_ffn"]
+    elif layer_outputs:
+        raw = layer_outputs[-1]
+    else:
+        raise RuntimeError("Response hidden states were requested but not captured.")
+    normed = apply_decoder_final_norm(resolve_decoder_final_norm(model), raw)
+    return normed[0, int(start) : int(end), :]
 
 
 def build_dgst_t_raw(
@@ -147,6 +618,9 @@ def build_dgst_t_raw(
     prediction_position: int,
     support_scope: str = "visual_prompt",
     semantic_chunk_size: int = 64,
+    relative_vll_logit_source: str = "h_mid",
+    prompt_positions_override: Sequence[int] | None = None,
+    keep_on_device: bool = False,
 ) -> dict[str, Any]:
     """Build the raw tensors consumed by features.dgst_t.compute_dgst_t."""
     return build_dgst_t_raw_batch(
@@ -161,6 +635,9 @@ def build_dgst_t_raw(
         prediction_positions=[int(prediction_position)],
         support_scope=support_scope,
         semantic_chunk_size=semantic_chunk_size,
+        relative_vll_logit_source=relative_vll_logit_source,
+        prompt_positions_override=prompt_positions_override,
+        keep_on_device=keep_on_device,
     )[0]
 
 
@@ -177,6 +654,9 @@ def build_dgst_t_raw_batch(
     prediction_positions: Sequence[int],
     support_scope: str = "visual_prompt",
     semantic_chunk_size: int = 64,
+    relative_vll_logit_source: str = "h_mid",
+    prompt_positions_override: Sequence[int] | None = None,
+    keep_on_device: bool = False,
 ) -> list[dict[str, Any]]:
     """Build per-token DGST-T raw tensors from one shared decoder forward."""
     target_ids = [int(token_id) for token_id in target_token_ids]
@@ -186,12 +666,16 @@ def build_dgst_t_raw_batch(
     if not target_ids:
         return []
 
-    prompt_positions = resolve_prompt_positions(
-        full_input_ids=full_input_ids,
-        prompt_tokenized_length=prompt_tokenized_length,
-        image_token_id=image_token_id,
-        visual_start=visual_start,
-        visual_end=visual_end,
+    prompt_positions = (
+        [int(position) for position in prompt_positions_override]
+        if prompt_positions_override is not None
+        else resolve_prompt_positions(
+            full_input_ids=full_input_ids,
+            prompt_tokenized_length=prompt_tokenized_length,
+            image_token_id=image_token_id,
+            visual_start=visual_start,
+            visual_end=visual_end,
+        )
     )
     support_positions = resolve_support_positions(
         visual_start=visual_start,
@@ -206,6 +690,12 @@ def build_dgst_t_raw_batch(
 
     output_layer = resolve_output_embedding_layer(model)
     input_layer = resolve_input_embedding_layer(model)
+    relative_source = normalize_relative_vll_logit_source(relative_vll_logit_source)
+    final_norm_layer = (
+        resolve_decoder_final_norm(model)
+        if relative_source == "final_norm_h_mid"
+        else None
+    )
     hidden_size = int(captures[0]["h_mid"].shape[-1])
     target_embeddings = [
         embedding_for_token(
@@ -217,35 +707,65 @@ def build_dgst_t_raw_batch(
         )
         for token_id in target_ids
     ]
+    target_unembeddings = [
+        unembedding_for_token(
+            output_layer=output_layer,
+            target_token_id=token_id,
+            hidden_size=hidden_size,
+            device=captures[0]["h_mid"].device,
+        )
+        for token_id in target_ids
+    ]
 
     raw_parts = [
         {
             "source_ffn_states": [],
+            "source_attn_states": [],
             "prediction_hidden_states": [],
+            "support_h_prev_states": [],
             "support_h_mid_states": [],
+            "support_output_states": [],
             "support_attentions": [],
             "semantic_probs": [],
+            "relative_vll_logits": [],
             "prompt_last_hidden_states": [],
             "prompt_mean_hidden_states": [],
             "prompt_logit_lens_top3_confidence": [],
+            "prompt_logit_lens_max_confidence": [],
         }
         for _ in target_ids
     ]
 
     for layer_offset, capture in enumerate(captures):
+        h_prev = capture["h_prev"][0]
         h_mid = capture["h_mid"][0]
+        o_attn = capture["o_attn"][0]
         o_ffn = capture["o_ffn"][0]
         layer_hidden = h_mid + o_ffn
         device = h_mid.device
         support_index = torch.tensor(support_positions, dtype=torch.long, device=device)
         prompt_index = torch.tensor(prompt_positions, dtype=torch.long, device=device)
 
+        support_prev_states = h_prev.index_select(0, support_index)
         support_states = h_mid.index_select(0, support_index)
+        if relative_source == "h_prev":
+            support_relative_states = support_prev_states
+        elif final_norm_layer is not None:
+            support_relative_states = apply_decoder_final_norm(final_norm_layer, support_states)
+        else:
+            support_relative_states = support_states
+        support_output_states = layer_hidden.index_select(0, support_index)
         prompt_states = layer_hidden.index_select(0, prompt_index)
 
         support_semantic_all = target_probabilities_multi(
             output_layer=output_layer,
             states=support_states,
+            target_token_ids=target_ids,
+            chunk_size=semantic_chunk_size,
+        )
+        support_relative_logits_all = target_logits_multi(
+            output_layer=output_layer,
+            states=support_relative_states,
             target_token_ids=target_ids,
             chunk_size=semantic_chunk_size,
         )
@@ -257,26 +777,60 @@ def build_dgst_t_raw_batch(
         )
         top_k = min(3, int(prompt_probs_all.shape[0]))
         prompt_conf_all = torch.topk(prompt_probs_all.float(), k=top_k, dim=0).values.mean(dim=0)
-        prompt_last_state = prompt_states[-1].detach().cpu()
-        prompt_mean_state = prompt_states.mean(dim=0).detach().cpu()
-        support_states_cpu = support_states.detach().cpu()
+        prompt_max_conf_all = prompt_probs_all.float().max(dim=0).values
+        prompt_last_state = _raw_tensor(prompt_states[-1], keep_on_device=keep_on_device)
+        prompt_mean_state = _raw_tensor(prompt_states.mean(dim=0), keep_on_device=keep_on_device)
+        support_prev_states_raw = _raw_tensor(
+            support_prev_states,
+            keep_on_device=keep_on_device,
+        )
+        support_states_raw = _raw_tensor(support_states, keep_on_device=keep_on_device)
+        support_output_states_raw = _raw_tensor(
+            support_output_states,
+            keep_on_device=keep_on_device,
+        )
 
         for target_offset, prediction_position in enumerate(pred_positions):
-            attention_row = capture["attn_weights"][0, :, int(prediction_position), :]
+            attention_row = attention_row_from_capture(
+                capture,
+                int(prediction_position),
+            )
             support_attention = attention_row.index_select(
                 1, support_index.to(attention_row.device)
             ).mean(dim=0)
 
             part = raw_parts[target_offset]
-            part["source_ffn_states"].append(o_ffn[int(prediction_position), :].detach().cpu())
-            part["prediction_hidden_states"].append(layer_hidden[int(prediction_position), :].detach().cpu())
-            part["support_h_mid_states"].append(support_states_cpu)
-            part["support_attentions"].append(support_attention.detach().cpu())
-            part["semantic_probs"].append(support_semantic_all[:, target_offset].detach().cpu())
+            part["source_ffn_states"].append(
+                _raw_tensor(o_ffn[int(prediction_position), :], keep_on_device=keep_on_device)
+            )
+            part["source_attn_states"].append(
+                _raw_tensor(o_attn[int(prediction_position), :], keep_on_device=keep_on_device)
+            )
+            part["prediction_hidden_states"].append(
+                _raw_tensor(layer_hidden[int(prediction_position), :], keep_on_device=keep_on_device)
+            )
+            part["support_h_prev_states"].append(support_prev_states_raw)
+            part["support_h_mid_states"].append(support_states_raw)
+            part["support_output_states"].append(support_output_states_raw)
+            part["support_attentions"].append(
+                _raw_tensor(support_attention, keep_on_device=keep_on_device)
+            )
+            part["semantic_probs"].append(
+                _raw_tensor(support_semantic_all[:, target_offset], keep_on_device=keep_on_device)
+            )
+            part["relative_vll_logits"].append(
+                _raw_tensor(
+                    support_relative_logits_all[:, target_offset],
+                    keep_on_device=keep_on_device,
+                )
+            )
             part["prompt_last_hidden_states"].append(prompt_last_state)
             part["prompt_mean_hidden_states"].append(prompt_mean_state)
             part["prompt_logit_lens_top3_confidence"].append(
-                prompt_conf_all[target_offset].detach().cpu()
+                _raw_tensor(prompt_conf_all[target_offset], keep_on_device=keep_on_device)
+            )
+            part["prompt_logit_lens_max_confidence"].append(
+                _raw_tensor(prompt_max_conf_all[target_offset], keep_on_device=keep_on_device)
             )
 
     raws: list[dict[str, Any]] = []
@@ -288,22 +842,42 @@ def build_dgst_t_raw_batch(
                 "visual_start": int(visual_start),
                 "visual_end": int(visual_end),
                 "support_scope": str(support_scope),
+                "relative_vll_logit_source": relative_source,
                 "support_positions": [int(position) for position in support_positions],
                 "prompt_positions": [int(position) for position in prompt_positions],
                 "source_ffn_states": torch.stack(part["source_ffn_states"], dim=0),
+                "source_attn_states": torch.stack(part["source_attn_states"], dim=0),
                 "prediction_hidden_states": torch.stack(part["prediction_hidden_states"], dim=0),
+                "support_h_prev_states": torch.stack(part["support_h_prev_states"], dim=0),
                 "support_h_mid_states": torch.stack(part["support_h_mid_states"], dim=0),
+                "support_output_states": torch.stack(part["support_output_states"], dim=0),
                 "support_attentions": torch.stack(part["support_attentions"], dim=0),
                 "semantic_probs": torch.stack(part["semantic_probs"], dim=0),
+                "relative_vll_logits": torch.stack(part["relative_vll_logits"], dim=0),
                 "prompt_last_hidden_states": torch.stack(part["prompt_last_hidden_states"], dim=0),
                 "prompt_mean_hidden_states": torch.stack(part["prompt_mean_hidden_states"], dim=0),
                 "prompt_logit_lens_top3_confidence": torch.stack(
                     part["prompt_logit_lens_top3_confidence"], dim=0
                 ),
-                "target_embedding": target_embeddings[target_offset].detach().cpu(),
+                "prompt_logit_lens_max_confidence": torch.stack(
+                    part["prompt_logit_lens_max_confidence"], dim=0
+                ),
+                "target_embedding": _raw_tensor(
+                    target_embeddings[target_offset],
+                    keep_on_device=keep_on_device,
+                ),
+                "target_unembedding": _raw_tensor(
+                    target_unembeddings[target_offset],
+                    keep_on_device=keep_on_device,
+                ),
             }
         )
     return raws
+
+
+def _raw_tensor(tensor: torch.Tensor, *, keep_on_device: bool) -> torch.Tensor:
+    value = tensor.detach()
+    return value if keep_on_device else value.cpu()
 
 
 def resolve_prompt_positions(
@@ -353,6 +927,7 @@ def resolve_support_positions(
     return sorted(dict.fromkeys(visual_positions + [int(pos) for pos in prompt_positions]))
 
 
+@torch.no_grad()
 def target_probabilities(
     *,
     output_layer: Any,
@@ -369,14 +944,19 @@ def target_probabilities(
     ).squeeze(-1)
 
 
+@torch.no_grad()
 def target_probabilities_multi(
     *,
     output_layer: Any,
     states: torch.Tensor,
     target_token_ids: Sequence[int],
     chunk_size: int = 64,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
     """Compute p(target_token | state) for several targets with one logsumexp pass."""
+    temperature_value = float(temperature)
+    if not math.isfinite(temperature_value) or temperature_value <= 0.0:
+        raise ValueError("temperature must be a finite positive value.")
     weight = output_layer.weight
     bias = getattr(output_layer, "bias", None)
     token_ids = [int(token_id) for token_id in target_token_ids]
@@ -396,7 +976,8 @@ def target_probabilities_multi(
     for start in range(0, int(flat_states.shape[0]), max(1, int(chunk_size))):
         chunk = flat_states[start : start + int(chunk_size)].to(device=weight.device, dtype=weight.dtype)
         logits = F.linear(chunk, weight, bias.to(dtype=weight.dtype) if bias is not None else None)
-        log_denominator = torch.logsumexp(logits.float(), dim=-1)
+        scaled_logits = logits.float() / temperature_value
+        log_denominator = torch.logsumexp(scaled_logits, dim=-1)
         chunk_probs = torch.zeros(
             int(chunk.shape[0]),
             len(token_ids),
@@ -408,12 +989,198 @@ def target_probabilities_multi(
             dtype=torch.long,
             device=logits.device,
         )
-        target_logits = logits.index_select(dim=1, index=valid_token_index).float()
+        target_logits = scaled_logits.index_select(dim=1, index=valid_token_index)
         valid_probs = torch.exp((target_logits - log_denominator.unsqueeze(1)).clamp(max=0.0)).to(states.device)
         for valid_offset, (column, _token_id) in enumerate(valid_columns):
             chunk_probs[:, column] = valid_probs[:, valid_offset]
         probs.append(chunk_probs)
-    return torch.cat(probs, dim=0).reshape(*states.shape[:-1], len(token_ids)).float()
+    return (
+        torch.cat(probs, dim=0)
+        .reshape(*states.shape[:-1], len(token_ids))
+        .float()
+        .detach()
+    )
+
+
+@torch.no_grad()
+def target_logits_and_probabilities_multi(
+    *,
+    output_layer: Any,
+    states: torch.Tensor,
+    target_token_ids: Sequence[int],
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return target raw logits and vocabulary-softmax probabilities together.
+
+    Each state chunk is projected through the full output vocabulary exactly
+    once.  The target column supplies the raw logit while the same matrix's
+    log-sum-exp supplies the softmax denominator.  Only the two compact
+    ``[..., num_targets]`` tensors are retained; the full-vocabulary matrix is
+    released at the end of every chunk.
+
+    Raw logits follow the project's target-unembedding convention and exclude
+    an optional LM-head bias.  Softmax probabilities include the model-defined
+    bias, matching a normal vocabulary softmax.  Decoder-only LVLM heads used
+    in this project are normally bias-free, but keeping the distinction makes
+    the behavior explicit.
+    """
+    weight = output_layer.weight
+    bias = getattr(output_layer, "bias", None)
+    token_ids = [int(token_id) for token_id in target_token_ids]
+    output_shape = (*states.shape[:-1], len(token_ids))
+    if not token_ids:
+        empty = torch.empty(output_shape, dtype=torch.float32, device=states.device)
+        return empty, empty.clone()
+
+    valid_columns = [
+        (column, token_id)
+        for column, token_id in enumerate(token_ids)
+        if 0 <= token_id < int(weight.shape[0])
+    ]
+    if not valid_columns:
+        zeros = torch.zeros(output_shape, dtype=torch.float32, device=states.device)
+        return zeros, zeros.clone()
+
+    valid_token_index = torch.tensor(
+        [token_id for _column, token_id in valid_columns],
+        dtype=torch.long,
+        device=weight.device,
+    )
+    flat_states = states.reshape(-1, states.shape[-1])
+    raw_chunks: list[torch.Tensor] = []
+    prob_chunks: list[torch.Tensor] = []
+    step = max(1, int(chunk_size))
+    start = 0
+    while start < int(flat_states.shape[0]):
+        current_step = min(step, int(flat_states.shape[0]) - start)
+        chunk = flat_states[start : start + current_step].to(
+            device=weight.device,
+            dtype=weight.dtype,
+        )
+        vocab_logits = None
+        selected_with_bias = None
+        selected_raw = None
+        selected_prob = None
+        log_denominator = None
+        try:
+            vocab_logits = F.linear(
+                chunk,
+                weight,
+                bias.to(device=weight.device, dtype=weight.dtype)
+                if bias is not None
+                else None,
+            ).float()
+            selected_with_bias = vocab_logits.index_select(1, valid_token_index)
+            if bias is None:
+                selected_raw = selected_with_bias
+            else:
+                selected_raw = selected_with_bias - bias.index_select(
+                    0, valid_token_index
+                ).float().unsqueeze(0)
+            log_denominator = torch.logsumexp(
+                vocab_logits,
+                dim=-1,
+                keepdim=True,
+            )
+            selected_prob = torch.exp(
+                (selected_with_bias - log_denominator).clamp(max=0.0)
+            )
+        except torch.OutOfMemoryError:
+            # Large-vocabulary OneVision checkpoints can leave less than one
+            # 64-row projection available on 32 GiB cards.  Retry the same
+            # rows with a smaller transient matrix; compact results already
+            # produced for prior rows remain valid.
+            del (
+                chunk,
+                vocab_logits,
+                selected_with_bias,
+                selected_raw,
+                selected_prob,
+                log_denominator,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if current_step <= 1:
+                raise
+            step = max(1, current_step // 2)
+            continue
+
+        raw = torch.zeros(
+            int(chunk.shape[0]),
+            len(token_ids),
+            dtype=torch.float32,
+            device=states.device,
+        )
+        probs = torch.zeros_like(raw)
+        selected_raw = selected_raw.to(states.device)
+        selected_prob = selected_prob.to(states.device)
+        for valid_offset, (column, _token_id) in enumerate(valid_columns):
+            raw[:, column] = selected_raw[:, valid_offset]
+            probs[:, column] = selected_prob[:, valid_offset]
+        raw_chunks.append(raw)
+        prob_chunks.append(probs)
+        del (
+            vocab_logits,
+            selected_with_bias,
+            selected_raw,
+            selected_prob,
+            log_denominator,
+        )
+        start += current_step
+
+    raw_result = torch.cat(raw_chunks, dim=0).reshape(output_shape).float().detach()
+    prob_result = torch.cat(prob_chunks, dim=0).reshape(output_shape).float().detach()
+    return raw_result, prob_result
+
+
+@torch.no_grad()
+def target_logits_multi(
+    *,
+    output_layer: Any,
+    states: torch.Tensor,
+    target_token_ids: Sequence[int],
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Compute raw W_U target logits without LM-head bias."""
+    weight = output_layer.weight
+    token_ids = [int(token_id) for token_id in target_token_ids]
+    if not token_ids:
+        return torch.empty(*states.shape[:-1], 0, dtype=torch.float32, device=states.device)
+
+    valid_columns = [
+        (column, token_id)
+        for column, token_id in enumerate(token_ids)
+        if 0 <= token_id < int(weight.shape[0])
+    ]
+    if not valid_columns:
+        return torch.zeros(*states.shape[:-1], len(token_ids), dtype=torch.float32, device=states.device)
+
+    logits = []
+    flat_states = states.reshape(-1, states.shape[-1])
+    valid_token_index = torch.tensor(
+        [token_id for _column, token_id in valid_columns],
+        dtype=torch.long,
+        device=weight.device,
+    )
+    target_weight = weight.index_select(dim=0, index=valid_token_index)
+    for start in range(0, int(flat_states.shape[0]), max(1, int(chunk_size))):
+        chunk = flat_states[start : start + int(chunk_size)].to(device=weight.device, dtype=weight.dtype)
+        valid_logits = F.linear(chunk, target_weight, bias=None).float().to(states.device)
+        chunk_logits = torch.zeros(
+            int(chunk.shape[0]),
+            len(token_ids),
+            dtype=torch.float32,
+            device=states.device,
+        )
+        for valid_offset, (column, _token_id) in enumerate(valid_columns):
+            chunk_logits[:, column] = valid_logits[:, valid_offset]
+        logits.append(chunk_logits)
+    return (
+        torch.cat(logits, dim=0)
+        .reshape(*states.shape[:-1], len(token_ids))
+        .float()
+        .detach()
+    )
 
 
 def merged_position_for_tokenized_position(
@@ -475,8 +1242,15 @@ def hidden_states_from_captures(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token_states = []
     patch_states = []
-    for capture in captures:
-        layer_hidden = capture["h_mid"] + capture["o_ffn"]
+    for index, capture in enumerate(captures):
+        if index + 1 < len(captures):
+            # The next block's input is the exact post-layer state.  This also
+            # includes architecture-level processing performed after a decoder
+            # block returns (notably Qwen3-VL DeepStack injection in layers
+            # 0..2), which h_mid + o_ffn alone cannot reconstruct.
+            layer_hidden = captures[index + 1]["h_prev"]
+        else:
+            layer_hidden = capture["h_mid"] + capture["o_ffn"]
         token_states.append(layer_hidden[0, int(token_position), :])
         patch_states.append(layer_hidden[0, int(visual_start) : int(visual_end), :])
     return torch.stack(token_states, dim=0), torch.stack(patch_states, dim=0)
@@ -498,6 +1272,24 @@ def embedding_for_token(
         if 0 <= token_id < int(weight.shape[0]) and int(weight.shape[-1]) == int(hidden_size):
             return weight[token_id].detach().to(device=device, dtype=torch.float32)
     raise ValueError(f"Cannot resolve target token embedding for token_id={target_token_id}.")
+
+
+def unembedding_for_token(
+    *,
+    output_layer: Any,
+    target_token_id: int,
+    hidden_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    weight = getattr(output_layer, "weight", None)
+    token_id = int(target_token_id)
+    if (
+        weight is not None
+        and 0 <= token_id < int(weight.shape[0])
+        and int(weight.shape[-1]) == int(hidden_size)
+    ):
+        return weight[token_id].detach().to(device=device, dtype=torch.float32)
+    return torch.zeros(int(hidden_size), dtype=torch.float32, device=device)
 
 
 def _layer_attention_module(layer: Any):
